@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "net-stability"
+version = "1.0.0"
+description = "A conservative, reversible network reliability tuner with a small cross-platform GUI."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "Unlicense"
+authors = [{ name = "Master0fFate" }]
+keywords = ["wifi", "network", "npm", "diagnostics", "tkinter"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Win32 (MS Windows)",
+    "Environment :: X11 Applications",
+    "Environment :: MacOS X",
+    "Intended Audience :: End Users/Desktop",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Topic :: System :: Networking",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/Master0fFate/net-stability"
+Issues = "https://github.com/Master0fFate/net-stability/issues"
+
+[project.scripts]
+net-stability = "net_stability:main"
+net-stability-gui = "net_stability_gui:main"
+
+[tool.setuptools]
+py-modules = ["net_stability", "net_stability_gui"]

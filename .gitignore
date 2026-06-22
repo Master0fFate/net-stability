@@ -1,0 +1,37 @@
+# Python bytecode and local caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments and package output
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/
+
+# Test, type-checker, and tooling caches
+.codegraph/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+.coverage
+htmlcov/
+
+# Local application state and generated reports
+NetStability/
+netstability/
+reports/
+backups/
+*.log
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
