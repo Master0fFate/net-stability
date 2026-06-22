@@ -5,9 +5,9 @@
 ![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-4c51bf)
 ![License](https://img.shields.io/badge/license-Unlicense-brightgreen)
 
-Net Stability is a small, reversible network reliability helper for weak Wi-Fi links and flaky `npm install` runs. It can diagnose connection health, apply conservative tuning, and restore exact backups.
+Net Stability is a small, reversible network reliability helper for weak Wi-Fi links and flaky `npm install` runs. It diagnoses the likely failure layer first, applies conservative tuning only on explicit action, and restores exact backups.
 
-It now includes a simple desktop UI for non-technical users: one main button for the normal fix path, with advanced actions underneath for people who want diagnostics, npm-only tuning, restore, or backup listing.
+It now includes a simple desktop UI for non-technical users: one main read-only audit button, with advanced actions underneath for baseline measurement, full diagnostics, npm-only tuning, restore, or backup listing.
 
 ## What It Does
 
@@ -16,7 +16,8 @@ It now includes a simple desktop UI for non-technical users: one main button for
 - On Windows, adjusts documented Wi-Fi power behavior and supported adapter power properties when run as Administrator.
 - On Linux, disables NetworkManager Wi-Fi powersave on active Wi-Fi profiles when authorized.
 - On macOS, keeps system tuning diagnostic-only because there is no documented public Wi-Fi power equivalent used here.
-- Saves diagnostic JSON reports with optional MAC address redaction.
+- Saves diagnostic JSON reports with control-layer observations, recommendations, capability matrices, and optional identifier/token redaction.
+- Generates a read-only evidence audit that lists supported capabilities, denied folklore tweaks, and the current implementation gaps.
 - Avoids broad folklore tweaks such as DNS replacement, MTU guessing, TCP auto-tuning edits, QoS-reservation changes, global USB suspend changes, or blanket NIC offload disabling.
 
 ## Quick Start
@@ -27,7 +28,7 @@ Clone the repository, then run the desktop UI:
 python net_stability_gui.py
 ```
 
-Click **Optimize connection**. The app will show the stages as they run and print the underlying command output in the log.
+Click **Audit evidence first**. The app will show the stages as they run and print the underlying command output in the log.
 
 For Windows system tuning, open the terminal as Administrator before launching the GUI:
 
@@ -43,6 +44,8 @@ The GUI wraps the same CLI, so everything can also be run from a terminal.
 
 ```bash
 python net_stability.py diagnose
+python net_stability.py audit
+python net_stability.py measure idle
 python net_stability.py apply
 python net_stability.py apply --npm-only
 python net_stability.py restore latest
@@ -54,6 +57,8 @@ Useful options:
 
 ```bash
 python net_stability.py diagnose --samples 20 --redact
+python net_stability.py audit --redact
+python net_stability.py measure idle --samples 20 --redact
 python net_stability.py apply --dry-run
 python net_stability.py apply --system-only
 python net_stability.py restore latest --npm-only
@@ -65,7 +70,7 @@ The desktop UI is intentionally small and cross-platform:
 
 - Built with `tkinter`, included with most Python desktop installs.
 - No third-party runtime dependencies.
-- One primary action: **Optimize connection**.
+- One primary action: **Audit evidence first**.
 - Advanced actions stay visible but secondary.
 - The stage list explains what is happening without hiding the real log.
 
@@ -153,6 +158,8 @@ Net Stability is intentionally conservative:
 - User npm state and elevated system state are handled separately when needed.
 - The tool favors documented OS knobs and explicit diagnostics.
 - Reports can be redacted before sharing.
+- Router queue management is advisory only; a PC-side utility cannot directly fix queues inside an ISP modem or router.
+- The normal path refuses fixed-MTU guesses, global IPv6/DNS/TCP folklore tweaks, blanket offload changes, global USB selective-suspend changes, and generic "gaming" registry recipes.
 
 ## License
 

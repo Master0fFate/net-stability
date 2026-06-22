@@ -95,7 +95,115 @@ NPM_PROFILE_BASE: Dict[str, str] = {
     "prefer-offline": "true",
 }
 
+CONTROL_LAYERS: Tuple[Dict[str, str], ...] = (
+    {
+        "id": "application",
+        "label": "Application",
+        "client_scope": "App-specific concurrency, retry, timeout, cache, and watched-command diagnostics.",
+    },
+    {
+        "id": "host_transport",
+        "label": "Host transport",
+        "client_scope": "Read-only TCP/IP, DNS, route, proxy, dual-stack, and PMTU diagnostics.",
+    },
+    {
+        "id": "adapter_usb",
+        "label": "Adapter/USB",
+        "client_scope": "Adapter inventory, power stability trials, and physical placement experiments.",
+    },
+    {
+        "id": "wifi_link",
+        "label": "Wi-Fi radio/link",
+        "client_scope": "Signal, link-rate, association, retry, and placement/band observation.",
+    },
+    {
+        "id": "router_queue",
+        "label": "AP/router queue",
+        "client_scope": "Loaded-latency diagnosis and SQM/AQM advice; router mutation is outside normal mode.",
+    },
+    {
+        "id": "isp_path",
+        "label": "ISP/WAN/path",
+        "client_scope": "Remote-path evidence, target diversity, and family/path diagnostics.",
+    },
+)
+
+EVIDENCE_POLICY: Tuple[Dict[str, str], ...] = (
+    {
+        "id": "F01",
+        "feature": "Capability, topology, and baseline inventory",
+        "priority": "P0",
+        "risk": "read-only",
+        "evidence_grade": "A/C",
+        "layer": "host_transport",
+    },
+    {
+        "id": "F02",
+        "feature": "Longitudinal Wi-Fi telemetry",
+        "priority": "P0",
+        "risk": "read-only",
+        "evidence_grade": "A/B/C",
+        "layer": "wifi_link",
+    },
+    {
+        "id": "F03",
+        "feature": "Working-condition responsiveness tests",
+        "priority": "P0",
+        "risk": "read-only or opt-in traffic",
+        "evidence_grade": "A/B",
+        "layer": "router_queue",
+    },
+    {
+        "id": "F04",
+        "feature": "Multi-layer root-cause classifier",
+        "priority": "P0",
+        "risk": "read-only",
+        "evidence_grade": "A/B",
+        "layer": "isp_path",
+    },
+    {
+        "id": "F15",
+        "feature": "Benchmark-gated optimization engine",
+        "priority": "P0",
+        "risk": "governs mutations",
+        "evidence_grade": "A/B",
+        "layer": "application",
+    },
+    {
+        "id": "F16",
+        "feature": "Privacy, provenance, and reproducible reporting",
+        "priority": "P0",
+        "risk": "read-only",
+        "evidence_grade": "A/C",
+        "layer": "host_transport",
+    },
+)
+
+ANTI_FOLKLORE_DENYLIST: Tuple[str, ...] = (
+    "fixed MTU values such as 1400 or 1472",
+    "global IPv6 disable",
+    "DNS replacement as a speed boost",
+    "TCP ACK/Nagle registry recipes",
+    "TCP receive-window autotuning disable",
+    "blanket NIC offload disable",
+    "RSS or VMQ tuning on Wi-Fi",
+    "NetworkThrottlingIndex or SystemResponsiveness gaming tweaks",
+    "forced 5 GHz or maximum channel width",
+    "global USB selective suspend disable",
+    "Wi-Fi retry-limit reduction",
+    "blind CUBIC, BBR, ECN, L4S, or DSCP changes",
+    "firewall or antivirus disable",
+    "automatic random driver installation",
+)
+
 MAC_RE = re.compile(r"(?i)\b(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}\b")
+IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+TOKEN_VALUE_RE = re.compile(
+    r"(?i)\b(?:bearer\s+[A-Za-z0-9._~+/=-]{16,}|npm_[A-Za-z0-9]{20,}|"
+    r"gh[pousr]_[A-Za-z0-9_]{20,}|token[_-]like[_-][A-Za-z0-9_=-]{16,}|"
+    r"(?:token|secret|password|passwd|api[_-]?key|auth)[=:]\S+)\b"
+)
+SECRET_ARG_RE = re.compile(r"(?i)(token|secret|password|passwd|api[_-]?key|auth)")
 GUID_RE = re.compile(
     r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"
 )
@@ -1790,9 +1898,361 @@ ConvertTo-Json -InputObject $items -Depth 4 -Compress
     return data
 
 
+def capability_matrix() -> List[Dict[str, str]]:
+    system = platform.system()
+    matrix: List[Dict[str, str]] = [
+        {
+            "capability": "Idle gateway and remote latency probes",
+            "available": "yes",
+            "source": "ping command with HTTPS/DNS corroboration",
+            "privilege": "none",
+            "mutation": "none",
+        },
+        {
+            "capability": "Application command watch",
+            "available": "yes",
+            "source": "subprocess without shell",
+            "privilege": "none",
+            "mutation": "none",
+        },
+        {
+            "capability": "npm weak-link profile",
+            "available": "yes" if npm_executable() else "no",
+            "source": "npm config user location",
+            "privilege": "user",
+            "mutation": "application-scoped, snapshot-backed",
+        },
+        {
+            "capability": "Router SQM/AQM control",
+            "available": "no",
+            "source": "endpoint-only tool boundary",
+            "privilege": "router administrator",
+            "mutation": "advice only",
+        },
+    ]
+    if system == "Windows":
+        matrix.extend(
+            [
+                {
+                    "capability": "Wi-Fi adapter inventory",
+                    "available": "yes",
+                    "source": "PowerShell NetAdapter structured JSON",
+                    "privilege": "none",
+                    "mutation": "none",
+                },
+                {
+                    "capability": "Adapter-scoped power stability profile",
+                    "available": "conditional",
+                    "source": "Get/Set-NetAdapterPowerManagement and powercfg",
+                    "privilege": "administrator to write",
+                    "mutation": "snapshot-backed, opt-in apply path",
+                },
+                {
+                    "capability": "Windows WLAN report",
+                    "available": "conditional",
+                    "source": "netsh wlan report",
+                    "privilege": "user",
+                    "mutation": "none",
+                },
+            ]
+        )
+    elif system == "Linux":
+        matrix.extend(
+            [
+                {
+                    "capability": "NetworkManager Wi-Fi profile inventory",
+                    "available": "yes" if shutil.which("nmcli") else "no",
+                    "source": "nmcli structured fields",
+                    "privilege": "none",
+                    "mutation": "none",
+                },
+                {
+                    "capability": "NetworkManager Wi-Fi powersave profile",
+                    "available": "conditional",
+                    "source": "nmcli 802-11-wireless.powersave",
+                    "privilege": "polkit/root to write",
+                    "mutation": "snapshot-backed, opt-in apply path",
+                },
+                {
+                    "capability": "nl80211 deep station counters",
+                    "available": "planned",
+                    "source": "kernel nl80211",
+                    "privilege": "none or platform-dependent",
+                    "mutation": "none",
+                },
+            ]
+        )
+    elif system == "Darwin":
+        matrix.extend(
+            [
+                {
+                    "capability": "Working-condition responsiveness",
+                    "available": "conditional",
+                    "source": "networkQuality when present",
+                    "privilege": "none",
+                    "mutation": "none",
+                },
+                {
+                    "capability": "Wi-Fi system mutation",
+                    "available": "no",
+                    "source": "no documented public control used by this tool",
+                    "privilege": "n/a",
+                    "mutation": "none",
+                },
+            ]
+        )
+    else:
+        matrix.append(
+            {
+                "capability": f"{system} system tuning",
+                "available": "no",
+                "source": "unsupported platform",
+                "privilege": "n/a",
+                "mutation": "none",
+            }
+        )
+    return matrix
+
+
+def repository_map() -> Dict[str, Any]:
+    return {
+        "public_commands": [
+            "diagnose",
+            "measure idle",
+            "watch -- <command>",
+            "audit",
+            "apply",
+            "restore",
+            "list-backups",
+        ],
+        "platform_abstractions": {
+            "windows": "PowerShell/PowerCFG/NetAdapter read and adapter-scoped power writes",
+            "linux": "NetworkManager/nmcli read and active Wi-Fi profile powersave writes",
+            "macos": "diagnostics plus optional networkQuality; no undocumented Wi-Fi writes",
+        },
+        "snapshot_restore": {
+            "location": str(state_root() / "backups"),
+            "schema_version": SCHEMA_VERSION,
+            "restore_semantics": "snapshot-backed restore with conflict backup for npm user config",
+        },
+        "application_profiles": ["npm weak-link profile"],
+        "privileged_operations": [
+            "Windows system apply/restore requires Administrator",
+            "Linux NetworkManager write may require polkit/root",
+        ],
+        "tests": "standard-library smoke checks plus policy tests",
+        "remaining_gaps": [
+            "Native Wi-Fi ctypes backend is not yet implemented",
+            "Linux nl80211 counter backend is not yet implemented",
+            "Out-of-process rollback watchdog is not yet implemented",
+            "Benchmark acceptance still requires repeated external workloads",
+            "Router integration remains advisory only",
+        ],
+    }
+
+
+def observation_record(
+    kind: str,
+    severity: str,
+    facts: Sequence[str],
+    confidence: float,
+    limitations: Sequence[str],
+) -> Dict[str, Any]:
+    return {
+        "id": f"obs-{kind}",
+        "kind": kind,
+        "severity": severity,
+        "facts": list(facts),
+        "confidence": round(max(0.0, min(1.0, confidence)), 2),
+        "limitations": list(limitations),
+    }
+
+
+def recommendation_record(
+    identifier: str,
+    layer: str,
+    title: str,
+    evidence_grade: str,
+    risk: str,
+    observations: Sequence[str],
+    expected_metrics: Sequence[str],
+    uncertainty: str,
+) -> Dict[str, Any]:
+    return {
+        "id": identifier,
+        "control_layer": layer,
+        "title": title,
+        "evidence_grade": evidence_grade,
+        "risk": risk,
+        "automatic": False,
+        "trigger_observations": list(observations),
+        "expected_metrics": list(expected_metrics),
+        "uncertainty": uncertainty,
+    }
+
+
+def classify_measurement(
+    baseline: Mapping[str, Any],
+    load: Optional[Mapping[str, Any]] = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    active = load if load is not None else baseline
+    observations: List[Dict[str, Any]] = []
+    recommendations: List[Dict[str, Any]] = []
+    gateway = active.get("gateway_ping", {})
+    public = active.get("public_ping", {})
+    dns = active.get("dns", {})
+    registry = active.get("registry_https", {})
+
+    gateway_loss = float(gateway.get("loss_percent") or 0.0)
+    public_loss = float(public.get("loss_percent") or 0.0)
+    dns_fail = float(dns.get("failure_percent") or 0.0)
+    registry_fail = float(registry.get("failure_percent") or 0.0)
+
+    if gateway.get("available") and gateway_loss >= 10.0:
+        observations.append(
+            observation_record(
+                "gateway_latency_or_loss",
+                "high",
+                [f"gateway_loss_percent={gateway_loss:g}"],
+                0.72,
+                ["ICMP may be deprioritized by some routers."],
+            )
+        )
+        recommendations.append(
+            recommendation_record(
+                "rec-local-link-watch",
+                "wifi_link",
+                "Repeat a watched run and compare with placement, band, or wired/Ethernet evidence",
+                "A/B/C",
+                "read-only",
+                ["obs-gateway_latency_or_loss"],
+                ["loss", "loaded_latency", "disconnects"],
+                "Gateway loss alone cannot distinguish Wi-Fi RF, AP contention, adapter reset, or router CPU behavior.",
+            )
+        )
+
+    if public.get("available") and public_loss >= 10.0 and gateway_loss < 5.0:
+        observations.append(
+            observation_record(
+                "remote_path_loss",
+                "high",
+                [f"public_loss_percent={public_loss:g}", f"gateway_loss_percent={gateway_loss:g}"],
+                0.76,
+                ["A single public target can be rate-limited or filtered."],
+            )
+        )
+        recommendations.append(
+            recommendation_record(
+                "rec-remote-path-diversity",
+                "isp_path",
+                "Test multiple remote endpoints before changing local Wi-Fi or TCP settings",
+                "A",
+                "read-only",
+                ["obs-remote_path_loss"],
+                ["loss", "target_diversity"],
+                "Remote loss with a stable gateway can be ISP, route, target, proxy, or VPN behavior.",
+            )
+        )
+
+    if dns.get("available") and dns_fail > 0.0 and registry_fail == 0.0:
+        observations.append(
+            observation_record(
+                "resolver_delay_or_failure",
+                "medium",
+                [f"dns_failure_percent={dns_fail:g}", "https_probe_success=true"],
+                0.66,
+                ["The current probe does not separate cached from uncached resolver responses."],
+            )
+        )
+        recommendations.append(
+            recommendation_record(
+                "rec-dns-phase-timing",
+                "host_transport",
+                "Run request-phase diagnostics before changing DNS providers",
+                "A",
+                "read-only",
+                ["obs-resolver_delay_or_failure"],
+                ["dns_latency", "connect_latency"],
+                "DNS changes can affect lookup latency or address selection, not raw Wi-Fi capacity.",
+            )
+        )
+
+    if load is not None:
+        base_public = baseline.get("public_ping", {})
+        base_median = base_public.get("median_ms")
+        load_p95 = public.get("p95_ms")
+        if base_median is not None and load_p95 is not None:
+            threshold = max(200.0, float(base_median) * 4.0)
+            if float(load_p95) >= threshold and gateway_loss < 10.0:
+                observations.append(
+                    observation_record(
+                        "loaded_latency_inflation",
+                        "high",
+                        [f"idle_public_median_ms={float(base_median):g}", f"load_public_p95_ms={float(load_p95):g}"],
+                        0.82,
+                        ["Short runs are preliminary; repeat with upload/download direction separated."],
+                    )
+                )
+                recommendations.append(
+                    recommendation_record(
+                        "rec-router-sqm-advice",
+                        "router_queue",
+                        "Evaluate SQM/FQ-CoDel/CAKE at the WAN bottleneck",
+                        "A",
+                        "moderate",
+                        ["obs-loaded_latency_inflation"],
+                        ["loaded_latency", "loss", "fairness"],
+                        "A PC-side tool can measure this symptom but cannot directly fix a modem/router queue.",
+                    )
+                )
+
+    if not observations:
+        observations.append(
+            observation_record(
+                "insufficient_evidence",
+                "low",
+                ["no_threshold_crossed=true"],
+                0.35,
+                ["More samples or a watched failing workload may be required."],
+            )
+        )
+        recommendations.append(
+            recommendation_record(
+                "rec-collect-working-evidence",
+                "application",
+                "Capture a watched run during the failure",
+                "A/B",
+                "read-only",
+                ["obs-insufficient_evidence"],
+                ["command_exit_status", "gateway_latency", "remote_latency"],
+                "The current data does not identify a single control layer.",
+            )
+        )
+    return observations, recommendations
+
+
+def redact_command(command: Sequence[str]) -> List[str]:
+    redacted: List[str] = []
+    hide_next = False
+    for item in command:
+        if hide_next:
+            redacted.append("<redacted-secret>")
+            hide_next = False
+            continue
+        if SECRET_ARG_RE.search(item):
+            redacted.append("<redacted-secret-arg>")
+            if "=" not in item:
+                hide_next = True
+            continue
+        redacted.append(TOKEN_VALUE_RE.sub("<redacted-secret>", item))
+    return redacted
+
+
 def redact_report_value(value: Any) -> Any:
     if isinstance(value, str):
-        return MAC_RE.sub("<redacted-mac>", value)
+        redacted = MAC_RE.sub("<redacted-mac>", value)
+        redacted = TOKEN_VALUE_RE.sub("<redacted-secret>", redacted)
+        return IPV4_RE.sub("<redacted-ipv4>", redacted)
     if isinstance(value, list):
         return [redact_report_value(item) for item in value]
     if isinstance(value, dict):
@@ -1828,6 +2288,46 @@ def maybe_generate_windows_wlan_report(enabled: bool) -> Optional[Dict[str, Any]
     return record
 
 
+def command_audit(args: argparse.Namespace) -> int:
+    gateway = default_gateway()
+    report: Dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "tool": {"name": APP_DISPLAY_NAME, "version": VERSION},
+        "created_utc": utc_now_iso(),
+        "platform": platform_metadata(),
+        "gateway": gateway,
+        "repository_map": repository_map(),
+        "control_layers": list(CONTROL_LAYERS),
+        "capability_matrix": capability_matrix(),
+        "evidence_policy": list(EVIDENCE_POLICY),
+        "anti_folklore_denylist": list(ANTI_FOLKLORE_DENYLIST),
+        "normal_mode_boundaries": [
+            "audit, diagnose, measure, watch, and list-backups are read-only apart from explicit report files",
+            "apply and restore are the only normal commands that write persistent settings",
+            "router queue control remains advisory unless a separate reviewed router plugin exists",
+            "macOS Wi-Fi mutation is not implemented through undocumented controls",
+        ],
+    }
+    if args.platform_diagnostics:
+        report["platform_diagnostics"] = collect_platform_diagnostics()
+    if args.redact:
+        report = redact_report_value(report)
+    destination = Path(args.output).expanduser() if args.output else report_path("audit")
+    atomic_write_json(destination, report, private_parent=not bool(args.output))
+
+    print("Evidence audit:")
+    print(f"  Platform: {platform.system()} {platform.release()}")
+    print(f"  Gateway: {gateway or 'not detected'}")
+    print("  Normal mode denies:")
+    for item in ANTI_FOLKLORE_DENYLIST:
+        print(f"    - {item}")
+    print("  Capability matrix:")
+    for row in report["capability_matrix"]:
+        print(f"    - {row['capability']}: {row['available']} ({row['mutation']})")
+    print(f"Report saved: {destination}")
+    return 0
+
+
 def command_diagnose(args: argparse.Namespace) -> int:
     gateway = default_gateway()
     print(f"Default gateway: {gateway or 'not detected'}")
@@ -1841,6 +2341,7 @@ def command_diagnose(args: argparse.Namespace) -> int:
     )
     summary = summarize_samples(samples)
     print_sample_summary(summary, "Measurement summary:")
+    observations, recommendations = classify_measurement(summary)
 
     report: Dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -1851,6 +2352,9 @@ def command_diagnose(args: argparse.Namespace) -> int:
         "targets": {"public_ping": args.public_target, "registry": args.registry_host},
         "samples": samples,
         "summary": summary,
+        "observations": observations,
+        "recommendations": recommendations,
+        "capability_matrix": capability_matrix(),
         "platform_diagnostics": collect_platform_diagnostics(),
         "network_quality": maybe_run_network_quality(args.network_quality),
         "windows_wlan_report": maybe_generate_windows_wlan_report(args.wlan_report),
@@ -1865,6 +2369,10 @@ def command_diagnose(args: argparse.Namespace) -> int:
     atomic_write_json(destination, report, private_parent=not bool(args.output))
     print(f"Report saved: {destination}")
     return 0
+
+
+def command_measure_idle(args: argparse.Namespace) -> int:
+    return command_diagnose(args)
 
 
 def launch_monitored_command(command: Sequence[str]) -> subprocess.Popen[Any]:
@@ -1941,6 +2449,7 @@ def command_watch(args: argparse.Namespace) -> int:
     load_summary = summarize_samples(load_samples)
     print_sample_summary(load_summary, "During command:")
     signals = compare_phases(baseline_summary, load_summary)
+    observations, recommendations = classify_measurement(baseline_summary, load_summary)
     print("Interpretation:")
     for signal in signals:
         print(f"  - {signal}")
@@ -1952,7 +2461,7 @@ def command_watch(args: argparse.Namespace) -> int:
         "platform": platform_metadata(),
         "gateway": gateway,
         "targets": {"public_ping": args.public_target, "registry": args.registry_host},
-        "command": command,
+        "command": redact_command(command) if args.redact else command,
         "command_returncode": returncode,
         "interrupted": interrupted,
         "baseline_samples": baseline_samples,
@@ -1960,6 +2469,9 @@ def command_watch(args: argparse.Namespace) -> int:
         "baseline_summary": baseline_summary,
         "load_summary": load_summary,
         "interpretation": signals,
+        "observations": observations,
+        "recommendations": recommendations,
+        "capability_matrix": capability_matrix(),
         "notes": [
             "ICMP can be rate-limited or blocked; HTTPS probes are included for corroboration.",
             "A host-side tool cannot repair queues inside an ISP modem/router; SQM must run at the bottleneck.",
@@ -2014,6 +2526,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     subparsers = parser.add_subparsers(dest="command_name", required=True)
 
+    audit = subparsers.add_parser("audit", help="write a read-only evidence, capability, and safety-policy report")
+    audit.add_argument("--output", help="write JSON report to this path")
+    audit.add_argument("--redact", action="store_true", help="redact identifiers in the saved report")
+    audit.add_argument(
+        "--no-platform-diagnostics",
+        dest="platform_diagnostics",
+        action="store_false",
+        help="skip OS command diagnostics and only emit the policy/capability model",
+    )
+    audit.set_defaults(function=command_audit, platform_diagnostics=True)
+
     diagnose = subparsers.add_parser("diagnose", help="collect idle network and adapter diagnostics")
     diagnose.add_argument("--samples", type=positive_int, default=10, help="number of network samples (default: 10)")
     diagnose.add_argument(
@@ -2028,6 +2551,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_probe_options(diagnose)
     diagnose.set_defaults(function=command_diagnose)
+
+    measure = subparsers.add_parser("measure", help="measurement-first diagnostics without applying settings")
+    measure_subparsers = measure.add_subparsers(dest="measure_name", required=True)
+    measure_idle = measure_subparsers.add_parser("idle", help="collect idle baseline samples")
+    measure_idle.add_argument("--samples", type=positive_int, default=10, help="number of network samples (default: 10)")
+    measure_idle.add_argument(
+        "--network-quality",
+        action="store_true",
+        help="on macOS, additionally run Apple's loaded networkQuality test",
+    )
+    measure_idle.add_argument(
+        "--wlan-report",
+        action="store_true",
+        help="on Windows, generate Microsoft's WLAN disconnect report",
+    )
+    add_probe_options(measure_idle)
+    measure_idle.set_defaults(function=command_measure_idle)
 
     watch = subparsers.add_parser("watch", help="monitor gateway/public/registry health while a command runs")
     watch.add_argument(

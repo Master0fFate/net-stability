@@ -17,7 +17,7 @@ from typing import Final, Literal
 APP_TITLE: Final = "Net Stability"
 SCRIPT_PATH: Final = Path(__file__).with_name("net_stability.py")
 
-StageName = Literal["check", "backup", "npm", "system", "done"]
+StageName = Literal["check", "audit", "backup", "npm", "system", "done"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,12 +29,22 @@ class CommandSpec:
 
 COMMANDS: Final[tuple[CommandSpec, ...]] = (
     CommandSpec(
+        "Audit evidence first",
+        ("audit", "--redact"),
+        "Create a read-only evidence, capability, and safety-policy report.",
+    ),
+    CommandSpec(
+        "Measure idle baseline",
+        ("measure", "idle", "--samples", "5", "--redact"),
+        "Collect baseline gateway, remote, DNS, and HTTPS measurements.",
+    ),
+    CommandSpec(
         "Optimize connection",
         ("apply", "--yes"),
         "Back up current settings, tune npm, and apply supported OS Wi-Fi reliability settings.",
     ),
     CommandSpec(
-        "Run diagnostics",
+        "Run full diagnostics",
         ("diagnose", "--samples", "5", "--redact"),
         "Measure network health and save a redacted JSON report.",
     ),
@@ -57,13 +67,14 @@ COMMANDS: Final[tuple[CommandSpec, ...]] = (
 
 STAGE_LABELS: Final[dict[StageName, str]] = {
     "check": "Check the connection and platform",
+    "audit": "Map evidence and safe capabilities",
     "backup": "Create a restore point",
     "npm": "Tune npm for weak links",
     "system": "Apply supported Wi-Fi power settings",
     "done": "Show the result and restore path",
 }
 
-STAGE_ORDER: Final[tuple[StageName, ...]] = ("check", "backup", "npm", "system", "done")
+STAGE_ORDER: Final[tuple[StageName, ...]] = ("check", "audit", "backup", "npm", "system", "done")
 
 
 class NetStabilityGui:
@@ -102,14 +113,14 @@ class NetStabilityGui:
         ttk.Label(outer, text=APP_TITLE, style="Title.TLabel").pack(anchor=tk.W)
         ttk.Label(
             outer,
-            text="Make weak Wi-Fi and npm installs more tolerant, with automatic backups before changes.",
+            text="Diagnose the failing layer first, then apply only reversible changes with restore points.",
             style="Lead.TLabel",
             wraplength=740,
         ).pack(anchor=tk.W, pady=(6, 20))
 
         primary = ttk.Button(
             outer,
-            text="Optimize connection",
+            text="Audit evidence first",
             style="Primary.TButton",
             command=lambda: self._start(COMMANDS[0]),
         )
@@ -137,9 +148,17 @@ class NetStabilityGui:
 
         advanced = ttk.Frame(outer)
         advanced.pack(fill=tk.X, pady=(0, 12))
-        for column, spec in enumerate(COMMANDS[1:]):
+        for index, spec in enumerate(COMMANDS[1:]):
+            row = index // 3
+            column = index % 3
             button = ttk.Button(advanced, text=spec.label, command=lambda item=spec: self._start(item))
-            button.grid(row=0, column=column, sticky=tk.EW, padx=(0 if column == 0 else 8, 0))
+            button.grid(
+                row=row,
+                column=column,
+                sticky=tk.EW,
+                padx=(0 if column == 0 else 8, 0),
+                pady=(0 if row == 0 else 8, 0),
+            )
             advanced.columnconfigure(column, weight=1)
 
         log_frame = ttk.Frame(outer, style="Panel.TFrame", padding=10)
@@ -196,6 +215,8 @@ class NetStabilityGui:
 
     def _infer_stage(self, line: str) -> None:
         lowered = line.lower()
+        if "evidence audit" in lowered or "capability matrix" in lowered:
+            self.events.put("STAGE:audit:Running")
         if "backup created" in lowered or "restore point" in lowered:
             self.events.put("STAGE:backup:Complete")
         if "npm " in lowered:
@@ -233,8 +254,11 @@ def smoke_check() -> int:
         print(f"Missing CLI script: {SCRIPT_PATH}", file=sys.stderr)
         return 1
     print(f"{APP_TITLE} GUI smoke check passed on {platform.system()}.")
-    print("Primary action: Optimize connection")
-    print("Advanced actions: Run diagnostics, Optimize npm only, Restore latest backup, Show backups")
+    print("Primary action: Audit evidence first")
+    print(
+        "Advanced actions: Measure idle baseline, Optimize connection, Run full diagnostics, "
+        "Optimize npm only, Restore latest backup, Show backups"
+    )
     return 0
 
 
