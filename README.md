@@ -13,12 +13,12 @@ It now includes a simple desktop UI for non-technical users: one main read-only 
 
 - Creates a restore point before applying changes.
 - Applies a weak-link npm profile: fewer per-origin sockets, longer fetch timeouts, more retries, and `prefer-offline`.
-- On Windows, adjusts documented Wi-Fi power behavior and supported adapter power properties when run as Administrator.
+- On Windows, restores restricted TCP receive-window auto-tuning to the normal Windows throughput profile, then adjusts documented Wi-Fi power behavior and supported adapter power properties when run as Administrator.
 - On Linux, disables NetworkManager Wi-Fi powersave on active Wi-Fi profiles when authorized.
 - On macOS, keeps system tuning diagnostic-only because there is no documented public Wi-Fi power equivalent used here.
 - Saves diagnostic JSON reports with control-layer observations, recommendations, capability matrices, and optional identifier/token redaction.
 - Generates a read-only evidence audit that lists supported capabilities, denied folklore tweaks, and the current implementation gaps.
-- Avoids broad folklore tweaks such as DNS replacement, MTU guessing, TCP auto-tuning edits, QoS-reservation changes, global USB suspend changes, or blanket NIC offload disabling.
+- Avoids broad folklore tweaks such as DNS replacement, MTU guessing, TCP auto-tuning disablement, QoS-reservation changes, global USB suspend changes, or blanket NIC offload disabling.
 
 ## Quick Start
 
@@ -159,7 +159,7 @@ Net Stability is intentionally conservative:
 - The tool favors documented OS knobs and explicit diagnostics.
 - Reports can be redacted before sharing.
 - Router queue management is advisory only; a PC-side utility cannot directly fix queues inside an ISP modem or router.
-- The normal path refuses fixed-MTU guesses, global IPv6/DNS/TCP folklore tweaks, blanket offload changes, global USB selective-suspend changes, and generic "gaming" registry recipes.
+- The normal path refuses fixed-MTU guesses, global IPv6/DNS/TCP folklore tweaks, TCP auto-tuning disablement, blanket offload changes, global USB selective-suspend changes, and generic "gaming" registry recipes.
 
 ## License
 

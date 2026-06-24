@@ -85,6 +85,8 @@ WINDOWS_WIFI_POWER_SETTING_GUID = "12bbebe6-58d6-4636-95bb-3217ef867c1a"
 
 DEFAULT_REGISTRY_HOST = "registry.npmjs.org"
 DEFAULT_PUBLIC_PING_TARGET = "1.1.1.1"
+WINDOWS_TCP_AUTOTUNING_NORMAL = "normal"
+WINDOWS_TCP_AUTOTUNING_REPAIR_VALUES = {"disabled", "highlyrestricted", "restricted", "experimental"}
 
 NPM_PROFILE_BASE: Dict[str, str] = {
     "fetch-retries": "5",
@@ -847,8 +849,44 @@ ConvertTo-Json -InputObject @($items) -Depth 5 -Compress
     return {"available": True, "adapters": parsed}
 
 
+def parse_windows_tcp_global_state(result: CommandResult) -> Dict[str, Any]:
+    if not result.ok:
+        return {
+            "available": False,
+            "error": result.error or result.stderr.strip() or result.stdout.strip(),
+        }
+    state: Dict[str, Any] = {"available": True, "raw": result.stdout}
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition(":")
+        if not separator:
+            continue
+        normalized_key = " ".join(key.strip().lower().split())
+        normalized_value = " ".join(value.strip().lower().split())
+        if normalized_key == "receive window auto-tuning level":
+            state["receive_window_autotuning"] = normalized_value
+    return state
+
+
+def windows_tcp_global_state() -> Dict[str, Any]:
+    result = run_command(["netsh", "interface", "tcp", "show", "global"], timeout=10)
+    return parse_windows_tcp_global_state(result)
+
+
+def windows_tcp_autotuning_needs_repair(state: Mapping[str, Any]) -> bool:
+    level = str(state.get("receive_window_autotuning") or "").strip().lower()
+    return level in WINDOWS_TCP_AUTOTUNING_REPAIR_VALUES
+
+
+def windows_set_tcp_autotuning(level: str) -> CommandResult:
+    return run_command(
+        ["netsh", "interface", "tcp", "set", "global", f"autotuninglevel={level}"],
+        timeout=10,
+    )
+
+
 def capture_windows_state() -> Dict[str, Any]:
     return {
+        "tcp_global": windows_tcp_global_state(),
         "power": windows_power_state(),
         "wifi_adapters": windows_wifi_adapters_state(),
     }
@@ -930,6 +968,27 @@ def apply_windows_system(
     restart: bool,
 ) -> None:
     state = manifest.get("state", {}).get("system", {})
+    tcp_global = state.get("tcp_global", {})
+    if isinstance(tcp_global, dict) and windows_tcp_autotuning_needs_repair(tcp_global):
+        original_level = str(tcp_global.get("receive_window_autotuning") or "").strip().lower()
+        result = windows_set_tcp_autotuning(WINDOWS_TCP_AUTOTUNING_NORMAL)
+        if result.ok:
+            record = {
+                "type": "windows_tcp_autotuning",
+                "original_level": original_level,
+                "applied": WINDOWS_TCP_AUTOTUNING_NORMAL,
+            }
+            manifest.setdefault("applied", {}).setdefault("system", []).append(record)
+            atomic_write_json(manifest_path, manifest)
+            print("  + Windows TCP receive-window auto-tuning: normal")
+        else:
+            print_command_failure("Windows TCP receive-window auto-tuning", result)
+            record_apply_issue(
+                manifest, manifest_path, "error", "windows",
+                "Windows TCP receive-window auto-tuning repair failed: "
+                f"{result.error or result.stderr.strip() or result.stdout.strip()}",
+            )
+
     power = state.get("power", {})
     if power.get("available"):
         scheme = str(power["scheme_guid"])
@@ -1005,6 +1064,21 @@ def restore_windows_system(manifest: Dict[str, Any], restart: bool) -> List[Dict
     state = manifest.get("state", {}).get("system", {})
     applied = manifest.get("applied", {}).get("system", [])
     results: List[Dict[str, Any]] = []
+
+    for item in applied:
+        if item.get("type") != "windows_tcp_autotuning":
+            continue
+        original_level = str(item.get("original_level") or "").strip().lower()
+        if original_level not in WINDOWS_TCP_AUTOTUNING_REPAIR_VALUES | {WINDOWS_TCP_AUTOTUNING_NORMAL}:
+            continue
+        command = windows_set_tcp_autotuning(original_level)
+        record = {"type": "windows_tcp_autotuning", "ok": command.ok}
+        if command.ok:
+            print(f"  + restored Windows TCP receive-window auto-tuning: {original_level}")
+        else:
+            record["error"] = command.error or command.stderr.strip()
+            print_command_failure("restore Windows TCP receive-window auto-tuning", command)
+        results.append(record)
 
     if any(item.get("type") == "windows_wifi_power" for item in applied):
         power = state.get("power", {})
@@ -1272,6 +1346,7 @@ def planned_changes(do_system: bool, do_npm: bool, include_battery: bool, maxsoc
     system = platform.system()
     if do_system:
         if system == "Windows":
+            changes.append("Restore Windows TCP receive-window auto-tuning to normal when restricted or disabled")
             changes.append("Set the active plan's Wi-Fi policy to Maximum Performance on AC" + (" and battery" if include_battery else ""))
             changes.append("Disable supported NDIS SelectiveSuspend and DeviceSleepOnDisconnect on physical Wi-Fi adapters")
         elif system == "Linux":
@@ -1328,18 +1403,18 @@ def create_snapshot(do_system: bool, do_npm: bool) -> Tuple[Path, Path, Dict[str
 def command_apply(args: argparse.Namespace) -> int:
     do_system = not args.npm_only
     do_npm = not args.system_only
-    validate_apply_context(do_system, do_npm)
 
     print("Planned changes:")
     for change in planned_changes(do_system, do_npm, args.include_battery, args.npm_maxsockets):
         print(f"  - {change}")
     if do_system and not args.no_restart and platform.system() in {"Windows", "Linux"}:
         print("  - The Wi-Fi adapter/connection may disconnect briefly while settings are activated")
-    print("No MTU, DNS, TCP auto-tuning, global USB suspend, or blanket offload settings will be changed.")
+    print("No MTU, DNS, TCP auto-tuning disablement, global USB suspend, or blanket offload settings will be changed.")
 
     if args.dry_run:
         print("Dry run complete; no snapshot or setting was written.")
         return 0
+    validate_apply_context(do_system, do_npm)
     if not confirm("Create a backup and apply these changes?", args.yes):
         print("Cancelled.")
         return 1

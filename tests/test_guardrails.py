@@ -113,6 +113,44 @@ class CliGuardrailTests(unittest.TestCase):
                 )
                 assert_no_unsafe_actions(self, planned_lines)
 
+    def test_windows_system_plan_when_dry_run_repairs_restricted_tcp_autotuning(self) -> None:
+        # Given: Windows system tuning is rendered without writing settings.
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        # When: the dry-run plan is generated for Windows.
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch("net_stability.platform.system", return_value="Windows"))
+            stack.enter_context(mock.patch("net_stability.validate_apply_context", return_value=None))
+            stack.enter_context(contextlib.redirect_stdout(stdout))
+            stack.enter_context(contextlib.redirect_stderr(stderr))
+            return_code = net_stability.main(("apply", "--dry-run", "--system-only", "--no-restart"))
+
+        # Then: the system plan includes repair of receive-window autotuning.
+        self.assertEqual(return_code, 0, stderr.getvalue())
+        output = stdout.getvalue()
+        self.assertIn("Restore Windows TCP receive-window auto-tuning to normal", output)
+        planned_lines = "\n".join(line for line in output.splitlines() if line.startswith("  - "))
+        assert_no_unsafe_actions(self, planned_lines)
+
+    def test_windows_tcp_state_when_autotuning_disabled_marks_repair_needed(self) -> None:
+        # Given: netsh reports the local throughput-hostile state seen on this machine.
+        result = net_stability.CommandResult(
+            ["netsh", "interface", "tcp", "show", "global"],
+            0,
+            "Receive Window Auto-Tuning Level    : disabled \n",
+            "",
+            1.0,
+        )
+
+        # When: the Windows TCP state is parsed.
+        state = net_stability.parse_windows_tcp_global_state(result)
+
+        # Then: the disabled receive window is identified as needing repair.
+        self.assertTrue(state["available"])
+        self.assertEqual(state["receive_window_autotuning"], "disabled")
+        self.assertTrue(net_stability.windows_tcp_autotuning_needs_repair(state))
+
 
 class ReportGuardrailTests(unittest.TestCase):
     def test_redacted_diagnose_report_when_generated_removes_mac_and_token_like_values(self) -> None:
