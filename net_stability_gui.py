@@ -101,7 +101,7 @@ class NetStabilityGui:
         self.running = False
 
         self.root.title(APP_TITLE)
-        self.root.geometry("860+780")
+        self.root.geometry("860x780")
         self.root.minsize(720, 600)
         self._configure_style()
         self._build()
