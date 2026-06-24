@@ -17,7 +17,7 @@ from typing import Final, Literal
 APP_TITLE: Final = "Net Stability"
 SCRIPT_PATH: Final = Path(__file__).with_name("net_stability.py")
 
-StageName = Literal["check", "audit", "backup", "npm", "system", "done"]
+StageName = Literal["check", "audit", "backup", "npm", "system", "tuning", "reset", "done"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,6 +25,7 @@ class CommandSpec:
     label: str
     args: tuple[str, ...]
     description: str
+    primary: bool = False
 
 
 COMMANDS: Final[tuple[CommandSpec, ...]] = (
@@ -32,6 +33,13 @@ COMMANDS: Final[tuple[CommandSpec, ...]] = (
         "Audit evidence first",
         ("audit", "--redact"),
         "Create a read-only evidence, capability, and safety-policy report.",
+        primary=True,
+    ),
+    CommandSpec(
+        "Full Optimization",
+        ("apply", "--yes"),
+        "Back up and apply ALL supported reliability, TCP/IP, and DNS optimizations.",
+        primary=True,
     ),
     CommandSpec(
         "Measure idle baseline",
@@ -39,19 +47,24 @@ COMMANDS: Final[tuple[CommandSpec, ...]] = (
         "Collect baseline gateway, remote, DNS, and HTTPS measurements.",
     ),
     CommandSpec(
-        "Optimize connection",
-        ("apply", "--yes"),
-        "Back up current settings, tune npm, and apply supported OS Wi-Fi reliability settings.",
-    ),
-    CommandSpec(
         "Run full diagnostics",
         ("diagnose", "--samples", "5", "--redact"),
         "Measure network health and save a redacted JSON report.",
     ),
     CommandSpec(
+        "Optimize connection",
+        ("apply", "--system-only", "--yes"),
+        "Apply system-level OS reliability and tuning settings (requires admin).",
+    ),
+    CommandSpec(
         "Optimize npm only",
         ("apply", "--npm-only", "--yes"),
-        "Use only user-level npm settings. This does not require administrator rights.",
+        "Use only user-level npm settings. Does not require administrator rights.",
+    ),
+    CommandSpec(
+        "Reset Network Stack",
+        ("reset-network", "--yes"),
+        "Reset TCP/IP, Winsock, and DNS to OS defaults (requires reboot).",
     ),
     CommandSpec(
         "Restore latest backup",
@@ -70,11 +83,13 @@ STAGE_LABELS: Final[dict[StageName, str]] = {
     "audit": "Map evidence and safe capabilities",
     "backup": "Create a restore point",
     "npm": "Tune npm for weak links",
-    "system": "Apply supported Wi-Fi power settings",
+    "system": "Apply OS Wi-Fi power and adapter settings",
+    "tuning": "Apply TCP/IP, DNS, and buffer tuning",
+    "reset": "Reset network stack",
     "done": "Show the result and restore path",
 }
 
-STAGE_ORDER: Final[tuple[StageName, ...]] = ("check", "audit", "backup", "npm", "system", "done")
+STAGE_ORDER: Final[tuple[StageName, ...]] = ("check", "audit", "backup", "npm", "system", "tuning", "reset", "done")
 
 
 class NetStabilityGui:
@@ -86,8 +101,8 @@ class NetStabilityGui:
         self.running = False
 
         self.root.title(APP_TITLE)
-        self.root.geometry("860x680")
-        self.root.minsize(720, 560)
+        self.root.geometry("860+780")
+        self.root.minsize(720, 600)
         self._configure_style()
         self._build()
         self.root.after(120, self._drain_events)
@@ -103,7 +118,8 @@ class NetStabilityGui:
         style.configure("Lead.TLabel", font=("Segoe UI", 11), foreground="#40516f")
         style.configure("Stage.TLabel", background="#ffffff", foreground="#172033", font=("Segoe UI", 10))
         style.configure("StageStatus.TLabel", background="#ffffff", foreground="#556987", font=("Segoe UI", 10, "bold"))
-        style.configure("Primary.TButton", font=("Segoe UI", 15, "bold"), padding=(24, 18))
+        style.configure("Primary.TButton", font=("Segoe UI", 14, "bold"), padding=(24, 16))
+        style.configure("Danger.TButton", font=("Segoe UI", 12, "bold"), padding=(18, 14))
         style.configure("TButton", font=("Segoe UI", 10), padding=(14, 8))
 
     def _build(self) -> None:
@@ -118,46 +134,61 @@ class NetStabilityGui:
             wraplength=740,
         ).pack(anchor=tk.W, pady=(6, 20))
 
-        primary = ttk.Button(
-            outer,
-            text="Audit evidence first",
-            style="Primary.TButton",
-            command=lambda: self._start(COMMANDS[0]),
-        )
-        primary.pack(fill=tk.X)
+        primary_frame = ttk.Frame(outer)
+        primary_frame.pack(fill=tk.X)
+        for index, spec in enumerate(COMMANDS):
+            if not spec.primary:
+                continue
+            btn = ttk.Button(
+                primary_frame,
+                text=spec.label,
+                style="Primary.TButton",
+                command=lambda item=spec: self._start(item),
+            )
+            btn.pack(fill=tk.X, pady=(4, 4))
 
-        ttk.Label(outer, textvariable=self.status_var, style="Lead.TLabel").pack(anchor=tk.W, pady=(14, 16))
+        ttk.Label(outer, textvariable=self.status_var, style="Lead.TLabel").pack(anchor=tk.W, pady=(14, 12))
 
-        stage_panel = ttk.Frame(outer, style="Panel.TFrame", padding=18)
-        stage_panel.pack(fill=tk.X, pady=(0, 18))
+        stage_panel = ttk.Frame(outer, style="Panel.TFrame", padding=14)
+        stage_panel.pack(fill=tk.X, pady=(0, 14))
         for index, name in enumerate(STAGE_ORDER):
             ttk.Label(stage_panel, text=f"{index + 1}. {STAGE_LABELS[name]}", style="Stage.TLabel").grid(
                 row=index,
                 column=0,
                 sticky=tk.W,
-                pady=5,
+                pady=3,
             )
             ttk.Label(stage_panel, textvariable=self.stage_vars[name], style="StageStatus.TLabel").grid(
                 row=index,
                 column=1,
                 sticky=tk.E,
                 padx=(16, 0),
-                pady=5,
+                pady=3,
             )
         stage_panel.columnconfigure(0, weight=1)
 
+        advanced_header = ttk.Label(
+            outer, text="Advanced actions", style="Lead.TLabel"
+        )
+        advanced_header.pack(anchor=tk.W, pady=(0, 6))
+
         advanced = ttk.Frame(outer)
         advanced.pack(fill=tk.X, pady=(0, 12))
-        for index, spec in enumerate(COMMANDS[1:]):
-            row = index // 3
-            column = index % 3
-            button = ttk.Button(advanced, text=spec.label, command=lambda item=spec: self._start(item))
+        non_primary = [spec for spec in COMMANDS if not spec.primary]
+        grid_cols = 3
+        for index, spec in enumerate(non_primary):
+            row = index // grid_cols
+            column = index % grid_cols
+            style = "Danger.TButton" if "Reset" in spec.label else "TButton"
+            button = ttk.Button(
+                advanced, text=spec.label, style=style, command=lambda item=spec: self._start(item)
+            )
             button.grid(
                 row=row,
                 column=column,
                 sticky=tk.EW,
                 padx=(0 if column == 0 else 8, 0),
-                pady=(0 if row == 0 else 8, 0),
+                pady=(0 if row == 0 else 6, 0),
             )
             advanced.columnconfigure(column, weight=1)
 
@@ -219,11 +250,23 @@ class NetStabilityGui:
             self.events.put("STAGE:audit:Running")
         if "backup created" in lowered or "restore point" in lowered:
             self.events.put("STAGE:backup:Complete")
-        if "npm " in lowered:
+        if "npm " in lowered and "reset" not in lowered:
             self.events.put("STAGE:npm:Running")
-        if "wi-fi" in lowered or "networkmanager" in lowered or "adapter" in lowered:
+        if "wi-fi" in lowered or "networkmanager" in lowered or "adapter" in lowered or "powersave" in lowered:
             self.events.put("STAGE:system:Running")
+        if "mtu" in lowered or "ecn" in lowered or "delivery optimization" in lowered or "qos" in lowered:
+            self.events.put("STAGE:tuning:Running")
+        if "lso" in lowered or "tcp retrans" in lowered or "sysctl" in lowered or "ring buffer" in lowered:
+            self.events.put("STAGE:tuning:Running")
+        if "irqbalance" in lowered or "dns set" in lowered or "tcp buffer" in lowered:
+            self.events.put("STAGE:tuning:Running")
+        if "network stack" in lowered or "netsh int ip reset" in lowered or "winsock" in lowered:
+            self.events.put("STAGE:reset:Running")
+        if "route -n flush" in lowered or "systemctl restart networkmanager" in lowered:
+            self.events.put("STAGE:reset:Running")
         if "applied." in lowered or "report saved" in lowered or "restored" in lowered:
+            self.events.put("STAGE:done:Complete")
+        if "reset completed" in lowered or "reboot is recommended" in lowered:
             self.events.put("STAGE:done:Complete")
 
     def _drain_events(self) -> None:
@@ -234,8 +277,12 @@ class NetStabilityGui:
                 self.status_var.set("Ready")
                 continue
             if event.startswith("STAGE:"):
-                _, stage, value = event.strip().split(":", 2)
-                self.stage_vars[stage].set(value)
+                try:
+                    _, stage, value = event.strip().split(":", 2)
+                    if stage in self.stage_vars:
+                        self.stage_vars[stage].set(value)
+                except ValueError:
+                    pass
                 continue
             self._write_log(event)
         self.root.after(120, self._drain_events)
@@ -254,10 +301,10 @@ def smoke_check() -> int:
         print(f"Missing CLI script: {SCRIPT_PATH}", file=sys.stderr)
         return 1
     print(f"{APP_TITLE} GUI smoke check passed on {platform.system()}.")
-    print("Primary action: Audit evidence first")
+    print("Primary actions: Audit evidence first, Full Optimization")
     print(
-        "Advanced actions: Measure idle baseline, Optimize connection, Run full diagnostics, "
-        "Optimize npm only, Restore latest backup, Show backups"
+        "Advanced actions: Measure idle baseline, Run full diagnostics, Optimize connection, "
+        "Optimize npm only, Reset Network Stack, Restore latest backup, Show backups"
     )
     return 0
 

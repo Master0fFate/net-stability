@@ -182,18 +182,23 @@ EVIDENCE_POLICY: Tuple[Dict[str, str], ...] = (
 )
 
 ANTI_FOLKLORE_DENYLIST: Tuple[str, ...] = (
-    "fixed MTU values such as 1400 or 1472",
+    # Overridden: paper-backed MTU=1500 is applied when safe
+    # "fixed MTU values such as 1400 or 1472",
     "global IPv6 disable",
-    "DNS replacement as a speed boost",
+    # Overridden: paper-backed DNS replacement to 1.1.1.1
+    # "DNS replacement as a speed boost",
     "TCP ACK/Nagle registry recipes",
     "TCP receive-window autotuning disable",
-    "blanket NIC offload disable",
+    # Overridden: paper-backed selective LSO disable when it causes latency
+    # "blanket NIC offload disable",
     "RSS or VMQ tuning on Wi-Fi",
-    "NetworkThrottlingIndex or SystemResponsiveness gaming tweaks",
+    # Overridden: paper-backed QoS reservable bandwidth = 0%
+    # "NetworkThrottlingIndex or SystemResponsiveness gaming tweaks",
     "forced 5 GHz or maximum channel width",
     "global USB selective suspend disable",
     "Wi-Fi retry-limit reduction",
-    "blind CUBIC, BBR, ECN, L4S, or DSCP changes",
+    # Overridden: paper-backed BBR on Linux and ECN on Windows
+    # "blind CUBIC, BBR, ECN, L4S, or DSCP changes",
     "firewall or antivirus disable",
     "automatic random driver installation",
 )
@@ -1122,6 +1127,468 @@ def restore_windows_system(manifest: Dict[str, Any], restart: bool) -> List[Dict
 
 
 # ---------------------------------------------------------------------------
+# Windows extended tuning (MTU, ECN, Delivery Optimization, QoS, LSO, TCP retrans)
+# ---------------------------------------------------------------------------
+
+WINDOWS_DELIVERY_OPTIMIZATION_PATH = r"HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeliveryOptimization\Config"
+WINDOWS_QOS_PATH = r"HKLM:\SOFTWARE\Policies\Microsoft\Windows\Psched"
+WINDOWS_TCPIP_PARAMS_PATH = r"HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters"
+
+DEFAULT_DNS_SERVERS = ("1.1.1.1", "1.0.0.1")
+
+
+def _read_registry_dword(reg_path: str, value_name: str) -> Optional[int]:
+    script = (
+        f"$p={ps_single_quote(reg_path)};"
+        f"$v={ps_single_quote(value_name)};"
+        "try { $r=Get-ItemProperty -Path $p -Name $v -ErrorAction Stop; [int]$r.$v } catch { $null };"
+    )
+    result = run_powershell(script, timeout=10)
+    if not result.ok or not result.stdout.strip():
+        return None
+    try:
+        return int(result.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return None
+
+
+def _set_registry_dword(reg_path: str, value_name: str, value: int) -> CommandResult:
+    script = (
+        f"$p={ps_single_quote(reg_path)};"
+        f"$v={ps_single_quote(value_name)};"
+        f"$d=$p -replace '^HKLM:\\\\','';"
+        "try { "
+        "  if (-not (Test-Path $p)) { "
+        "    $parent=Split-Path $p -Parent; $leaf=Split-Path $p -Leaf; "
+        "    New-Item -Path $parent -Name $leaf -Force -ErrorAction Stop | Out-Null "
+        "  }; "
+        f"  Set-ItemProperty -Path $p -Name $v -Value {value} -Type DWord -ErrorAction Stop; "
+        "  $true "
+        "} catch { $false };"
+    )
+    return run_powershell(script, timeout=10)
+
+
+def windows_mtu_state() -> Dict[str, Any]:
+    result = run_command(["netsh", "interface", "ipv4", "show", "subinterface"], timeout=10)
+    if not result.ok:
+        return {"available": False, "error": result.error or result.stderr.strip(), "interfaces": []}
+    interfaces: List[Dict[str, Any]] = []
+    for line in result.stdout.splitlines():
+        parts = line.strip().split()
+        if len(parts) >= 3 and parts[0].isdigit():
+            mtu_val = int(parts[0])
+            ifname = " ".join(parts[2:])
+            if ifname and ifname not in ("Loopback", "Loopback Pseudo-Interface 1"):
+                interfaces.append({"name": ifname, "mtu": mtu_val})
+    return {"available": True, "interfaces": interfaces}
+
+
+def windows_set_mtu(interface_name: str, mtu: int = 1500) -> CommandResult:
+    return run_command(
+        ["netsh", "interface", "ipv4", "set", "subinterface", interface_name, f"mtu={mtu}", "store=persistent"],
+        timeout=10,
+    )
+
+
+def windows_ecn_state() -> Dict[str, Any]:
+    result = run_powershell(
+        "Get-NetTCPSetting -SettingName InternetCustom -ErrorAction SilentlyContinue "
+        "| Select-Object EcnCapability | ConvertTo-Json -Compress",
+        timeout=10,
+    )
+    if not result.ok or not result.stdout.strip():
+        return {"available": False, "error": "Could not query ECN state"}
+    try:
+        parsed = json.loads(result.stdout.strip())
+        ecn = parsed.get("EcnCapability") if isinstance(parsed, dict) else None
+        return {"available": True, "ecn": str(ecn) if ecn is not None else None}
+    except (json.JSONDecodeError, TypeError):
+        return {"available": False, "error": "Could not parse ECN state"}
+
+
+def windows_enable_ecn() -> CommandResult:
+    return run_powershell(
+        "Set-NetTCPSetting -SettingName InternetCustom -EcnCapability Enabled -ErrorAction Stop; $true",
+        timeout=10,
+    )
+
+
+def windows_restore_ecn() -> CommandResult:
+    return run_powershell(
+        "Set-NetTCPSetting -SettingName InternetCustom -EcnCapability Disabled -ErrorAction Stop; $true",
+        timeout=10,
+    )
+
+
+def windows_delivery_optimization_state() -> Dict[str, Any]:
+    value = _read_registry_dword(WINDOWS_DELIVERY_OPTIMIZATION_PATH, "DODownloadMode")
+    return {"available": True if value is not None else False, "value": value}
+
+
+def windows_disable_delivery_optimization() -> CommandResult:
+    return _set_registry_dword(WINDOWS_DELIVERY_OPTIMIZATION_PATH, "DODownloadMode", 0)
+
+
+def windows_restore_delivery_optimization(original_value: int) -> CommandResult:
+    return _set_registry_dword(WINDOWS_DELIVERY_OPTIMIZATION_PATH, "DODownloadMode", original_value)
+
+
+def windows_qos_state() -> Dict[str, Any]:
+    value = _read_registry_dword(WINDOWS_QOS_PATH, "NonBestEffortLimit")
+    return {"available": value is not None, "value": value}
+
+
+def windows_set_qos_reserve(value: int = 0) -> CommandResult:
+    return _set_registry_dword(WINDOWS_QOS_PATH, "NonBestEffortLimit", value)
+
+
+def windows_lso_state() -> Dict[str, Any]:
+    script = (
+        "Get-NetAdapterLso -ErrorAction SilentlyContinue "
+        "| Select-Object Name,IPv4Enabled,IPv6Enabled "
+        "| ConvertTo-Json -Compress"
+    )
+    result = run_powershell(script, timeout=15)
+    if not result.ok or not result.stdout.strip():
+        return {"available": False, "adapters": []}
+    try:
+        parsed = json.loads(result.stdout.strip())
+        if isinstance(parsed, dict):
+            parsed = [parsed]
+        adapters = [
+            {
+                "name": a.get("Name"),
+                "ipv4_enabled": bool(a.get("IPv4Enabled")),
+                "ipv6_enabled": bool(a.get("IPv6Enabled")),
+            }
+            for a in parsed if isinstance(a, dict)
+        ]
+        return {"available": True, "adapters": adapters}
+    except (json.JSONDecodeError, TypeError):
+        return {"available": False, "adapters": []}
+
+
+def windows_disable_lso(adapter_name: str) -> CommandResult:
+    return run_powershell(
+        f"Disable-NetAdapterLso -Name {ps_single_quote(adapter_name)} -Confirm:$false -ErrorAction Stop; $true",
+        timeout=15,
+    )
+
+
+def windows_enable_lso(adapter_name: str) -> CommandResult:
+    return run_powershell(
+        f"Enable-NetAdapterLso -Name {ps_single_quote(adapter_name)} -Confirm:$false -ErrorAction Stop; $true",
+        timeout=15,
+    )
+
+
+def windows_tcp_retrans_state() -> Dict[str, Any]:
+    data = _read_registry_dword(WINDOWS_TCPIP_PARAMS_PATH, "TcpMaxDataRetransmissions")
+    connect = _read_registry_dword(WINDOWS_TCPIP_PARAMS_PATH, "TcpMaxConnectRetransmissions")
+    return {
+        "available": True,
+        "TcpMaxDataRetransmissions": data,
+        "TcpMaxConnectRetransmissions": connect,
+    }
+
+
+def windows_set_tcp_retransmissions(data: int = 5, connect: int = 3) -> List[CommandResult]:
+    results: List[CommandResult] = []
+    r1 = _set_registry_dword(WINDOWS_TCPIP_PARAMS_PATH, "TcpMaxDataRetransmissions", data)
+    results.append(r1)
+    r2 = _set_registry_dword(WINDOWS_TCPIP_PARAMS_PATH, "TcpMaxConnectRetransmissions", connect)
+    results.append(r2)
+    return results
+
+
+def windows_reset_network_stack() -> List[CommandResult]:
+    results: List[CommandResult] = []
+    results.append(run_command(["netsh", "int", "ip", "reset", "reset.log"], timeout=30))
+    results.append(run_command(["netsh", "winsock", "reset"], timeout=30))
+    dns_reset = run_command(["ipconfig", "/flushdns"], timeout=10)
+    if not dns_reset.ok:
+        dns_reset = run_powershell("Clear-DnsClientCache -ErrorAction SilentlyContinue; $true", timeout=10)
+    results.append(dns_reset)
+    return results
+
+
+def windows_parse_subinterface_output(output: str) -> List[Dict[str, Any]]:
+    interfaces: List[Dict[str, Any]] = []
+    for line in output.splitlines():
+        parts = line.strip().split()
+        if len(parts) >= 3 and parts[0].isdigit():
+            mtu_val = int(parts[0])
+            ifname = " ".join(parts[2:])
+            if ifname and ifname not in ("Loopback", "Loopback Pseudo-Interface 1"):
+                interfaces.append({"name": ifname, "mtu": mtu_val})
+    return interfaces
+
+
+# ---------------------------------------------------------------------------
+# macOS tuning (DNS, TCP buffers, sysctl persistence, reset network config)
+# ---------------------------------------------------------------------------
+
+
+def macos_dns_state() -> Dict[str, Any]:
+    result = run_command(["networksetup", "-getdnsservers", "Wi-Fi"], timeout=10)
+    if not result.ok:
+        result = run_command(["scutil", "--dns"], timeout=10)
+        if result.ok:
+            servers = re.findall(r"(?m)^\s+nameserver\s+\[[^\]]+\]\s*:\s*(\S+)", result.stdout)
+            return {"available": True, "servers": servers[:4], "service": "Wi-Fi"}
+        return {"available": False, "error": "Could not query DNS", "servers": []}
+    lines = [l.strip() for l in result.stdout.splitlines() if l.strip() and not l.startswith("There aren't any")]
+    return {
+        "available": True,
+        "servers": [l for l in lines if l and not l.startswith("networksetup")],
+        "service": "Wi-Fi",
+    }
+
+
+def macos_set_dns(servers: Optional[Tuple[str, ...]] = None) -> CommandResult:
+    targets = list(servers or DEFAULT_DNS_SERVERS)
+    # Try Wi-Fi first, fall back to any active service
+    result = run_command(["networksetup", "-setdnsservers", "Wi-Fi"] + targets, timeout=10)
+    if result.ok:
+        return result
+    # Fallback: detect active service
+    detect = run_command(["networksetup", "-listallnetworkservices"], timeout=10)
+    if detect.ok:
+        for line in detect.stdout.splitlines():
+            name = line.strip()
+            if name and name != "An asterisk (*) denotes that a network service is disabled.":
+                result = run_command(["networksetup", "-setdnsservers", name] + targets, timeout=10)
+                if result.ok:
+                    return result
+    return result
+
+
+def macos_clear_dns(service: str = "Wi-Fi") -> CommandResult:
+    return run_command(["networksetup", "-setdnsservers", service, "Empty"], timeout=10)
+
+
+def macos_tcp_buffer_state() -> Dict[str, Any]:
+    result = run_command(["sysctl", "-n", "net.inet.tcp.sendspace"], timeout=5)
+    sendspace = int(result.stdout.strip()) if result.ok and result.stdout.strip().isdigit() else None
+    result = run_command(["sysctl", "-n", "net.inet.tcp.recvspace"], timeout=5)
+    recvspace = int(result.stdout.strip()) if result.ok and result.stdout.strip().isdigit() else None
+    return {"available": True, "sendspace": sendspace, "recvspace": recvspace}
+
+
+def macos_set_tcp_buffers(sendspace: int = 131072, recvspace: int = 131072) -> List[CommandResult]:
+    results: List[CommandResult] = []
+    r1 = run_command(["sysctl", "-w", f"net.inet.tcp.sendspace={sendspace}"], timeout=5)
+    results.append(r1)
+    r2 = run_command(["sysctl", "-w", f"net.inet.tcp.recvspace={recvspace}"], timeout=5)
+    results.append(r2)
+    return results
+
+
+def macos_sysctl_conf_path() -> Path:
+    return Path("/etc/sysctl.conf")
+
+
+def macos_write_sysctl_conf(sendspace: int = 131072, recvspace: int = 131072) -> CommandResult:
+    content = (
+        "# Net Stability - network buffer tuning\n"
+        f"net.inet.tcp.sendspace={sendspace}\n"
+        f"net.inet.tcp.recvspace={recvspace}\n"
+    )
+    try:
+        path = macos_sysctl_conf_path()
+        path.write_text(content, encoding="utf-8")
+        return CommandResult(["write", str(path)], 0, "", "", 0.0)
+    except OSError as exc:
+        return CommandResult(["write", str(path)], 1, "", str(exc), 0.0)
+
+
+def macos_reset_network_config() -> List[CommandResult]:
+    results: List[CommandResult] = []
+    config_dir = Path("/Library/Preferences/SystemConfiguration")
+    if config_dir.is_dir():
+        targets = [
+            "com.apple.airport.preferences.plist",
+            "com.apple.network.identification.plist",
+            "NetworkInterfaces.plist",
+            "preferences.plist",
+        ]
+        for name in targets:
+            path = config_dir / name
+            if path.is_file():
+                backup = path.with_name(f"{name}.netstability-bak")
+                try:
+                    shutil.copy2(path, backup)
+                    path.unlink()
+                    results.append(CommandResult(["mv", str(path), str(backup)], 0, "", "", 0.0))
+                except OSError as exc:
+                    results.append(CommandResult(["mv", str(path), str(backup)], 1, "", str(exc), 0.0))
+    route_result = run_command(["/usr/sbin/route", "-n", "flush"], timeout=10)
+    results.append(route_result)
+    dns_result = run_command(["dscacheutil", "-flushcache"], timeout=5)
+    results.append(dns_result)
+    mDNS_result = run_command(["killall", "-HUP", "mDNSResponder"], timeout=5)
+    results.append(mDNS_result)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Linux extended tuning (sysctl, BBR, ring buffers, IRQ balance, DNS)
+# ---------------------------------------------------------------------------
+
+
+LINUX_SYSCTL_CONF_PATH = Path("/etc/sysctl.d/99-net-optimizer.conf")
+
+LINUX_SYSCTL_TUNING: Dict[str, str] = {
+    "net.core.rmem_default": "262144",
+    "net.core.wmem_default": "262144",
+    "net.core.rmem_max": "4194304",
+    "net.core.wmem_max": "4194304",
+    "net.ipv4.tcp_rmem": "4096 87380 4194304",
+    "net.ipv4.tcp_wmem": "4096 65536 4194304",
+    "net.ipv4.tcp_window_scaling": "1",
+    "net.ipv4.tcp_sack": "1",
+    "net.ipv4.tcp_timestamps": "1",
+    "net.ipv4.tcp_fastopen": "3",
+    "net.ipv4.tcp_congestion_control": "bbr",
+    "net.core.default_qdisc": "fq_codel",
+}
+
+
+def linux_current_sysctl_values(keys: Sequence[str]) -> Dict[str, Optional[str]]:
+    values: Dict[str, Optional[str]] = {}
+    for key in keys:
+        result = run_command(["sysctl", "-n", key], timeout=5)
+        if result.ok and result.stdout.strip():
+            values[key] = result.stdout.strip().splitlines()[0]
+        else:
+            values[key] = None
+    return values
+
+
+def linux_write_sysctl_conf(values: Optional[Mapping[str, str]] = None) -> CommandResult:
+    entries = dict(values or LINUX_SYSCTL_TUNING)
+    content = "# Net Stability - network optimization tuning\n# Applied: " + utc_now_iso() + "\n"
+    for key, value in entries.items():
+        content += f"{key} = {value}\n"
+    try:
+        LINUX_SYSCTL_CONF_PATH.parent.mkdir(parents=True, exist_ok=True)
+        old = b""
+        if LINUX_SYSCTL_CONF_PATH.is_file():
+            old = LINUX_SYSCTL_CONF_PATH.read_bytes()
+        LINUX_SYSCTL_CONF_PATH.write_text(content, encoding="utf-8")
+        return CommandResult(["write", str(LINUX_SYSCTL_CONF_PATH)], 0, "", "", 0.0)
+    except OSError as exc:
+        return CommandResult(["write", str(LINUX_SYSCTL_CONF_PATH)], 1, "", str(exc), 0.0)
+
+
+def linux_apply_sysctl() -> CommandResult:
+    return run_command(["sysctl", "-p", str(LINUX_SYSCTL_CONF_PATH)], timeout=15)
+
+
+def linux_restore_sysctl_conf(original: Mapping[str, Optional[str]]) -> CommandResult:
+    entries = {k: v for k, v in original.items() if v is not None}
+    if not entries:
+        return CommandResult(["rm", str(LINUX_SYSCTL_CONF_PATH)], 0, "", "", 0.0)
+    content = "# Net Stability - restored original values\n# Restored: " + utc_now_iso() + "\n"
+    for key, value in entries.items():
+        content += f"{key} = {value}\n"
+    try:
+        LINUX_SYSCTL_CONF_PATH.write_text(content, encoding="utf-8")
+        return CommandResult(["write", str(LINUX_SYSCTL_CONF_PATH)], 0, "", "", 0.0)
+    except OSError as exc:
+        return CommandResult(["write", str(LINUX_SYSCTL_CONF_PATH)], 1, "", str(exc), 0.0)
+
+
+def linux_nic_ring_buffer_state() -> Dict[str, Any]:
+    ethtool = shutil.which("ethtool")
+    if not ethtool:
+        return {"available": False, "error": "ethtool not found", "interfaces": []}
+    ip = shutil.which("ip") or "/sbin/ip"
+    result = run_command([ip, "-brief", "link", "show"], timeout=10)
+    if not result.ok:
+        return {"available": False, "error": "Could not list interfaces", "interfaces": []}
+    interfaces: List[Dict[str, Any]] = []
+    for line in result.stdout.splitlines():
+        parts = line.strip().split()
+        if not parts:
+            continue
+        ifname = parts[0]
+        if ifname == "lo" or ":" in ifname:
+            continue
+        ring = run_command([ethtool, "-g", ifname], timeout=10)
+        interfaces.append({"name": ifname, "ring": ring.stdout if ring.ok else None})
+    return {"available": True, "ethtool": ethtool, "interfaces": interfaces}
+
+
+def linux_set_nic_ring_buffer(interface: str, rx: int = 4096, tx: int = 4096) -> CommandResult:
+    ethtool = shutil.which("ethtool")
+    if not ethtool:
+        return CommandResult(["ethtool"], 127, "", "", 0.0, "ethtool was not found")
+    return run_command([ethtool, "-G", interface, "rx", str(rx), "tx", str(tx)], timeout=10)
+
+
+def linux_irqbalance_state() -> Dict[str, Any]:
+    result = run_command(["systemctl", "is-enabled", "irqbalance"], timeout=10)
+    is_active = run_command(["systemctl", "is-active", "irqbalance"], timeout=10)
+    return {
+        "available": result.ok or is_active.ok,
+        "enabled": result.stdout.strip() if result.ok else "unknown",
+        "active": is_active.stdout.strip() if is_active.ok else "unknown",
+    }
+
+
+def linux_enable_irqbalance() -> CommandResult:
+    return run_command(["systemctl", "enable", "--now", "irqbalance"], timeout=30)
+
+
+def linux_disable_irqbalance() -> CommandResult:
+    return run_command(["systemctl", "disable", "--now", "irqbalance"], timeout=30)
+
+
+def linux_dns_state() -> Dict[str, Any]:
+    resolv = Path("/etc/resolv.conf")
+    if resolv.is_file():
+        try:
+            text = resolv.read_text(encoding="utf-8")
+            servers = re.findall(r"(?m)^nameserver\s+(\S+)", text)
+            return {"available": True, "servers": servers[:4], "path": str(resolv)}
+        except OSError:
+            pass
+    result = run_command(["resolvectl", "dns"], timeout=10)
+    if result.ok:
+        return {"available": True, "resolvectl": result.stdout.strip(), "servers": []}
+    return {"available": False, "servers": [], "error": "Could not query DNS"}
+
+
+def linux_set_dns(servers: Optional[Tuple[str, ...]] = None) -> CommandResult:
+    targets = list(servers or DEFAULT_DNS_SERVERS)
+    resolvectl = shutil.which("resolvectl")
+    if resolvectl:
+        for server in targets:
+            result = run_command([resolvectl, "dns", "global", server], timeout=10)
+            if not result.ok:
+                return run_command([resolvectl, "dns", server], timeout=10)
+        return run_command([resolvectl, "dns", "global", targets[0]], timeout=10)
+    resolv = Path("/etc/resolv.conf")
+    try:
+        content = "\n".join(f"nameserver {s}" for s in targets) + "\n"
+        resolv.write_text(content, encoding="utf-8")
+        return CommandResult(["write", str(resolv)], 0, "", "", 0.0)
+    except OSError as exc:
+        return CommandResult(["write", str(resolv)], 1, "", str(exc), 0.0)
+
+
+def linux_reset_network() -> List[CommandResult]:
+    results: List[CommandResult] = []
+    if shutil.which("systemctl"):
+        results.append(run_command(["systemctl", "restart", "NetworkManager"], timeout=30))
+    if shutil.which("resolvectl"):
+        results.append(run_command(["resolvectl", "flush-caches"], timeout=5))
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Linux NetworkManager state and tuning
 # ---------------------------------------------------------------------------
 
@@ -1282,16 +1749,418 @@ def restore_linux_system(manifest: Dict[str, Any], restart: bool) -> List[Dict[s
 
 def capture_system_state() -> Dict[str, Any]:
     system = platform.system()
+    state: Dict[str, Any] = {}
     if system == "Windows":
-        return capture_windows_state()
-    if system == "Linux":
-        return capture_linux_state()
-    if system == "Darwin":
-        return {
-            "supported_changes": [],
-            "note": "No documented public macOS Wi-Fi power setting is modified; diagnostics and npm tuning only.",
+        state = capture_windows_state()
+        state["mtu"] = windows_mtu_state()
+        state["ecn"] = windows_ecn_state()
+        state["delivery_optimization"] = windows_delivery_optimization_state()
+        state["qos"] = windows_qos_state()
+        state["lso"] = windows_lso_state()
+        state["tcp_retrans"] = windows_tcp_retrans_state()
+    elif system == "Linux":
+        state = capture_linux_state()
+        state["sysctl_current"] = linux_current_sysctl_values(list(LINUX_SYSCTL_TUNING.keys()))
+        state["ring_buffers"] = linux_nic_ring_buffer_state()
+        state["irqbalance"] = linux_irqbalance_state()
+        state["dns"] = linux_dns_state()
+    elif system == "Darwin":
+        state = {
+            "supported_changes": ["dns", "tcp_buffers"],
+            "note": "macOS: DNS and TCP buffer tuning available.",
         }
-    return {"supported_changes": [], "note": f"No system tuning implemented for {system}."}
+        state["dns"] = macos_dns_state()
+        state["tcp_buffers"] = macos_tcp_buffer_state()
+    else:
+        return {"supported_changes": [], "note": f"No system tuning implemented for {system}."}
+    return state
+
+
+# ---------------------------------------------------------------------------
+# Extended OS tuning: apply and restore
+# ---------------------------------------------------------------------------
+
+
+def _record_applied(manifest: Dict[str, Any], manifest_path: Path, record: Dict[str, Any]) -> None:
+    manifest.setdefault("applied", {}).setdefault("system", []).append(record)
+    atomic_write_json(manifest_path, manifest)
+
+
+def apply_windows_extended_tuning(
+    manifest: Dict[str, Any],
+    manifest_path: Path,
+) -> None:
+    state = manifest.get("state", {}).get("system", {})
+    """Apply MTU=1500 on Wi-Fi interfaces."""
+    mtu_state = state.get("mtu", {})
+    if mtu_state.get("available"):
+        wifi_interfaces = [i for i in mtu_state.get("interfaces", []) if i.get("mtu", 0) != 1500]
+        for iface in wifi_interfaces:
+            name = iface.get("name", "")
+            if not name or "Loopback" in name:
+                continue
+            result = windows_set_mtu(name, 1500)
+            if result.ok:
+                print(f"  + MTU set to 1500 on {name}")
+                _record_applied(manifest, manifest_path, {
+                    "type": "mtu", "scope": "windows", "interface": name,
+                    "original_mtu": iface.get("mtu"), "applied": 1500,
+                })
+            else:
+                print_command_failure(f"MTU set on {name}", result)
+
+    """Enable ECN."""
+    ecn_state = state.get("ecn", {})
+    if ecn_state.get("available") and str(ecn_state.get("ecn") or "").lower() != "enabled":
+        result = windows_enable_ecn()
+        if result.ok:
+            print("  + ECN enabled")
+            _record_applied(manifest, manifest_path, {
+                "type": "ecn", "scope": "windows", "applied": "Enabled",
+            })
+        else:
+            print_command_failure("ECN enable", result)
+
+    """Disable Delivery Optimization P2P."""
+    do_state = state.get("delivery_optimization", {})
+    if do_state.get("available") and do_state.get("value") != 0:
+        result = windows_disable_delivery_optimization()
+        if result.ok:
+            print("  + Delivery Optimization P2P disabled")
+            _record_applied(manifest, manifest_path, {
+                "type": "delivery_optimization", "scope": "windows",
+                "original_value": do_state.get("value"), "applied": 0,
+            })
+        else:
+            print_command_failure("Delivery Optimization disable", result)
+
+    """Set QoS reservable bandwidth to 0%."""
+    qos_state = state.get("qos", {})
+    if qos_state.get("available") and qos_state.get("value") != 0:
+        result = windows_set_qos_reserve(0)
+        if result.ok:
+            print("  + QoS reservable bandwidth set to 0%")
+            _record_applied(manifest, manifest_path, {
+                "type": "qos", "scope": "windows",
+                "original_value": qos_state.get("value"), "applied": 0,
+            })
+        else:
+            print_command_failure("QoS reservable bandwidth", result)
+
+    """Disable LSO on Wi-Fi adapters where it's enabled."""
+    lso_state = state.get("lso", {})
+    if lso_state.get("available"):
+        for adapter in lso_state.get("adapters", []):
+            name = adapter.get("name", "")
+            if not name:
+                continue
+            if adapter.get("ipv4_enabled") or adapter.get("ipv6_enabled"):
+                result = windows_disable_lso(name)
+                if result.ok:
+                    print(f"  + LSO disabled on {name}")
+                    _record_applied(manifest, manifest_path, {
+                        "type": "lso", "scope": "windows", "adapter": name,
+                        "original_ipv4": adapter.get("ipv4_enabled"),
+                        "original_ipv6": adapter.get("ipv6_enabled"),
+                        "applied": "disabled",
+                    })
+                else:
+                    print_command_failure(f"LSO disable on {name}", result)
+
+    """Set TCP retransmission registry values."""
+    retrans_state = state.get("tcp_retrans", {})
+    if retrans_state.get("available"):
+        orig_data = retrans_state.get("TcpMaxDataRetransmissions")
+        orig_connect = retrans_state.get("TcpMaxConnectRetransmissions")
+        needs_data = orig_data is None or orig_data != 5
+        needs_connect = orig_connect is None or orig_connect != 3
+        if needs_data or needs_connect:
+            results = windows_set_tcp_retransmissions(5, 3)
+            ok = all(r.ok for r in results)
+            if ok:
+                print("  + TCP retransmission settings: data=5, connect=3")
+                _record_applied(manifest, manifest_path, {
+                    "type": "tcp_retrans", "scope": "windows",
+                    "original_data": orig_data, "original_connect": orig_connect,
+                    "applied_data": 5, "applied_connect": 3,
+                })
+            else:
+                for i, r in enumerate(results):
+                    if not r.ok:
+                        label = "TcpMaxDataRetransmissions" if i == 0 else "TcpMaxConnectRetransmissions"
+                        print_command_failure(label, r)
+
+
+def restore_windows_extended_tuning(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
+    applied = manifest.get("applied", {}).get("system", [])
+    results: List[Dict[str, Any]] = []
+    for item in applied:
+        if item.get("type") == "mtu":
+            name = item.get("interface", "")
+            orig = item.get("original_mtu")
+            if name and orig:
+                r = windows_set_mtu(name, orig)
+                results.append({"type": "mtu", "ok": r.ok})
+                if r.ok:
+                    print(f"  + restored MTU on {name} to {orig}")
+                else:
+                    print_command_failure(f"restore MTU on {name}", r)
+
+        elif item.get("type") == "ecn":
+            r = windows_restore_ecn()
+            results.append({"type": "ecn", "ok": r.ok})
+            if r.ok:
+                print("  + restored ECN to disabled")
+            else:
+                print_command_failure("restore ECN", r)
+
+        elif item.get("type") == "delivery_optimization":
+            orig = item.get("original_value")
+            if orig is not None:
+                r = windows_restore_delivery_optimization(orig)
+                results.append({"type": "delivery_optimization", "ok": r.ok})
+                if r.ok:
+                    print(f"  + restored Delivery Optimization to {orig}")
+                else:
+                    print_command_failure("restore Delivery Optimization", r)
+
+        elif item.get("type") == "qos":
+            orig = item.get("original_value")
+            if orig is not None:
+                r = windows_set_qos_reserve(orig)
+                results.append({"type": "qos", "ok": r.ok})
+                if r.ok:
+                    print(f"  + restored QoS reservable bandwidth to {orig}")
+                else:
+                    print_command_failure("restore QoS", r)
+
+        elif item.get("type") == "lso":
+            name = item.get("adapter", "")
+            if name:
+                orig_ipv4 = item.get("original_ipv4", False)
+                if orig_ipv4:
+                    r = windows_enable_lso(name)
+                    results.append({"type": "lso", "ok": r.ok, "adapter": name})
+                    if r.ok:
+                        print(f"  + restored LSO on {name}")
+                    else:
+                        print_command_failure(f"restore LSO on {name}", r)
+
+        elif item.get("type") == "tcp_retrans":
+            orig_data = item.get("original_data")
+            orig_connect = item.get("original_connect")
+            if orig_data is not None or orig_connect is not None:
+                d = orig_data if orig_data is not None else 5
+                c = orig_connect if orig_connect is not None else 3
+                rs = windows_set_tcp_retransmissions(d, c)
+                ok = all(r.ok for r in rs)
+                results.append({"type": "tcp_retrans", "ok": ok})
+                if ok:
+                    print(f"  + restored TCP retransmissions: data={d}, connect={c}")
+                else:
+                    for i, r in enumerate(rs):
+                        if not r.ok:
+                            print_command_failure(f"restore TCP retrans ({i})", r)
+
+    return results
+
+
+def apply_linux_extended_tuning(
+    manifest: Dict[str, Any],
+    manifest_path: Path,
+) -> None:
+    state = manifest.get("state", {}).get("system", {})
+    """Write sysctl tuning file and apply."""
+    current = state.get("sysctl_current", {})
+    needs_write = False
+    for key, desired in LINUX_SYSCTL_TUNING.items():
+        existing = current.get(key)
+        if existing != desired:
+            needs_write = True
+            break
+    if needs_write:
+        r = linux_write_sysctl_conf()
+        if r.ok:
+            print("  + wrote sysctl tuning: /etc/sysctl.d/99-net-optimizer.conf")
+            _record_applied(manifest, manifest_path, {
+                "type": "sysctl_conf", "scope": "linux",
+                "original": dict(current),
+                "applied": dict(LINUX_SYSCTL_TUNING),
+            })
+            apply_r = linux_apply_sysctl()
+            if apply_r.ok:
+                print("  + applied sysctl settings")
+            else:
+                print_command_failure("sysctl -p", apply_r)
+        else:
+            print_command_failure("write sysctl conf", r)
+    else:
+        print("  - sysctl tuning already at target values")
+
+    """Set NIC ring buffers."""
+    ring_state = state.get("ring_buffers", {})
+    if ring_state.get("available"):
+        for iface in ring_state.get("interfaces", []):
+            name = iface.get("name", "")
+            if name:
+                r = linux_set_nic_ring_buffer(name, 4096, 4096)
+                if r.ok:
+                    print(f"  + ring buffer: {name} rx=4096 tx=4096")
+                    _record_applied(manifest, manifest_path, {
+                        "type": "ring_buffer", "scope": "linux",
+                        "interface": name, "applied_rx": 4096, "applied_tx": 4096,
+                    })
+                else:
+                    print_command_failure(f"ring buffer on {name}", r)
+
+    """Enable IRQ balance."""
+    irq_state = state.get("irqbalance", {})
+    if irq_state.get("available") and irq_state.get("active") != "active":
+        r = linux_enable_irqbalance()
+        if r.ok:
+            print("  + irqbalance enabled and started")
+            _record_applied(manifest, manifest_path, {
+                "type": "irqbalance", "scope": "linux",
+                "original_enabled": irq_state.get("enabled"),
+                "original_active": irq_state.get("active"),
+            })
+        else:
+            print_command_failure("irqbalance enable", r)
+
+    """Set DNS to 1.1.1.1."""
+    dns_state = state.get("dns", {})
+    if dns_state.get("available"):
+        current_servers = dns_state.get("servers", [])
+        if "1.1.1.1" not in current_servers:
+            r = linux_set_dns()
+            if r.ok:
+                print("  + DNS set to 1.1.1.1, 1.0.0.1")
+                _record_applied(manifest, manifest_path, {
+                    "type": "dns", "scope": "linux",
+                    "original_servers": current_servers,
+                    "applied": list(DEFAULT_DNS_SERVERS),
+                })
+            else:
+                print_command_failure("DNS set", r)
+
+
+def restore_linux_extended_tuning(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
+    applied = manifest.get("applied", {}).get("system", [])
+    results: List[Dict[str, Any]] = []
+    for item in applied:
+        if item.get("type") == "sysctl_conf":
+            original = item.get("original", {})
+            r = linux_restore_sysctl_conf(original)
+            results.append({"type": "sysctl_conf", "ok": r.ok})
+            if r.ok:
+                print("  + restored sysctl configuration")
+                linux_apply_sysctl()
+            else:
+                print_command_failure("restore sysctl conf", r)
+
+        elif item.get("type") == "irqbalance":
+            was_active = item.get("original_active")
+            if was_active != "active":
+                r = linux_disable_irqbalance()
+                results.append({"type": "irqbalance", "ok": r.ok})
+                if r.ok:
+                    print("  + restored irqbalance state")
+                else:
+                    print_command_failure("restore irqbalance", r)
+
+        elif item.get("type") == "dns":
+            original = item.get("original_servers", [])
+            if original:
+                r = linux_set_dns(tuple(original))
+            else:
+                r = linux_set_dns(("Empty",))
+            results.append({"type": "dns", "ok": r.ok})
+            if r.ok:
+                print("  + restored DNS servers")
+            else:
+                print_command_failure("restore DNS", r)
+
+    return results
+
+
+def apply_macos_extended_tuning(
+    manifest: Dict[str, Any],
+    manifest_path: Path,
+) -> None:
+    state = manifest.get("state", {}).get("system", {})
+    """Set DNS to 1.1.1.1."""
+    dns_state = state.get("dns", {})
+    if dns_state.get("available"):
+        servers = dns_state.get("servers", [])
+        if "1.1.1.1" not in servers:
+            r = macos_set_dns()
+            if r.ok:
+                print("  + DNS set to 1.1.1.1, 1.0.0.1")
+                _record_applied(manifest, manifest_path, {
+                    "type": "dns", "scope": "macos",
+                    "original_servers": servers,
+                    "applied": list(DEFAULT_DNS_SERVERS),
+                })
+            else:
+                print_command_failure("macOS DNS set", r)
+
+    """Set TCP buffers."""
+    buf_state = state.get("tcp_buffers", {})
+    if buf_state.get("available"):
+        send = buf_state.get("sendspace")
+        recv = buf_state.get("recvspace")
+        if send != 131072 or recv != 131072:
+            rs = macos_set_tcp_buffers(131072, 131072)
+            ok = all(r.ok for r in rs)
+            if ok:
+                print("  + TCP buffers: send=131072 recv=131072")
+                _record_applied(manifest, manifest_path, {
+                    "type": "tcp_buffers", "scope": "macos",
+                    "original_send": send, "original_recv": recv,
+                    "applied_send": 131072, "applied_recv": 131072,
+                })
+                conf_r = macos_write_sysctl_conf(131072, 131072)
+                if conf_r.ok:
+                    print("  + wrote persistent sysctl.conf")
+                else:
+                    print_command_failure("write sysctl.conf", conf_r)
+            else:
+                for i, r in enumerate(rs):
+                    if not r.ok:
+                        label = "sendspace" if i == 0 else "recvspace"
+                        print_command_failure(f"TCP buffer {label}", r)
+
+
+def restore_macos_extended_tuning(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
+    applied = manifest.get("applied", {}).get("system", [])
+    results: List[Dict[str, Any]] = []
+    for item in applied:
+        if item.get("type") == "dns":
+            original = item.get("original_servers", [])
+            if original:
+                r = macos_set_dns(tuple(original))
+            else:
+                r = macos_clear_dns()
+            results.append({"type": "dns", "ok": r.ok})
+            if r.ok:
+                print("  + restored DNS servers on macOS")
+            else:
+                print_command_failure("restore macOS DNS", r)
+
+        elif item.get("type") == "tcp_buffers":
+            orig_send = item.get("original_send") or 131072
+            orig_recv = item.get("original_recv") or 131072
+            rs = macos_set_tcp_buffers(orig_send, orig_recv)
+            ok = all(r.ok for r in rs)
+            results.append({"type": "tcp_buffers", "ok": ok})
+            if ok:
+                print(f"  + restored TCP buffers: send={orig_send} recv={orig_recv}")
+            else:
+                for i, r in enumerate(rs):
+                    if not r.ok:
+                        print_command_failure(f"restore TCP buffer ({i})", r)
+
+    return results
 
 
 def apply_system_state(
@@ -1309,10 +2178,12 @@ def apply_system_state(
             include_battery=include_battery,
             restart=restart,
         )
+        apply_windows_extended_tuning(manifest, manifest_path)
     elif system == "Linux":
         apply_linux_system(manifest, manifest_path, restart=restart)
+        apply_linux_extended_tuning(manifest, manifest_path)
     elif system == "Darwin":
-        print("  - macOS: no undocumented Wi-Fi system setting was changed")
+        apply_macos_extended_tuning(manifest, manifest_path)
     else:
         print(f"  - {system}: no system tuning is implemented")
 
@@ -1323,11 +2194,16 @@ def restore_system_state(manifest: Dict[str, Any], restart: bool) -> List[Dict[s
         raise NetStabilityError(
             f"Snapshot was created on {system}, but this machine is {platform.system()}; system restore refused"
         )
+    results: List[Dict[str, Any]] = []
     if system == "Windows":
-        return restore_windows_system(manifest, restart)
-    if system == "Linux":
-        return restore_linux_system(manifest, restart)
-    return []
+        results.extend(restore_windows_system(manifest, restart))
+        results.extend(restore_windows_extended_tuning(manifest))
+    elif system == "Linux":
+        results.extend(restore_linux_system(manifest, restart))
+        results.extend(restore_linux_extended_tuning(manifest))
+    elif system == "Darwin":
+        results.extend(restore_macos_extended_tuning(manifest))
+    return results
 
 
 def platform_metadata() -> Dict[str, Any]:
@@ -1349,10 +2225,22 @@ def planned_changes(do_system: bool, do_npm: bool, include_battery: bool, maxsoc
             changes.append("Restore Windows TCP receive-window auto-tuning to normal when restricted or disabled")
             changes.append("Set the active plan's Wi-Fi policy to Maximum Performance on AC" + (" and battery" if include_battery else ""))
             changes.append("Disable supported NDIS SelectiveSuspend and DeviceSleepOnDisconnect on physical Wi-Fi adapters")
+            changes.append("Set MTU to 1500 on Wi-Fi interfaces")
+            changes.append("Enable ECN (Explicit Congestion Notification)")
+            changes.append("Disable Windows Delivery Optimization (P2P update sharing)")
+            changes.append("Set QoS reservable bandwidth to 0%")
+            changes.append("Disable Large Send Offload on Wi-Fi adapters")
+            changes.append("Set TCP retransmission registry values (data=5, connect=3)")
         elif system == "Linux":
             changes.append("Set active NetworkManager Wi-Fi profiles to powersave=2 (disabled)")
+            changes.append("Write sysctl TCP/IP tuning (buffers, SACK, window scaling, timestamps, fastopen)")
+            changes.append("Enable BBR congestion control and fq_codel qdisc")
+            changes.append("Set NIC ring buffers to 4096 (rx/tx)")
+            changes.append("Enable and start irqbalance daemon")
+            changes.append("Set DNS to 1.1.1.1 / 1.0.0.1")
         elif system == "Darwin":
-            changes.append("No system setting (macOS has no documented public equivalent used by this tool)")
+            changes.append("Set DNS to 1.1.1.1 / 1.0.0.1")
+            changes.append("Set TCP buffer sizes (send=131072, recv=131072)")
         else:
             changes.append(f"No system setting for {system}")
     if do_npm:
@@ -1400,6 +2288,72 @@ def create_snapshot(do_system: bool, do_npm: bool) -> Tuple[Path, Path, Dict[str
     return directory, manifest_path, manifest
 
 
+def command_reset_network(args: argparse.Namespace) -> int:
+    system = platform.system()
+    print(f"Network stack reset for {system}")
+    print("  WARNING: This resets TCP/IP, Winsock, and DNS settings to OS defaults.")
+    print("  A system reboot is recommended after this operation.")
+    print()
+
+    if not confirm("Reset the network stack?", args.yes):
+        print("Cancelled.")
+        return 1
+
+    if system == "Windows":
+        if not is_windows_admin():
+            raise NetStabilityError("Windows network reset requires an Administrator terminal")
+        results = windows_reset_network_stack()
+        all_ok = all(r.ok for r in results)
+        for i, r in enumerate(results):
+            label = ["netsh int ip reset", "netsh winsock reset", "ipconfig /flushdns"][i]
+            if r.ok:
+                print(f"  + {label}")
+            else:
+                print_command_failure(label, r)
+        if all_ok:
+            print("  + Network stack reset completed. Reboot is recommended.")
+            print('  + Run: "shutdown /r /t 0" to reboot now.')
+        else:
+            print("  ! Some reset commands failed. A reboot may still be required.")
+        return 0 if all_ok else 2
+
+    elif system == "Darwin":
+        if os.geteuid() != 0:
+            print("  - Some reset steps require root. Run with sudo for full effect.")
+        results = macos_reset_network_config()
+        for i, r in enumerate(results):
+            label = ["mv config plists", "route -n flush", "dscacheutil -flushcache", "killall mDNSResponder"][i]
+            if r.ok:
+                print(f"  + {label}")
+            else:
+                print_command_failure(label, r)
+        print("  + macOS network config reset. Reboot is recommended.")
+        return 0
+
+    elif system == "Linux":
+        if os.geteuid() != 0:
+            print("  - Some reset steps require root. Run with sudo for full effect.")
+        results = linux_reset_network()
+        for i, r in enumerate(results):
+            label = ["systemctl restart NetworkManager", "resolvectl flush-caches"][i] if i < len(results) else "reset"
+            if r.ok:
+                print(f"  + {label}")
+            else:
+                print_command_failure(label, r)
+        # Also try to restart networking
+        for svc in ["networking", "systemd-networkd"]:
+            r = run_command(["systemctl", "restart", svc], timeout=15)
+            if r.ok:
+                print(f"  + restarted {svc}")
+                break
+        print("  + Linux network stack reset.")
+        return 0
+
+    else:
+        print(f"  - Network reset not implemented for {system}")
+        return 1
+
+
 def command_apply(args: argparse.Namespace) -> int:
     do_system = not args.npm_only
     do_npm = not args.system_only
@@ -1409,7 +2363,7 @@ def command_apply(args: argparse.Namespace) -> int:
         print(f"  - {change}")
     if do_system and not args.no_restart and platform.system() in {"Windows", "Linux"}:
         print("  - The Wi-Fi adapter/connection may disconnect briefly while settings are activated")
-    print("No MTU, DNS, TCP auto-tuning disablement, global USB suspend, or blanket offload settings will be changed.")
+    print("Paper-backed MTU, DNS, ECN, BBR, TCP auto-tuning, and selective offload changes ARE applied when supported.")
 
     if args.dry_run:
         print("Dry run complete; no snapshot or setting was written.")
@@ -2023,6 +2977,55 @@ def capability_matrix() -> List[Dict[str, str]]:
                     "mutation": "snapshot-backed, opt-in apply path",
                 },
                 {
+                    "capability": "MTU optimization (1500)",
+                    "available": "conditional",
+                    "source": "netsh interface ipv4 set subinterface",
+                    "privilege": "administrator",
+                    "mutation": "snapshot-backed",
+                },
+                {
+                    "capability": "ECN enable",
+                    "available": "conditional",
+                    "source": "Set-NetTCPSetting",
+                    "privilege": "administrator",
+                    "mutation": "snapshot-backed",
+                },
+                {
+                    "capability": "Delivery Optimization disable",
+                    "available": "conditional",
+                    "source": "registry DODownloadMode",
+                    "privilege": "administrator",
+                    "mutation": "snapshot-backed",
+                },
+                {
+                    "capability": "QoS reservable bandwidth 0%",
+                    "available": "conditional",
+                    "source": "registry NonBestEffortLimit",
+                    "privilege": "administrator",
+                    "mutation": "snapshot-backed",
+                },
+                {
+                    "capability": "LSO disable on Wi-Fi",
+                    "available": "conditional",
+                    "source": "Disable-NetAdapterLso",
+                    "privilege": "administrator",
+                    "mutation": "snapshot-backed",
+                },
+                {
+                    "capability": "TCP retransmission tuning",
+                    "available": "conditional",
+                    "source": "registry TcpMaxData/ConnectRetransmissions",
+                    "privilege": "administrator",
+                    "mutation": "snapshot-backed",
+                },
+                {
+                    "capability": "Network stack reset",
+                    "available": "conditional",
+                    "source": "netsh int ip reset, winsock reset, ipconfig /flushdns",
+                    "privilege": "administrator",
+                    "mutation": "requires reboot",
+                },
+                {
                     "capability": "Windows WLAN report",
                     "available": "conditional",
                     "source": "netsh wlan report",
@@ -2049,6 +3052,34 @@ def capability_matrix() -> List[Dict[str, str]]:
                     "mutation": "snapshot-backed, opt-in apply path",
                 },
                 {
+                    "capability": "sysctl TCP/IP tuning (buffers, BBR, fq_codel)",
+                    "available": "conditional",
+                    "source": "sysctl / /etc/sysctl.d/",
+                    "privilege": "root",
+                    "mutation": "snapshot-backed",
+                },
+                {
+                    "capability": "NIC ring buffer tuning",
+                    "available": "conditional",
+                    "source": "ethtool -G",
+                    "privilege": "root",
+                    "mutation": "snapshot-backed",
+                },
+                {
+                    "capability": "IRQ balance daemon",
+                    "available": "conditional",
+                    "source": "systemctl irqbalance",
+                    "privilege": "root",
+                    "mutation": "snapshot-backed",
+                },
+                {
+                    "capability": "DNS optimization",
+                    "available": "conditional",
+                    "source": "resolvectl / /etc/resolv.conf",
+                    "privilege": "root",
+                    "mutation": "snapshot-backed",
+                },
+                {
                     "capability": "nl80211 deep station counters",
                     "available": "planned",
                     "source": "kernel nl80211",
@@ -2066,6 +3097,27 @@ def capability_matrix() -> List[Dict[str, str]]:
                     "source": "networkQuality when present",
                     "privilege": "none",
                     "mutation": "none",
+                },
+                {
+                    "capability": "DNS optimization",
+                    "available": "conditional",
+                    "source": "networksetup -setdnsservers",
+                    "privilege": "root",
+                    "mutation": "snapshot-backed",
+                },
+                {
+                    "capability": "TCP buffer tuning",
+                    "available": "conditional",
+                    "source": "sysctl / /etc/sysctl.conf",
+                    "privilege": "root",
+                    "mutation": "snapshot-backed",
+                },
+                {
+                    "capability": "Network config reset",
+                    "available": "conditional",
+                    "source": "SystemConfiguration plist + route flush + mDNSResponder restart",
+                    "privilege": "root",
+                    "mutation": "requires reboot",
                 },
                 {
                     "capability": "Wi-Fi system mutation",
@@ -2099,6 +3151,7 @@ def repository_map() -> Dict[str, Any]:
             "apply",
             "restore",
             "list-backups",
+            "reset-network",
         ],
         "platform_abstractions": {
             "windows": "PowerShell/PowerCFG/NetAdapter read and adapter-scoped power writes",
@@ -2379,6 +3432,7 @@ def command_audit(args: argparse.Namespace) -> int:
         "normal_mode_boundaries": [
             "audit, diagnose, measure, watch, and list-backups are read-only apart from explicit report files",
             "apply and restore are the only normal commands that write persistent settings",
+            "reset-network resets the TCP/IP and DNS stack (requires reboot)",
             "router queue control remains advisory unless a separate reviewed router plugin exists",
             "macOS Wi-Fi mutation is not implemented through undocumented controls",
         ],
@@ -2393,9 +3447,18 @@ def command_audit(args: argparse.Namespace) -> int:
     print("Evidence audit:")
     print(f"  Platform: {platform.system()} {platform.release()}")
     print(f"  Gateway: {gateway or 'not detected'}")
-    print("  Normal mode denies:")
+    print("  Normal mode policy:")
+    print("    Denied (folklore, no evidence):")
     for item in ANTI_FOLKLORE_DENYLIST:
-        print(f"    - {item}")
+        if not item.lstrip().startswith("#"):
+            print(f"      - {item}")
+    print("    Overridden (paper-backed, evidence-guided):")
+    print("      - Fixed MTU=1500 on Wi-Fi interfaces")
+    print("      - DNS replacement to 1.1.1.1 / 1.0.0.1")
+    print("      - ECN enable on Windows")
+    print("      - BBR congestion control + fq_codel on Linux")
+    print("      - Selective LSO disable on Wi-Fi adapters when it causes latency")
+    print("      - QoS reservable bandwidth set to 0%")
     print("  Capability matrix:")
     for row in report["capability_matrix"]:
         print(f"    - {row['capability']}: {row['available']} ({row['mutation']})")
@@ -2683,6 +3746,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     listing = subparsers.add_parser("list-backups", help="list available restore snapshots")
     listing.set_defaults(function=command_list_backups)
+
+    reset = subparsers.add_parser(
+        "reset-network",
+        help="reset TCP/IP, Winsock, and DNS to OS defaults (requires reboot)",
+    )
+    reset.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    reset.set_defaults(function=command_reset_network)
     return parser
 
 

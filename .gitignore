@@ -27,6 +27,10 @@ reports/
 backups/
 *.log
 
+# Orchestration and evidence artifact directories
+.omo/
+tests/evidence/
+
 # Editors and operating systems
 .idea/
 .vscode/

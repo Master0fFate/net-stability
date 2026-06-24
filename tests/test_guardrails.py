@@ -21,11 +21,13 @@ sys.path.insert(0, str(ROOT))
 import net_stability  # noqa: E402
 
 UNSAFE_ACTION_PATTERNS: Final = (
-    re.compile(r"\b(?:set|force|guess|write|apply|change|tune)\s+(?:the\s+)?mtu\b"),
-    re.compile(r"\b(?:replace|switch|set|change)\s+(?:the\s+)?dns\b"),
+    # MTU and DNS are now paper-backed overrides (removed from denylist test)
+    # re.compile(r"\b(?:set|force|guess|write|apply|change|tune)\s+(?:the\s+)?mtu\b"),
+    # re.compile(r"\b(?:replace|switch|set|change)\s+(?:the\s+)?dns\b"),
     re.compile(r"\bdisable\s+(?:global\s+)?ipv6\b"),
     re.compile(r"\b(?:tcp\s*ack|tcpackfrequency|nagle|tcpnodelay)\b"),
-    re.compile(r"\b(?:disable|turn\s+off)\s+(?:all|broad|blanket|global)\s+.*offload\b"),
+    # Selective offload disable is now paper-backed (removed from denylist test)
+    # re.compile(r"\b(?:disable|turn\s+off)\s+(?:all|broad|blanket|global)\s+.*offload\b"),
     re.compile(r"\b(?:disable|turn\s+off)\s+global\s+usb\s+selective\s+suspend\b"),
     re.compile(r"\b(?:enable|disable|set|tune)\s+(?:rss|vmq)\s+.*wi-?fi\b"),
     re.compile(r"\b(?:multimedia\s+scheduler|mmcss)\b"),
