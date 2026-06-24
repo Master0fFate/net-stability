@@ -1176,10 +1176,11 @@ def windows_mtu_state() -> Dict[str, Any]:
     interfaces: List[Dict[str, Any]] = []
     for line in result.stdout.splitlines():
         parts = line.strip().split()
-        if len(parts) >= 3 and parts[0].isdigit():
+        # First 4 fields: MTU, MediaSenseState, BytesIn, BytesOut. Name is everything after.
+        if len(parts) >= 5 and parts[0].isdigit():
             mtu_val = int(parts[0])
-            ifname = " ".join(parts[2:])
-            if ifname and ifname not in ("Loopback", "Loopback Pseudo-Interface 1"):
+            ifname = " ".join(parts[4:])
+            if ifname and "Loopback" not in ifname:
                 interfaces.append({"name": ifname, "mtu": mtu_val})
     return {"available": True, "interfaces": interfaces}
 
@@ -1317,10 +1318,10 @@ def windows_parse_subinterface_output(output: str) -> List[Dict[str, Any]]:
     interfaces: List[Dict[str, Any]] = []
     for line in output.splitlines():
         parts = line.strip().split()
-        if len(parts) >= 3 and parts[0].isdigit():
+        if len(parts) >= 5 and parts[0].isdigit():
             mtu_val = int(parts[0])
-            ifname = " ".join(parts[2:])
-            if ifname and ifname not in ("Loopback", "Loopback Pseudo-Interface 1"):
+            ifname = " ".join(parts[4:])
+            if ifname and "Loopback" not in ifname:
                 interfaces.append({"name": ifname, "mtu": mtu_val})
     return interfaces
 
@@ -1811,7 +1812,9 @@ def apply_windows_extended_tuning(
 
     """Enable ECN."""
     ecn_state = state.get("ecn", {})
-    if ecn_state.get("available") and str(ecn_state.get("ecn") or "").lower() != "enabled":
+    def _ecn_enabled(v: Any) -> bool:
+        return str(v or "").strip().lower() in ("enabled", "1", "true")
+    if ecn_state.get("available") and not _ecn_enabled(ecn_state.get("ecn")):
         result = windows_enable_ecn()
         if result.ok:
             print("  + ECN enabled")
@@ -1889,6 +1892,8 @@ def apply_windows_extended_tuning(
                     if not r.ok:
                         label = "TcpMaxDataRetransmissions" if i == 0 else "TcpMaxConnectRetransmissions"
                         print_command_failure(label, r)
+
+    print("  + Windows extended tuning: complete")
 
 
 def restore_windows_extended_tuning(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -2043,6 +2048,8 @@ def apply_linux_extended_tuning(
             else:
                 print_command_failure("DNS set", r)
 
+    print("  + Linux extended tuning: complete")
+
 
 def restore_linux_extended_tuning(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
     applied = manifest.get("applied", {}).get("system", [])
@@ -2130,6 +2137,8 @@ def apply_macos_extended_tuning(
                         label = "sendspace" if i == 0 else "recvspace"
                         print_command_failure(f"TCP buffer {label}", r)
 
+    print("  + macOS extended tuning: complete")
+
 
 def restore_macos_extended_tuning(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
     applied = manifest.get("applied", {}).get("system", [])
@@ -2178,11 +2187,14 @@ def apply_system_state(
             include_battery=include_battery,
             restart=restart,
         )
+        print("  - applying paper-backed extended tuning...")
         apply_windows_extended_tuning(manifest, manifest_path)
     elif system == "Linux":
         apply_linux_system(manifest, manifest_path, restart=restart)
+        print("  - applying paper-backed extended tuning...")
         apply_linux_extended_tuning(manifest, manifest_path)
     elif system == "Darwin":
+        print("  - applying paper-backed extended tuning...")
         apply_macos_extended_tuning(manifest, manifest_path)
     else:
         print(f"  - {system}: no system tuning is implemented")
