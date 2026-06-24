@@ -5,20 +5,24 @@
 ![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-4c51bf)
 ![License](https://img.shields.io/badge/license-Unlicense-brightgreen)
 
-Net Stability is a small, reversible network reliability helper for weak Wi-Fi links and flaky `npm install` runs. It diagnoses the likely failure layer first, applies conservative tuning only on explicit action, and restores exact backups.
+Net Stability is a small, reversible network reliability helper for weak Wi-Fi links and flaky `npm install` runs. It diagnoses the likely failure layer first, applies conservative (but evidence-backed) tuning, and restores exact backups.
 
-It now includes a simple desktop UI for non-technical users: one main read-only audit button, with advanced actions underneath for baseline measurement, full diagnostics, npm-only tuning, restore, or backup listing.
+It includes a simple desktop UI with two primary paths: **Audit evidence first** for read-only diagnostics, and **Full Optimization** to apply every supported OS and npm tuning tweak in one shot.
+
+---
 
 ## What It Does
 
-- Creates a restore point before applying changes.
+- Creates a restore point **before** applying any change.
 - Applies a weak-link npm profile: fewer per-origin sockets, longer fetch timeouts, more retries, and `prefer-offline`.
-- On Windows, restores restricted TCP receive-window auto-tuning to the normal Windows throughput profile, then adjusts documented Wi-Fi power behavior and supported adapter power properties when run as Administrator.
-- On Linux, disables NetworkManager Wi-Fi powersave on active Wi-Fi profiles when authorized.
-- On macOS, keeps system tuning diagnostic-only because there is no documented public Wi-Fi power equivalent used here.
+- **Windows**: Restores restricted TCP receive-window auto-tuning, adjusts Wi-Fi power policy and adapter power properties, sets MTU to 1500, enables ECN, disables Delivery Optimization P2P sharing, sets QoS reservable bandwidth to 0%, disables Large Send Offload on Wi-Fi adapters, and tunes TCP retransmission registry values.
+- **Linux**: Disables NetworkManager Wi-Fi powersave, writes sysctl TCP/IP tuning (buffers, SACK, window scaling, timestamps, fastopen), enables BBR congestion control with fq_codel qdisc, increases NIC ring buffers, enables the irqbalance daemon, and sets DNS to 1.1.1.1.
+- **macOS**: Sets DNS to 1.1.1.1 / 1.0.0.1, tunes TCP buffer sizes (131072 send/recv), and writes persistent sysctl.conf.
+- **All platforms**: `reset-network` command resets the TCP/IP stack, Winsock (Windows), and DNS cache to OS defaults.
 - Saves diagnostic JSON reports with control-layer observations, recommendations, capability matrices, and optional identifier/token redaction.
-- Generates a read-only evidence audit that lists supported capabilities, denied folklore tweaks, and the current implementation gaps.
-- Avoids broad folklore tweaks such as DNS replacement, MTU guessing, TCP auto-tuning disablement, QoS-reservation changes, global USB suspend changes, or blanket NIC offload disabling.
+- Generates a read-only evidence audit that lists supported capabilities, denylisted folklore tweaks, and overridden paper-backed optimizations.
+
+---
 
 ## Quick Start
 
@@ -28,7 +32,10 @@ Clone the repository, then run the desktop UI:
 python net_stability_gui.py
 ```
 
-Click **Audit evidence first**. The app will show the stages as they run and print the underlying command output in the log.
+Two primary buttons at the top:
+
+- **Audit evidence first** -- read-only diagnostics and capability report.
+- **Full Optimization** -- backs up current state, then applies every supported OS tuning and npm profile in one operation.
 
 For Windows system tuning, open the terminal as Administrator before launching the GUI:
 
@@ -37,6 +44,8 @@ python net_stability_gui.py
 ```
 
 If you do not have admin access, use **Optimize npm only** in the advanced section.
+
+---
 
 ## Command Line
 
@@ -51,6 +60,7 @@ python net_stability.py apply --npm-only
 python net_stability.py restore latest
 python net_stability.py list-backups
 python net_stability.py watch -- npm install
+python net_stability.py reset-network
 ```
 
 Useful options:
@@ -64,17 +74,22 @@ python net_stability.py apply --system-only
 python net_stability.py restore latest --npm-only
 ```
 
+---
+
 ## Beginner UI
 
 The desktop UI is intentionally small and cross-platform:
 
 - Built with `tkinter`, included with most Python desktop installs.
 - No third-party runtime dependencies.
-- One primary action: **Audit evidence first**.
-- Advanced actions stay visible but secondary.
-- The stage list explains what is happening without hiding the real log.
+- Two primary buttons: **Audit evidence first** and **Full Optimization**.
+- Advanced actions (diagnostics, npm-only, reset network, restore, backups) stay visible but secondary.
+- An 8-stage progress panel tracks every step of the pipeline.
+- The log panel streams real command output in a dark terminal-style view.
 
 This keeps the project easy to package later with tools such as PyInstaller or Briefcase.
+
+---
 
 ## Restore Points
 
@@ -98,13 +113,26 @@ To inspect available backups:
 python net_stability.py list-backups
 ```
 
+---
+
 ## Platform Notes
 
 ### Windows
 
 System tuning requires an Administrator terminal. User-level npm tuning does not.
 
-The tool may briefly restart or reapply the Wi-Fi adapter/connection so the setting takes effect.
+The tool applies these Windows-specific optimizations:
+- TCP receive-window auto-tuning set to `normal` (repairs restricted/disabled states)
+- Wi-Fi power policy set to Maximum Performance
+- NDIS SelectiveSuspend and DeviceSleepOnDisconnect disabled on Wi-Fi adapters
+- MTU set to 1500 on Wi-Fi interfaces
+- ECN (Explicit Congestion Notification) enabled
+- Delivery Optimization P2P sharing disabled via registry
+- QoS reservable bandwidth set to 0%
+- Large Send Offload disabled on Wi-Fi adapters
+- TCP retransmission registry: `TcpMaxDataRetransmissions=5`, `TcpMaxConnectRetransmissions=3`
+
+The tool may briefly restart or reapply the Wi-Fi adapter so settings take effect.
 
 ### Linux
 
@@ -122,9 +150,36 @@ sudo python net_stability.py apply --system-only
 
 The tool refuses to modify npm configuration under `sudo` to avoid changing root's npm state by accident.
 
+Linux-specific optimizations:
+- NetworkManager Wi-Fi powersave disabled on active profiles
+- sysctl TCP/IP tuning: buffer sizes, SACK, window scaling, timestamps, TCP fastopen
+- BBR congestion control enabled with fq_codel qdisc
+- NIC ring buffers set to rx=4096 / tx=4096 (via ethtool)
+- irqbalance daemon enabled and started
+- DNS set to 1.1.1.1 / 1.0.0.1
+
 ### macOS
 
-The tool collects diagnostics and can tune npm. It does not change undocumented system Wi-Fi settings.
+macOS-specific optimizations:
+- DNS set to 1.1.1.1 / 1.0.0.1
+- TCP buffer sizes: send=131072, recv=131072
+- Persistent sysctl.conf written for buffer settings
+
+The tool does not change undocumented system Wi-Fi knobs.
+
+---
+
+## Network Stack Reset
+
+The `reset-network` command resets TCP/IP, Winsock, and DNS settings to OS defaults:
+
+```bash
+python net_stability.py reset-network
+```
+
+This is a separate, destructive operation (not part of the normal `apply` path) and requires a system reboot afterward.
+
+---
 
 ## Install As A Local Command
 
@@ -136,6 +191,8 @@ net-stability-gui
 ```
 
 If you prefer not to install it, run the files directly with `python`.
+
+---
 
 ## Development Checks
 
@@ -149,17 +206,23 @@ python net_stability_gui.py --smoke
 
 The smoke check verifies the GUI entry point without opening a desktop window.
 
+---
+
 ## Safety Model
 
 Net Stability is intentionally conservative:
 
-- Every change is backed up before it is applied.
-- Restore commands target exact snapshots.
-- User npm state and elevated system state are handled separately when needed.
+- Every change is backed up **before** it is applied.
+- Restore commands target exact snapshots with full pre-change state.
+- User npm state and elevated system state are handled in separate operations when needed.
 - The tool favors documented OS knobs and explicit diagnostics.
 - Reports can be redacted before sharing.
 - Router queue management is advisory only; a PC-side utility cannot directly fix queues inside an ISP modem or router.
-- The normal path refuses fixed-MTU guesses, global IPv6/DNS/TCP folklore tweaks, TCP auto-tuning disablement, blanket offload changes, global USB selective-suspend changes, and generic "gaming" registry recipes.
+- Some previously-denylisted tweaks (MTU, DNS, ECN, BBR, LSO, QoS) are now applied with **evidence-backed safe values** from the research paper. The `audit` command clearly lists which folklore tweaks are still denied and which are overridden with paper-backed justification.
+- The `reset-network` command is intentionally kept separate from `apply` because it is a destructive operation.
+- Non-evidence-backed folklore tweaks (global IPv6 disable, TCP ACK/Nagle recipes, RSS/VMQ on Wi-Fi, forced band/frequency, global USB suspend disable, firewall/antivirus disable, automatic driver installation) remain permanently denylisted.
+
+---
 
 ## License
 
