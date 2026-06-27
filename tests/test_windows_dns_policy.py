@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import argparse
+import contextlib
+import io
 import subprocess
 import sys
 import unittest
 from pathlib import Path
 from typing import Final
+from unittest import mock
 
 ROOT: Final = Path(__file__).resolve().parents[1]
 
@@ -96,7 +100,51 @@ class WindowsDnsPolicyTests(unittest.TestCase):
 
         # Then: the DNS policy repair button is advertised.
         self.assertEqual(result.returncode, 0, output)
-        self.assertIn("Repair Windows DNS policy", output)
+        self.assertIn("Repair DNS", output)
+
+    def test_repair_dns_when_linux_dry_run_reports_platform_repair(self) -> None:
+        # Given: Linux has a resolver state that differs from the stable DNS profile.
+        args = argparse.Namespace(dry_run=True, yes=True)
+        output = io.StringIO()
+
+        # When: the cross-platform DNS repair command is driven in dry-run mode.
+        with (
+            mock.patch.object(net_stability.platform, "system", return_value="Linux"),
+            mock.patch.object(
+                net_stability,
+                "linux_dns_state",
+                return_value={"available": True, "servers": ["192.168.1.1"]},
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            result = net_stability.command_repair_dns(args)
+
+        # Then: Linux gets a DNS repair plan instead of the Windows-only rejection.
+        self.assertEqual(result, 0)
+        self.assertIn("Linux DNS repair", output.getvalue())
+        self.assertIn("1.1.1.1, 1.0.0.1", output.getvalue())
+
+    def test_repair_dns_when_macos_dry_run_reports_platform_repair(self) -> None:
+        # Given: macOS has no explicit DNS servers configured.
+        args = argparse.Namespace(dry_run=True, yes=True)
+        output = io.StringIO()
+
+        # When: the cross-platform DNS repair command is driven in dry-run mode.
+        with (
+            mock.patch.object(net_stability.platform, "system", return_value="Darwin"),
+            mock.patch.object(
+                net_stability,
+                "macos_dns_state",
+                return_value={"available": True, "servers": [], "service": "Wi-Fi"},
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            result = net_stability.command_repair_dns(args)
+
+        # Then: macOS gets a DNS repair plan instead of the Windows-only rejection.
+        self.assertEqual(result, 0)
+        self.assertIn("macOS DNS repair", output.getvalue())
+        self.assertIn("1.1.1.1, 1.0.0.1", output.getvalue())
 
 
 if __name__ == "__main__":

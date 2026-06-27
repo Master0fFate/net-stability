@@ -66,10 +66,9 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import windows_dns_policy
 
@@ -1350,10 +1349,14 @@ def macos_dns_state() -> Dict[str, Any]:
             servers = re.findall(r"(?m)^\s+nameserver\s+\[[^\]]+\]\s*:\s*(\S+)", result.stdout)
             return {"available": True, "servers": servers[:4], "service": "Wi-Fi"}
         return {"available": False, "error": "Could not query DNS", "servers": []}
-    lines = [l.strip() for l in result.stdout.splitlines() if l.strip() and not l.startswith("There aren't any")]
+    lines = [
+        line.strip()
+        for line in result.stdout.splitlines()
+        if line.strip() and not line.startswith("There aren't any")
+    ]
     return {
         "available": True,
-        "servers": [l for l in lines if l and not l.startswith("networksetup")],
+        "servers": [line for line in lines if line and not line.startswith("networksetup")],
         "service": "Wi-Fi",
     }
 
@@ -1485,9 +1488,6 @@ def linux_write_sysctl_conf(values: Optional[Mapping[str, str]] = None) -> Comma
         content += f"{key} = {value}\n"
     try:
         LINUX_SYSCTL_CONF_PATH.parent.mkdir(parents=True, exist_ok=True)
-        old = b""
-        if LINUX_SYSCTL_CONF_PATH.is_file():
-            old = LINUX_SYSCTL_CONF_PATH.read_bytes()
         LINUX_SYSCTL_CONF_PATH.write_text(content, encoding="utf-8")
         return CommandResult(["write", str(LINUX_SYSCTL_CONF_PATH)], 0, "", "", 0.0)
     except OSError as exc:
@@ -1597,6 +1597,18 @@ def linux_reset_network() -> List[CommandResult]:
         results.append(run_command(["systemctl", "restart", "NetworkManager"], timeout=30))
     if shutil.which("resolvectl"):
         results.append(run_command(["resolvectl", "flush-caches"], timeout=5))
+    return results
+
+
+def linux_flush_dns_cache() -> List[CommandResult]:
+    results: List[CommandResult] = []
+    resolvectl = shutil.which("resolvectl")
+    if resolvectl:
+        results.append(run_command([resolvectl, "flush-caches"], timeout=5))
+        return results
+    systemd_resolve = shutil.which("systemd-resolve")
+    if systemd_resolve:
+        results.append(run_command([systemd_resolve, "--flush-caches"], timeout=5))
     return results
 
 
@@ -2452,11 +2464,17 @@ def command_reset_network(args: argparse.Namespace) -> int:
         return 1
 
 
-def command_repair_dns(args: argparse.Namespace) -> int:
-    if platform.system() != "Windows":
-        print("Windows DNS policy repair is only available on Windows.")
-        return 1
+def _format_dns_servers(servers: Sequence[str]) -> str:
+    return ", ".join(servers) if servers else "none"
 
+
+def _dns_needs_target_servers(servers: Sequence[str]) -> bool:
+    return any(server in {"0.0.0.0", ""} for server in servers) or any(
+        server not in servers for server in DEFAULT_DNS_SERVERS
+    )
+
+
+def command_repair_windows_dns(args: argparse.Namespace) -> int:
     health = windows_dns_policy_health()
     print("Windows DNS policy health:")
     print(f"  Severity: {health.severity}")
@@ -2494,6 +2512,88 @@ def command_repair_dns(args: argparse.Namespace) -> int:
     if result.reboot_recommended:
         print("  - Reboot is recommended if NRPT corruption remains.")
     return 0 if result.ok else 2
+
+
+def command_repair_linux_dns(args: argparse.Namespace) -> int:
+    state = linux_dns_state()
+    servers = tuple(str(server) for server in state.get("servers", []))
+    print("Linux DNS repair:")
+    print(f"  Current servers: {_format_dns_servers(servers)}")
+    print(f"  Target servers: {_format_dns_servers(DEFAULT_DNS_SERVERS)}")
+
+    needs_target = _dns_needs_target_servers(servers)
+    if args.dry_run:
+        print("  - Would flush the Linux resolver cache.")
+        if needs_target:
+            print("  - Would set DNS servers to 1.1.1.1, 1.0.0.1.")
+        else:
+            print("  - DNS servers already match the stable profile.")
+        return 0
+    if os.geteuid() != 0:
+        raise NetStabilityError("Linux DNS repair requires root; run with sudo")
+    if not confirm("Repair Linux DNS state?", args.yes):
+        print("Cancelled.")
+        return 1
+
+    results = linux_flush_dns_cache()
+    if needs_target:
+        results.append(linux_set_dns(DEFAULT_DNS_SERVERS))
+    if not results:
+        print("  - No Linux DNS cache flush command was available.")
+        return 0
+    for result in results:
+        if result.ok:
+            print(f"  + {' '.join(result.command)}")
+        else:
+            print_command_failure("Linux DNS repair", result)
+    return 0 if all(result.ok for result in results) else 2
+
+
+def command_repair_macos_dns(args: argparse.Namespace) -> int:
+    state = macos_dns_state()
+    servers = tuple(str(server) for server in state.get("servers", []))
+    print("macOS DNS repair:")
+    print(f"  Current servers: {_format_dns_servers(servers)}")
+    print(f"  Target servers: {_format_dns_servers(DEFAULT_DNS_SERVERS)}")
+
+    needs_target = _dns_needs_target_servers(servers)
+    if args.dry_run:
+        print("  - Would flush the macOS DNS and mDNS responder caches.")
+        if needs_target:
+            print("  - Would set DNS servers to 1.1.1.1, 1.0.0.1.")
+        else:
+            print("  - DNS servers already match the stable profile.")
+        return 0
+    if os.geteuid() != 0:
+        raise NetStabilityError("macOS DNS repair requires root; run with sudo")
+    if not confirm("Repair macOS DNS state?", args.yes):
+        print("Cancelled.")
+        return 1
+
+    results = [
+        run_command(["dscacheutil", "-flushcache"], timeout=5),
+        run_command(["killall", "-HUP", "mDNSResponder"], timeout=5),
+    ]
+    if needs_target:
+        results.append(macos_set_dns(DEFAULT_DNS_SERVERS))
+    for result in results:
+        if result.ok:
+            print(f"  + {' '.join(result.command)}")
+        else:
+            print_command_failure("macOS DNS repair", result)
+    return 0 if all(result.ok for result in results) else 2
+
+
+def command_repair_dns(args: argparse.Namespace) -> int:
+    system = platform.system()
+    if system == "Windows":
+        return command_repair_windows_dns(args)
+    if system == "Linux":
+        return command_repair_linux_dns(args)
+    if system == "Darwin":
+        return command_repair_macos_dns(args)
+    print(f"DNS repair is not implemented for {system}.")
+    return 1
 
 
 def command_apply(args: argparse.Namespace) -> int:
@@ -3908,7 +4008,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     repair_dns = subparsers.add_parser(
         "repair-dns",
-        help="diagnose and repair Windows DNS policy corruption and invalid resolver entries",
+        help="diagnose and repair platform DNS policy, cache, and resolver state",
     )
     repair_dns.add_argument("--dry-run", action="store_true", help="show intended DNS repair only")
     repair_dns.add_argument("--yes", action="store_true", help="skip the confirmation prompt")

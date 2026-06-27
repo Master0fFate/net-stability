@@ -29,9 +29,9 @@ COMMANDS: Final[tuple[CommandSpec, ...]] = (
         primary=True,
     ),
     CommandSpec(
-        "Repair Windows DNS policy",
+        "Repair DNS",
         ("repair-dns", "--yes"),
-        "Fix DNS policy corruption, DNS Client timeouts, and invalid resolver entries on Windows.",
+        "Repair platform DNS state: Windows policy health, Linux resolver cache, or macOS DNS cache.",
     ),
     CommandSpec(
         "Measure idle baseline",

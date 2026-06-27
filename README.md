@@ -8,7 +8,7 @@
 Net Stability is a small, reversible network reliability helper for weak Wi-Fi links and flaky `npm install` runs. It diagnoses the likely failure layer first, applies conservative (but evidence-backed) tuning, and restores exact backups.
 
 It includes a simple desktop UI with two primary paths: **Audit evidence first** for read-only diagnostics, and **Full Optimization** to apply every supported OS and npm tuning tweak in one shot.
-It also adds a Windows-specific **DNS policy repair** path for corrupted NRPT state, DNS Client timeouts, and invalid resolver entries.
+It also includes a cross-platform **Repair DNS** action: Windows keeps the deeper DNS policy repair for corrupted NRPT state, while Linux and macOS use platform-native DNS cache and resolver repair.
 
 ---
 
@@ -18,6 +18,8 @@ It also adds a Windows-specific **DNS policy repair** path for corrupted NRPT st
 - Applies a weak-link npm profile: fewer per-origin sockets, longer fetch timeouts, more retries, and `prefer-offline`.
 - **Windows**: Restores restricted TCP receive-window auto-tuning, adjusts Wi-Fi power policy and adapter power properties, sets MTU to 1500, enables ECN, disables Delivery Optimization P2P sharing, sets QoS reservable bandwidth to 0%, disables Large Send Offload on Wi-Fi adapters, and tunes TCP retransmission registry values.
 - **Windows DNS policy**: Diagnoses NRPT corruption, DNS Client timeout events, and invalid resolver entries; repairs only invalid DNS server assignments and flushes the DNS cache, without deleting VPN or NRPT rules automatically.
+- **Linux DNS repair**: Flushes the resolver cache when supported and repairs DNS servers to the stable 1.1.1.1 / 1.0.0.1 profile when the current resolver state is missing or invalid.
+- **macOS DNS repair**: Flushes DNS and mDNS responder caches and repairs DNS servers to the stable 1.1.1.1 / 1.0.0.1 profile when needed.
 - **Linux**: Disables NetworkManager Wi-Fi powersave, writes sysctl TCP/IP tuning (buffers, SACK, window scaling, timestamps, fastopen), enables BBR congestion control with fq_codel qdisc, increases NIC ring buffers, enables the irqbalance daemon, and sets DNS to 1.1.1.1.
 - **macOS**: Sets DNS to 1.1.1.1 / 1.0.0.1, tunes TCP buffer sizes (131072 send/recv), and writes persistent sysctl.conf.
 - **All platforms**: `reset-network` command resets the TCP/IP stack, Winsock (Windows), and DNS cache to OS defaults.
@@ -38,7 +40,7 @@ Two primary buttons at the top:
 
 - **Audit evidence first** -- read-only diagnostics and capability report.
 - **Full Optimization** -- backs up current state, then applies every supported OS tuning and npm profile in one operation.
-- **Repair Windows DNS policy** -- Windows-only repair flow for DNS policy corruption and invalid resolver entries.
+- **Repair DNS** -- platform-specific DNS repair for Windows, Linux, and macOS.
 
 For Windows system tuning, open the terminal as Administrator before launching the GUI:
 
@@ -88,7 +90,7 @@ The desktop UI is intentionally small and cross-platform:
 - Built with `tkinter`, included with most Python desktop installs.
 - No third-party runtime dependencies.
 - Two primary buttons: **Audit evidence first** and **Full Optimization**.
-- Advanced actions (DNS policy repair, diagnostics, npm-only, reset network, restore, backups) stay visible but secondary.
+- Advanced actions (DNS repair, diagnostics, npm-only, reset network, restore, backups) stay visible but secondary.
 - An 8-stage progress panel tracks every step of the pipeline.
 - The log panel streams real command output in a dark terminal-style view.
 
@@ -169,12 +171,22 @@ Linux-specific optimizations:
 - irqbalance daemon enabled and started
 - DNS set to 1.1.1.1 / 1.0.0.1
 
+Linux DNS repair is available via `repair-dns`:
+- Reports current DNS servers
+- Flushes resolver caches with `resolvectl` or `systemd-resolve` when available
+- Sets DNS to 1.1.1.1 / 1.0.0.1 when the resolver state is missing, invalid, or not already using the stable profile
+
 ### macOS
 
 macOS-specific optimizations:
 - DNS set to 1.1.1.1 / 1.0.0.1
 - TCP buffer sizes: send=131072, recv=131072
 - Persistent sysctl.conf written for buffer settings
+
+macOS DNS repair is available via `repair-dns`:
+- Reports current DNS servers
+- Flushes DNS and mDNS responder caches
+- Sets DNS to 1.1.1.1 / 1.0.0.1 when the resolver state is missing, invalid, or not already using the stable profile
 
 The tool does not change undocumented system Wi-Fi knobs.
 
@@ -227,6 +239,7 @@ Net Stability is intentionally conservative:
 - Restore commands target exact snapshots with full pre-change state.
 - User npm state and elevated system state are handled in separate operations when needed.
 - Windows DNS policy repair is conservative and does not delete NRPT or VPN rules automatically.
+- Linux and macOS DNS repair is scoped to resolver cache cleanup and the documented stable DNS server profile.
 - The tool favors documented OS knobs and explicit diagnostics.
 - Reports can be redacted before sharing.
 - Router queue management is advisory only; a PC-side utility cannot directly fix queues inside an ISP modem or router.
