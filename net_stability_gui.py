@@ -9,87 +9,14 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
-from dataclasses import dataclass
 from pathlib import Path
 from tkinter import ttk
-from typing import Final, Literal
+from typing import Final
+
+from net_stability_gui_commands import COMMANDS, STAGE_LABELS, STAGE_ORDER, CommandSpec
 
 APP_TITLE: Final = "Net Stability"
 SCRIPT_PATH: Final = Path(__file__).with_name("net_stability.py")
-
-StageName = Literal["check", "audit", "backup", "npm", "system", "tuning", "reset", "done"]
-
-
-@dataclass(frozen=True, slots=True)
-class CommandSpec:
-    label: str
-    args: tuple[str, ...]
-    description: str
-    primary: bool = False
-
-
-COMMANDS: Final[tuple[CommandSpec, ...]] = (
-    CommandSpec(
-        "Audit evidence first",
-        ("audit", "--redact"),
-        "Create a read-only evidence, capability, and safety-policy report.",
-        primary=True,
-    ),
-    CommandSpec(
-        "Full Optimization",
-        ("apply", "--yes"),
-        "Back up and apply ALL supported reliability, TCP/IP, and DNS optimizations.",
-        primary=True,
-    ),
-    CommandSpec(
-        "Measure idle baseline",
-        ("measure", "idle", "--samples", "5", "--redact"),
-        "Collect baseline gateway, remote, DNS, and HTTPS measurements.",
-    ),
-    CommandSpec(
-        "Run full diagnostics",
-        ("diagnose", "--samples", "5", "--redact"),
-        "Measure network health and save a redacted JSON report.",
-    ),
-    CommandSpec(
-        "Optimize connection",
-        ("apply", "--system-only", "--yes"),
-        "Apply system-level OS reliability and tuning settings (requires admin).",
-    ),
-    CommandSpec(
-        "Optimize npm only",
-        ("apply", "--npm-only", "--yes"),
-        "Use only user-level npm settings. Does not require administrator rights.",
-    ),
-    CommandSpec(
-        "Reset Network Stack",
-        ("reset-network", "--yes"),
-        "Reset TCP/IP, Winsock, and DNS to OS defaults (requires reboot).",
-    ),
-    CommandSpec(
-        "Restore latest backup",
-        ("restore", "latest", "--yes"),
-        "Undo the most recent Net Stability change set.",
-    ),
-    CommandSpec(
-        "Show backups",
-        ("list-backups",),
-        "List restore points created by this tool.",
-    ),
-)
-
-STAGE_LABELS: Final[dict[StageName, str]] = {
-    "check": "Check the connection and platform",
-    "audit": "Map evidence and safe capabilities",
-    "backup": "Create a restore point",
-    "npm": "Tune npm for weak links",
-    "system": "Apply OS Wi-Fi power and adapter settings",
-    "tuning": "Apply TCP/IP, DNS, and buffer tuning",
-    "reset": "Reset network stack",
-    "done": "Show the result and restore path",
-}
-
-STAGE_ORDER: Final[tuple[StageName, ...]] = ("check", "audit", "backup", "npm", "system", "tuning", "reset", "done")
 
 
 class NetStabilityGui:
@@ -260,6 +187,8 @@ class NetStabilityGui:
             self.events.put("STAGE:tuning:Running")
         if "irqbalance" in lowered or "dns set" in lowered or "tcp buffer" in lowered:
             self.events.put("STAGE:tuning:Running")
+        if "dns policy" in lowered or "nrpt" in lowered or "resolver" in lowered:
+            self.events.put("STAGE:tuning:Running")
         if "network stack" in lowered or "netsh int ip reset" in lowered or "winsock" in lowered:
             self.events.put("STAGE:reset:Running")
         if "route -n flush" in lowered or "systemctl restart networkmanager" in lowered:
@@ -277,12 +206,11 @@ class NetStabilityGui:
                 self.status_var.set("Ready")
                 continue
             if event.startswith("STAGE:"):
-                try:
-                    _, stage, value = event.strip().split(":", 2)
+                parts = event.strip().split(":", 2)
+                if len(parts) == 3:
+                    _, stage, value = parts
                     if stage in self.stage_vars:
                         self.stage_vars[stage].set(value)
-                except ValueError:
-                    pass
                 continue
             self._write_log(event)
         self.root.after(120, self._drain_events)
@@ -303,8 +231,8 @@ def smoke_check() -> int:
     print(f"{APP_TITLE} GUI smoke check passed on {platform.system()}.")
     print("Primary actions: Audit evidence first, Full Optimization")
     print(
-        "Advanced actions: Measure idle baseline, Run full diagnostics, Optimize connection, "
-        "Optimize npm only, Reset Network Stack, Restore latest backup, Show backups"
+        "Advanced actions: Repair Windows DNS policy, Measure idle baseline, Run full diagnostics, "
+        "Optimize connection, Optimize npm only, Reset Network Stack, Restore latest backup, Show backups"
     )
     return 0
 

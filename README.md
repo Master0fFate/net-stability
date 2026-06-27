@@ -8,6 +8,7 @@
 Net Stability is a small, reversible network reliability helper for weak Wi-Fi links and flaky `npm install` runs. It diagnoses the likely failure layer first, applies conservative (but evidence-backed) tuning, and restores exact backups.
 
 It includes a simple desktop UI with two primary paths: **Audit evidence first** for read-only diagnostics, and **Full Optimization** to apply every supported OS and npm tuning tweak in one shot.
+It also adds a Windows-specific **DNS policy repair** path for corrupted NRPT state, DNS Client timeouts, and invalid resolver entries.
 
 ---
 
@@ -16,6 +17,7 @@ It includes a simple desktop UI with two primary paths: **Audit evidence first**
 - Creates a restore point **before** applying any change.
 - Applies a weak-link npm profile: fewer per-origin sockets, longer fetch timeouts, more retries, and `prefer-offline`.
 - **Windows**: Restores restricted TCP receive-window auto-tuning, adjusts Wi-Fi power policy and adapter power properties, sets MTU to 1500, enables ECN, disables Delivery Optimization P2P sharing, sets QoS reservable bandwidth to 0%, disables Large Send Offload on Wi-Fi adapters, and tunes TCP retransmission registry values.
+- **Windows DNS policy**: Diagnoses NRPT corruption, DNS Client timeout events, and invalid resolver entries; repairs only invalid DNS server assignments and flushes the DNS cache, without deleting VPN or NRPT rules automatically.
 - **Linux**: Disables NetworkManager Wi-Fi powersave, writes sysctl TCP/IP tuning (buffers, SACK, window scaling, timestamps, fastopen), enables BBR congestion control with fq_codel qdisc, increases NIC ring buffers, enables the irqbalance daemon, and sets DNS to 1.1.1.1.
 - **macOS**: Sets DNS to 1.1.1.1 / 1.0.0.1, tunes TCP buffer sizes (131072 send/recv), and writes persistent sysctl.conf.
 - **All platforms**: `reset-network` command resets the TCP/IP stack, Winsock (Windows), and DNS cache to OS defaults.
@@ -36,6 +38,7 @@ Two primary buttons at the top:
 
 - **Audit evidence first** -- read-only diagnostics and capability report.
 - **Full Optimization** -- backs up current state, then applies every supported OS tuning and npm profile in one operation.
+- **Repair Windows DNS policy** -- Windows-only repair flow for DNS policy corruption and invalid resolver entries.
 
 For Windows system tuning, open the terminal as Administrator before launching the GUI:
 
@@ -61,6 +64,7 @@ python net_stability.py restore latest
 python net_stability.py list-backups
 python net_stability.py watch -- npm install
 python net_stability.py reset-network
+python net_stability.py repair-dns
 ```
 
 Useful options:
@@ -72,6 +76,7 @@ python net_stability.py measure idle --samples 20 --redact
 python net_stability.py apply --dry-run
 python net_stability.py apply --system-only
 python net_stability.py restore latest --npm-only
+python net_stability.py repair-dns --dry-run
 ```
 
 ---
@@ -83,7 +88,7 @@ The desktop UI is intentionally small and cross-platform:
 - Built with `tkinter`, included with most Python desktop installs.
 - No third-party runtime dependencies.
 - Two primary buttons: **Audit evidence first** and **Full Optimization**.
-- Advanced actions (diagnostics, npm-only, reset network, restore, backups) stay visible but secondary.
+- Advanced actions (DNS policy repair, diagnostics, npm-only, reset network, restore, backups) stay visible but secondary.
 - An 8-stage progress panel tracks every step of the pipeline.
 - The log panel streams real command output in a dark terminal-style view.
 
@@ -131,6 +136,12 @@ The tool applies these Windows-specific optimizations:
 - QoS reservable bandwidth set to 0%
 - Large Send Offload disabled on Wi-Fi adapters
 - TCP retransmission registry: `TcpMaxDataRetransmissions=5`, `TcpMaxConnectRetransmissions=3`
+
+Windows DNS policy repair is available separately via `repair-dns`:
+- Detects NRPT-effective query failures, DNS Client event 1014/1023 spikes, and invalid resolver entries like `0.0.0.0`
+- Flushes the DNS cache before repair
+- Rewrites only invalid interface DNS server assignments, preserving VPN and enterprise NRPT rules
+- Recommends reboot or `reset-network` if NRPT corruption persists
 
 The tool may briefly restart or reapply the Wi-Fi adapter so settings take effect.
 
@@ -215,6 +226,7 @@ Net Stability is intentionally conservative:
 - Every change is backed up **before** it is applied.
 - Restore commands target exact snapshots with full pre-change state.
 - User npm state and elevated system state are handled in separate operations when needed.
+- Windows DNS policy repair is conservative and does not delete NRPT or VPN rules automatically.
 - The tool favors documented OS knobs and explicit diagnostics.
 - Reports can be redacted before sharing.
 - Router queue management is advisory only; a PC-side utility cannot directly fix queues inside an ISP modem or router.

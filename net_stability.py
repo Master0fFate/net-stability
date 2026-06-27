@@ -71,6 +71,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+import windows_dns_policy
+
 
 APP_DISPLAY_NAME = "Net Stability"
 APP_DIR_WINDOWS = "NetStability"
@@ -334,6 +336,14 @@ def run_powershell(script: str, *, timeout: float = 30.0) -> CommandResult:
         timeout=timeout,
         preferred_encoding="utf-8",
     )
+
+
+def run_windows_dns_policy_powershell(script: str, timeout: float) -> CommandResult:
+    return run_powershell(script, timeout=timeout)
+
+
+def windows_dns_policy_health() -> windows_dns_policy.DnsPolicyHealth:
+    return windows_dns_policy.collect_health(run_windows_dns_policy_powershell)
 
 
 def utc_now_iso() -> str:
@@ -894,6 +904,7 @@ def capture_windows_state() -> Dict[str, Any]:
         "tcp_global": windows_tcp_global_state(),
         "power": windows_power_state(),
         "wifi_adapters": windows_wifi_adapters_state(),
+        "dns_policy": windows_dns_policy_health().to_report(),
     }
 
 
@@ -1787,11 +1798,64 @@ def _record_applied(manifest: Dict[str, Any], manifest_path: Path, record: Dict[
     atomic_write_json(manifest_path, manifest)
 
 
+def apply_windows_dns_policy_repair(
+    manifest: Dict[str, Any],
+    manifest_path: Path,
+    health: windows_dns_policy.DnsPolicyHealth,
+) -> None:
+    if not health.repair_needed:
+        print("  + Windows DNS policy: healthy")
+        return
+
+    result = windows_dns_policy.repair_health(
+        run_windows_dns_policy_powershell,
+        health,
+        DEFAULT_DNS_SERVERS,
+    )
+    for action in result.actions:
+        if action.ok:
+            print(f"  + Windows DNS policy: {action.name}")
+        else:
+            print(f"  ! Windows DNS policy {action.name}: {action.detail}", file=sys.stderr)
+
+    record = {
+        "type": "windows_dns_policy_repair",
+        "scope": "windows",
+        "health": health.to_report(),
+        "repair": result.to_report(),
+    }
+    _record_applied(manifest, manifest_path, record)
+    if result.reboot_recommended:
+        record_apply_issue(
+            manifest,
+            manifest_path,
+            "warning",
+            "windows",
+            "Windows DNS NRPT policy corruption was detected; reboot or reset-network if it persists.",
+        )
+    if not result.ok:
+        record_apply_issue(
+            manifest,
+            manifest_path,
+            "error",
+            "windows",
+            "Windows DNS policy repair did not complete cleanly.",
+        )
+
+
 def apply_windows_extended_tuning(
     manifest: Dict[str, Any],
     manifest_path: Path,
 ) -> None:
     state = manifest.get("state", {}).get("system", {})
+    dns_policy_state = state.get("dns_policy", {})
+    if isinstance(dns_policy_state, dict):
+        apply_windows_dns_policy_repair(
+            manifest,
+            manifest_path,
+            windows_dns_policy.health_from_report(dns_policy_state),
+        )
+
     """Apply MTU=1500 on Wi-Fi interfaces."""
     mtu_state = state.get("mtu", {})
     if mtu_state.get("available"):
@@ -1900,7 +1964,28 @@ def restore_windows_extended_tuning(manifest: Dict[str, Any]) -> List[Dict[str, 
     applied = manifest.get("applied", {}).get("system", [])
     results: List[Dict[str, Any]] = []
     for item in applied:
-        if item.get("type") == "mtu":
+        if item.get("type") == "windows_dns_policy_repair":
+            repair = item.get("repair", {})
+            actions = repair.get("actions", []) if isinstance(repair, dict) else []
+            for action in actions:
+                if not isinstance(action, dict) or action.get("name") != "set_clean_dns_servers":
+                    continue
+                alias = str(action.get("interface_alias") or "")
+                original = [str(server) for server in action.get("original_servers", [])]
+                if not alias:
+                    continue
+                restore = windows_dns_policy.restore_dns_servers(
+                    run_windows_dns_policy_powershell,
+                    alias,
+                    original,
+                )
+                results.append(restore.to_report())
+                if restore.ok:
+                    print(f"  + restored DNS servers on {alias}")
+                else:
+                    print(f"  ! restore DNS servers on {alias}: {restore.detail}", file=sys.stderr)
+
+        elif item.get("type") == "mtu":
             name = item.get("interface", "")
             orig = item.get("original_mtu")
             if name and orig:
@@ -2234,6 +2319,7 @@ def planned_changes(do_system: bool, do_npm: bool, include_battery: bool, maxsoc
     system = platform.system()
     if do_system:
         if system == "Windows":
+            changes.append("Check and repair Windows DNS policy corruption, DNS Client timeouts, and invalid resolver entries")
             changes.append("Restore Windows TCP receive-window auto-tuning to normal when restricted or disabled")
             changes.append("Set the active plan's Wi-Fi policy to Maximum Performance on AC" + (" and battery" if include_battery else ""))
             changes.append("Disable supported NDIS SelectiveSuspend and DeviceSleepOnDisconnect on physical Wi-Fi adapters")
@@ -2364,6 +2450,50 @@ def command_reset_network(args: argparse.Namespace) -> int:
     else:
         print(f"  - Network reset not implemented for {system}")
         return 1
+
+
+def command_repair_dns(args: argparse.Namespace) -> int:
+    if platform.system() != "Windows":
+        print("Windows DNS policy repair is only available on Windows.")
+        return 1
+
+    health = windows_dns_policy_health()
+    print("Windows DNS policy health:")
+    print(f"  Severity: {health.severity}")
+    print(f"  Findings: {', '.join(health.findings) if health.findings else 'none'}")
+    print(
+        "  Recommended actions: "
+        f"{', '.join(health.recommended_actions) if health.recommended_actions else 'none'}"
+    )
+
+    if not health.repair_needed:
+        print("  + No DNS policy repair needed.")
+        return 0
+
+    if args.dry_run:
+        print("Dry run complete; DNS cache and resolver settings were not changed.")
+        return 0
+    if not is_windows_admin():
+        raise NetStabilityError("Windows DNS policy repair requires an Administrator terminal")
+    if not confirm("Repair Windows DNS policy state?", args.yes):
+        print("Cancelled.")
+        return 1
+
+    result = windows_dns_policy.repair_health(
+        run_windows_dns_policy_powershell,
+        health,
+        DEFAULT_DNS_SERVERS,
+    )
+    for action in result.actions:
+        if action.ok:
+            print(f"  + {action.name}")
+        else:
+            print(f"  ! {action.name}: {action.detail}", file=sys.stderr)
+    for note in result.notes:
+        print(f"  - {note}")
+    if result.reboot_recommended:
+        print("  - Reboot is recommended if NRPT corruption remains.")
+    return 0 if result.ok else 2
 
 
 def command_apply(args: argparse.Namespace) -> int:
@@ -2894,6 +3024,7 @@ $items=@(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Select-Object 
 ConvertTo-Json -InputObject $items -Depth 4 -Compress
 """
         data["windows_netadapters"] = run_powershell(adapter_script, timeout=20).to_report()
+        data["windows_dns_policy_health"] = windows_dns_policy_health().to_report()
         driver_script = r"""
 $items=@(Get-CimInstance Win32_PnPSignedDriver -ErrorAction SilentlyContinue | Where-Object {$_.DeviceClass -eq 'NET'} | Select-Object DeviceName,Manufacturer,DriverProviderName,DriverVersion,DriverDate,InfName,DeviceID)
 ConvertTo-Json -InputObject $items -Depth 4 -Compress
@@ -3031,6 +3162,13 @@ def capability_matrix() -> List[Dict[str, str]]:
                     "mutation": "snapshot-backed",
                 },
                 {
+                    "capability": "Windows DNS policy health and repair",
+                    "available": "conditional",
+                    "source": "Get-DnsClientNrptPolicy, DNS Client events, DNS server inventory",
+                    "privilege": "administrator to write DNS server repair",
+                    "mutation": "snapshot-backed DNS cache flush and invalid resolver repair",
+                },
+                {
                     "capability": "Network stack reset",
                     "available": "conditional",
                     "source": "netsh int ip reset, winsock reset, ipconfig /flushdns",
@@ -3164,6 +3302,7 @@ def repository_map() -> Dict[str, Any]:
             "restore",
             "list-backups",
             "reset-network",
+            "repair-dns",
         ],
         "platform_abstractions": {
             "windows": "PowerShell/PowerCFG/NetAdapter read and adapter-scoped power writes",
@@ -3178,6 +3317,7 @@ def repository_map() -> Dict[str, Any]:
         "application_profiles": ["npm weak-link profile"],
         "privileged_operations": [
             "Windows system apply/restore requires Administrator",
+            "Windows DNS policy repair changes only invalid resolver entries and never deletes NRPT/VPN rules automatically",
             "Linux NetworkManager write may require polkit/root",
         ],
         "tests": "standard-library smoke checks plus policy tests",
@@ -3765,6 +3905,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     reset.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
     reset.set_defaults(function=command_reset_network)
+
+    repair_dns = subparsers.add_parser(
+        "repair-dns",
+        help="diagnose and repair Windows DNS policy corruption and invalid resolver entries",
+    )
+    repair_dns.add_argument("--dry-run", action="store_true", help="show intended DNS repair only")
+    repair_dns.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    repair_dns.set_defaults(function=command_repair_dns)
     return parser
 
 
