@@ -68,7 +68,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 import windows_dns_policy
 
@@ -1179,19 +1179,45 @@ def _set_registry_dword(reg_path: str, value_name: str, value: int) -> CommandRe
     return run_powershell(script, timeout=10)
 
 
-def windows_mtu_state() -> Dict[str, Any]:
+def _normalize_interface_name(value: Any) -> str:
+    return " ".join(str(value or "").strip().lower().split())
+
+
+def _wifi_adapter_names(wifi_state: Mapping[str, Any]) -> List[str]:
+    adapters = wifi_state.get("adapters", []) if isinstance(wifi_state, Mapping) else []
+    names: List[str] = []
+    if not isinstance(adapters, list):
+        return names
+    seen: Set[str] = set()
+    for item in adapters:
+        if not isinstance(item, Mapping):
+            continue
+        for field in ("Name", "InterfaceDescription"):
+            name = str(item.get(field) or "").strip()
+            normalized = _normalize_interface_name(name)
+            if name and normalized not in seen:
+                names.append(name)
+                seen.add(normalized)
+    return names
+
+
+def _filter_interfaces_by_name(
+    interfaces: Sequence[Mapping[str, Any]],
+    allowed: Sequence[str],
+) -> List[Dict[str, Any]]:
+    allowed_set = {_normalize_interface_name(name) for name in allowed if str(name).strip()}
+    if not allowed_set:
+        return [dict(item) for item in interfaces]
+    return [dict(item) for item in interfaces if _normalize_interface_name(item.get("name")) in allowed_set]
+
+
+def windows_mtu_state(wifi_interfaces: Optional[Sequence[str]] = None) -> Dict[str, Any]:
     result = run_command(["netsh", "interface", "ipv4", "show", "subinterface"], timeout=10)
     if not result.ok:
         return {"available": False, "error": result.error or result.stderr.strip(), "interfaces": []}
-    interfaces: List[Dict[str, Any]] = []
-    for line in result.stdout.splitlines():
-        parts = line.strip().split()
-        # First 4 fields: MTU, MediaSenseState, BytesIn, BytesOut. Name is everything after.
-        if len(parts) >= 5 and parts[0].isdigit():
-            mtu_val = int(parts[0])
-            ifname = " ".join(parts[4:])
-            if ifname and "Loopback" not in ifname:
-                interfaces.append({"name": ifname, "mtu": mtu_val})
+    interfaces = windows_parse_subinterface_output(result.stdout)
+    if wifi_interfaces:
+        interfaces = _filter_interfaces_by_name(interfaces, wifi_interfaces)
     return {"available": True, "interfaces": interfaces}
 
 
@@ -1254,7 +1280,7 @@ def windows_set_qos_reserve(value: int = 0) -> CommandResult:
     return _set_registry_dword(WINDOWS_QOS_PATH, "NonBestEffortLimit", value)
 
 
-def windows_lso_state() -> Dict[str, Any]:
+def windows_lso_state(wifi_interfaces: Optional[Sequence[str]] = None) -> Dict[str, Any]:
     script = (
         "Get-NetAdapterLso -ErrorAction SilentlyContinue "
         "| Select-Object Name,IPv4Enabled,IPv6Enabled "
@@ -1275,6 +1301,9 @@ def windows_lso_state() -> Dict[str, Any]:
             }
             for a in parsed if isinstance(a, dict)
         ]
+        if wifi_interfaces:
+            allowed_set = {_normalize_interface_name(name) for name in wifi_interfaces if str(name).strip()}
+            adapters = [adapter for adapter in adapters if _normalize_interface_name(adapter.get("name")) in allowed_set]
         return {"available": True, "adapters": adapters}
     except (json.JSONDecodeError, TypeError):
         return {"available": False, "adapters": []}
@@ -1776,11 +1805,12 @@ def capture_system_state() -> Dict[str, Any]:
     state: Dict[str, Any] = {}
     if system == "Windows":
         state = capture_windows_state()
-        state["mtu"] = windows_mtu_state()
+        wifi_names = _wifi_adapter_names(state.get("wifi_adapters", {}))
+        state["mtu"] = windows_mtu_state(wifi_names)
         state["ecn"] = windows_ecn_state()
         state["delivery_optimization"] = windows_delivery_optimization_state()
         state["qos"] = windows_qos_state()
-        state["lso"] = windows_lso_state()
+        state["lso"] = windows_lso_state(wifi_names)
         state["tcp_retrans"] = windows_tcp_retrans_state()
     elif system == "Linux":
         state = capture_linux_state()
@@ -2040,7 +2070,8 @@ def restore_windows_extended_tuning(manifest: Dict[str, Any]) -> List[Dict[str, 
             name = item.get("adapter", "")
             if name:
                 orig_ipv4 = item.get("original_ipv4", False)
-                if orig_ipv4:
+                orig_ipv6 = item.get("original_ipv6", False)
+                if orig_ipv4 or orig_ipv6:
                     r = windows_enable_lso(name)
                     results.append({"type": "lso", "ok": r.ok, "adapter": name})
                     if r.ok:
