@@ -231,7 +231,7 @@ def smoke_check() -> int:
     print(f"{APP_TITLE} GUI smoke check passed on {platform.system()}.")
     print("Primary actions: Audit evidence first, Full Optimization")
     print(
-        "Advanced actions: Repair DNS, Measure idle baseline, Run full diagnostics, "
+        "Advanced actions: Repair DNS, Measure idle baseline, Benchmark pressure points, Run full diagnostics, "
         "Optimize connection, Optimize npm only, Reset Network Stack, Restore latest backup, Show backups"
     )
     return 0

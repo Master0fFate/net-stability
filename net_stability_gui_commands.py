@@ -39,6 +39,22 @@ COMMANDS: Final[tuple[CommandSpec, ...]] = (
         "Collect baseline gateway, remote, DNS, and HTTPS measurements.",
     ),
     CommandSpec(
+        "Benchmark pressure points",
+        (
+            "benchmark",
+            "--baseline-seconds",
+            "5",
+            "--load-seconds",
+            "15",
+            "--parallel-downloads",
+            "3",
+            "--download-mb",
+            "8",
+            "--redact",
+        ),
+        "Run a read-only loaded benchmark for download loss, jitter, DNS, HTTPS, and adapter counters.",
+    ),
+    CommandSpec(
         "Run full diagnostics",
         ("diagnose", "--samples", "5", "--redact"),
         "Measure network health and save a redacted JSON report.",

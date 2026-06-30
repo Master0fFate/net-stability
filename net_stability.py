@@ -66,10 +66,18 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
+from net_stability_benchmark import (
+    DEFAULT_DOWNLOAD_URL,
+    DownloadLoadConfig,
+    download_worker,
+    jitter_metrics,
+    summarize_download_results,
+)
 import windows_dns_policy
 
 
@@ -3032,7 +3040,7 @@ def ping_summary(samples: Sequence[Mapping[str, Any]], key: str) -> Dict[str, An
     latencies = [float(record["latency_ms"]) for record in successes if record.get("latency_ms") is not None]
     if not available:
         return {"available": False, "attempts": 0}
-    return {
+    summary = {
         "available": True,
         "attempts": len(available),
         "successes": len(successes),
@@ -3042,6 +3050,8 @@ def ping_summary(samples: Sequence[Mapping[str, Any]], key: str) -> Dict[str, An
         "min_ms": round(min(latencies), 3) if latencies else None,
         "max_ms": round(max(latencies), 3) if latencies else None,
     }
+    summary.update(jitter_metrics(latencies))
+    return summary
 
 
 def service_summary(samples: Sequence[Mapping[str, Any]], key: str) -> Dict[str, Any]:
@@ -3083,6 +3093,9 @@ def format_metric(summary: Mapping[str, Any], failure_key: str = "loss_percent")
         parts.append(f"median {median:g} ms")
     if p95 is not None:
         parts.append(f"p95 {p95:g} ms")
+    jitter = summary.get("jitter_avg_ms")
+    if jitter is not None:
+        parts.append(f"jitter {float(jitter):g} ms")
     return ", ".join(parts) or "no successful measurements"
 
 
@@ -3217,6 +3230,13 @@ def capability_matrix() -> List[Dict[str, str]]:
             "source": "subprocess without shell",
             "privilege": "none",
             "mutation": "none",
+        },
+        {
+            "capability": "Comprehensive download-loaded benchmark",
+            "available": "yes",
+            "source": "stdlib HTTPS load plus gateway/public/DNS/HTTPS probes",
+            "privilege": "none",
+            "mutation": "none, report output only",
         },
         {
             "capability": "npm weak-link profile",
@@ -3427,6 +3447,7 @@ def repository_map() -> Dict[str, Any]:
         "public_commands": [
             "diagnose",
             "measure idle",
+            "benchmark",
             "watch -- <command>",
             "audit",
             "apply",
@@ -3592,6 +3613,33 @@ def classify_measurement(
         base_public = baseline.get("public_ping", {})
         base_median = base_public.get("median_ms")
         load_p95 = public.get("p95_ms")
+        public_jitter = float(public.get("jitter_avg_ms") or 0.0)
+        if public.get("available") and gateway_loss < 5.0 and (public_loss >= 5.0 or public_jitter >= 15.0):
+            observations.append(
+                observation_record(
+                    "download_loaded_loss_or_jitter",
+                    "high",
+                    [
+                        f"load_public_loss_percent={public_loss:g}",
+                        f"load_public_jitter_avg_ms={public_jitter:g}",
+                        f"load_gateway_loss_percent={gateway_loss:g}",
+                    ],
+                    0.84,
+                    ["Remote ICMP can be rate-limited; corroborate with HTTPS throughput and target diversity."],
+                )
+            )
+            recommendations.append(
+                recommendation_record(
+                    "rec-download-sqm-aqm",
+                    "router_queue",
+                    "Enable or tune SQM/AQM at the download bottleneck before adding more client-side TCP tweaks",
+                    "A",
+                    "moderate",
+                    ["obs-download_loaded_loss_or_jitter"],
+                    ["download_loss", "jitter", "loaded_latency", "fairness"],
+                    "Stable gateway plus loaded remote loss/jitter usually means queueing or WAN/path pressure outside the host.",
+                )
+            )
         if base_median is not None and load_p95 is not None:
             threshold = max(200.0, float(base_median) * 4.0)
             if float(load_p95) >= threshold and gateway_loss < 10.0:
@@ -3699,6 +3747,124 @@ def maybe_generate_windows_wlan_report(enabled: bool) -> Optional[Dict[str, Any]
     return record
 
 
+@dataclass(frozen=True, slots=True)
+class BenchmarkRunConfig:
+    baseline_seconds: float
+    load_seconds: float
+    interval: float
+    public_target: str
+    registry_host: str
+    download_url: str
+    parallel_downloads: int
+    download_mb: int
+
+
+def adapter_counter_state() -> Optional[Dict[str, Any]]:
+    if platform.system() != "Windows":
+        return None
+    script = r"""
+$items=@(Get-NetAdapterStatistics -ErrorAction SilentlyContinue | Select-Object Name,ReceivedBytes,SentBytes,ReceivedUnicastPackets,SentUnicastPackets,ReceivedDiscardedPackets,OutboundDiscardedPackets,ReceivedPacketErrors,OutboundPacketErrors)
+ConvertTo-Json -InputObject $items -Depth 4 -Compress
+"""
+    result = run_powershell(script, timeout=20)
+    if not result.ok or not result.stdout.strip():
+        return {"available": False, "error": result.error or result.stderr.strip() or result.stdout.strip()}
+    try:
+        parsed = json.loads(result.stdout.strip())
+    except json.JSONDecodeError:
+        return {"available": False, "error": "Could not parse adapter statistics"}
+    if isinstance(parsed, dict):
+        parsed = [parsed]
+    if not isinstance(parsed, list):
+        return {"available": False, "error": "Adapter statistics returned an unexpected shape"}
+    return {"available": True, "adapters": parsed}
+
+
+def adapter_counter_delta(
+    before: Optional[Mapping[str, Any]],
+    after: Optional[Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if not before or not after or not before.get("available") or not after.get("available"):
+        return None
+    before_items = before.get("adapters", [])
+    after_items = after.get("adapters", [])
+    if not isinstance(before_items, list) or not isinstance(after_items, list):
+        return None
+    before_by_name = {
+        str(item.get("Name")): item
+        for item in before_items
+        if isinstance(item, dict) and item.get("Name") is not None
+    }
+    deltas: List[Dict[str, Any]] = []
+    for item in after_items:
+        if not isinstance(item, dict) or item.get("Name") is None:
+            continue
+        name = str(item["Name"])
+        previous = before_by_name.get(name)
+        if not isinstance(previous, dict):
+            continue
+        delta: Dict[str, Any] = {"Name": name}
+        for key in (
+            "ReceivedBytes",
+            "SentBytes",
+            "ReceivedDiscardedPackets",
+            "OutboundDiscardedPackets",
+            "ReceivedPacketErrors",
+            "OutboundPacketErrors",
+        ):
+            try:
+                delta[key] = int(item.get(key) or 0) - int(previous.get(key) or 0)
+            except (TypeError, ValueError):
+                delta[key] = None
+        deltas.append(delta)
+    return {"available": True, "adapters": deltas}
+
+
+def run_download_load(
+    config: BenchmarkRunConfig,
+    gateway: Optional[str],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    stop_event = threading.Event()
+    download_config = DownloadLoadConfig(
+        url=config.download_url,
+        parallel=config.parallel_downloads,
+        bytes_per_worker=config.download_mb * 1024 * 1024,
+        timeout_seconds=config.load_seconds,
+    )
+    started = time.perf_counter()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=config.parallel_downloads) as executor:
+        futures = [
+            executor.submit(download_worker, download_config, stop_event)
+            for _ in range(config.parallel_downloads)
+        ]
+        load_count = max(1, int(math.ceil(config.load_seconds / config.interval)))
+        load_samples = collect_samples(
+            load_count,
+            config.interval,
+            gateway,
+            config.public_target,
+            config.registry_host,
+            "download_load",
+        )
+        stop_event.set()
+        workers: List[Dict[str, Any]] = []
+        for future in futures:
+            try:
+                workers.append(future.result(timeout=3.0))
+            except concurrent.futures.TimeoutError:
+                workers.append({"success": False, "bytes_read": 0, "error": "download worker did not stop"})
+    duration_ms = (time.perf_counter() - started) * 1000.0
+    return (
+        load_samples,
+        summarize_download_results(
+            config.download_url,
+            config.parallel_downloads,
+            duration_ms,
+            workers,
+        ),
+    )
+
+
 def command_audit(args: argparse.Namespace) -> int:
     gateway = default_gateway()
     report: Dict[str, Any] = {
@@ -3794,6 +3960,104 @@ def command_diagnose(args: argparse.Namespace) -> int:
 
 def command_measure_idle(args: argparse.Namespace) -> int:
     return command_diagnose(args)
+
+
+def command_benchmark(args: argparse.Namespace) -> int:
+    gateway = default_gateway()
+    config = BenchmarkRunConfig(
+        baseline_seconds=args.baseline_seconds,
+        load_seconds=args.load_seconds,
+        interval=args.interval,
+        public_target=args.public_target,
+        registry_host=args.registry_host,
+        download_url=args.download_url,
+        parallel_downloads=args.parallel_downloads,
+        download_mb=args.download_mb,
+    )
+    baseline_count = max(1, int(math.ceil(config.baseline_seconds / config.interval)))
+    print(f"Default gateway: {gateway or 'not detected'}")
+    print(f"Collecting {config.baseline_seconds:g}s idle baseline")
+    baseline_samples = collect_samples(
+        baseline_count,
+        config.interval,
+        gateway,
+        config.public_target,
+        config.registry_host,
+        "baseline",
+    )
+    baseline_summary = summarize_samples(baseline_samples)
+    print_sample_summary(baseline_summary, "Baseline:")
+
+    before_counters = adapter_counter_state()
+    print(
+        "Running download-loaded benchmark: "
+        f"{config.parallel_downloads} stream(s), {config.download_mb} MiB each, {config.load_seconds:g}s sample window"
+    )
+    load_samples, download_report = run_download_load(config, gateway)
+    after_counters = adapter_counter_state()
+    counter_delta = adapter_counter_delta(before_counters, after_counters)
+
+    load_summary = summarize_samples(load_samples)
+    print_sample_summary(load_summary, "During download load:")
+    print(
+        "Download load: "
+        f"{download_report.get('throughput_mbps', 0):g} Mbps, "
+        f"{download_report.get('bytes_read', 0)} bytes read, "
+        f"{download_report.get('failures', 0)} worker failure(s)"
+    )
+    signals = compare_phases(baseline_summary, load_summary)
+    observations, recommendations = classify_measurement(baseline_summary, load_summary)
+    print("Pressure-point interpretation:")
+    for signal in signals:
+        print(f"  - {signal}")
+    for recommendation in recommendations:
+        if recommendation.get("id") == "rec-download-sqm-aqm":
+            print("  - SQM/AQM candidate: enable FQ-CoDel or CAKE at the router/WAN bottleneck.")
+
+    report: Dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "tool": {"name": APP_DISPLAY_NAME, "version": VERSION},
+        "created_utc": utc_now_iso(),
+        "platform": platform_metadata(),
+        "gateway": gateway,
+        "benchmark": {
+            "direction": "download",
+            "baseline_seconds": config.baseline_seconds,
+            "load_seconds": config.load_seconds,
+            "interval": config.interval,
+            "download_url": config.download_url,
+            "parallel_downloads": config.parallel_downloads,
+            "download_mb_per_worker": config.download_mb,
+        },
+        "targets": {"public_ping": config.public_target, "registry": config.registry_host},
+        "baseline_samples": baseline_samples,
+        "load_samples": load_samples,
+        "baseline_summary": baseline_summary,
+        "load_summary": load_summary,
+        "download_load": download_report,
+        "adapter_counters": {
+            "before": before_counters,
+            "after": after_counters,
+            "delta": counter_delta,
+        },
+        "interpretation": signals,
+        "observations": observations,
+        "recommendations": recommendations,
+        "capability_matrix": capability_matrix(),
+        "notes": [
+            "This benchmark intentionally creates download traffic; reduce --download-mb or --parallel-downloads on metered links.",
+            "Stable gateway with loaded public loss/jitter points toward router queue, WAN, ISP path, VPN, proxy, or target behavior.",
+            "A host-side tool can recommend SQM/AQM but cannot safely mutate a router without a reviewed router integration.",
+        ],
+    }
+    if args.platform_diagnostics:
+        report["platform_diagnostics"] = collect_platform_diagnostics()
+    if args.redact:
+        report = redact_report_value(report)
+    destination = Path(args.output).expanduser() if args.output else report_path("benchmark")
+    atomic_write_json(destination, report, private_parent=not bool(args.output))
+    print(f"Report saved: {destination}")
+    return 0
 
 
 def launch_monitored_command(command: Sequence[str]) -> subprocess.Popen[Any]:
@@ -3925,6 +4189,29 @@ def positive_float(value: str) -> float:
     return number
 
 
+def bounded_positive_int(value: str, *, maximum: int) -> int:
+    number = positive_int(value)
+    if number > maximum:
+        raise argparse.ArgumentTypeError(f"must be at most {maximum}")
+    return number
+
+
+def bounded_positive_float(value: str, *, maximum: float) -> float:
+    number = positive_float(value)
+    if number > maximum:
+        raise argparse.ArgumentTypeError(f"must be at most {maximum:g}")
+    return number
+
+
+def benchmark_download_url(value: str) -> str:
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise argparse.ArgumentTypeError("must be an HTTPS URL with a hostname")
+    if parsed.username is not None or parsed.password is not None:
+        raise argparse.ArgumentTypeError("must not include URL credentials")
+    return value
+
+
 def add_scope_options(parser: argparse.ArgumentParser) -> None:
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--system-only", action="store_true", help="change/restore only OS settings")
@@ -3989,6 +4276,49 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_probe_options(measure_idle)
     measure_idle.set_defaults(function=command_measure_idle)
+
+    benchmark = subparsers.add_parser(
+        "benchmark",
+        help="run a read-only pressure-point benchmark with controlled download load",
+    )
+    benchmark.add_argument(
+        "--baseline-seconds",
+        type=lambda value: bounded_positive_float(value, maximum=300.0),
+        default=8.0,
+        help="idle baseline duration before the download load (default: 8)",
+    )
+    benchmark.add_argument(
+        "--load-seconds",
+        type=lambda value: bounded_positive_float(value, maximum=300.0),
+        default=20.0,
+        help="duration of loaded probe sampling (default: 20)",
+    )
+    benchmark.add_argument(
+        "--parallel-downloads",
+        type=lambda value: bounded_positive_int(value, maximum=16),
+        default=4,
+        help="parallel HTTPS download streams (default: 4)",
+    )
+    benchmark.add_argument(
+        "--download-mb",
+        type=lambda value: bounded_positive_int(value, maximum=256),
+        default=16,
+        help="maximum MiB downloaded per stream (default: 16)",
+    )
+    benchmark.add_argument(
+        "--download-url",
+        type=benchmark_download_url,
+        default=DEFAULT_DOWNLOAD_URL,
+        help="HTTPS URL used for bounded download load",
+    )
+    benchmark.add_argument(
+        "--no-platform-diagnostics",
+        dest="platform_diagnostics",
+        action="store_false",
+        help="skip slower OS diagnostics and only save benchmark evidence",
+    )
+    add_probe_options(benchmark)
+    benchmark.set_defaults(function=command_benchmark, platform_diagnostics=True)
 
     watch = subparsers.add_parser("watch", help="monitor gateway/public/registry health while a command runs")
     watch.add_argument(

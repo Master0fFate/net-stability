@@ -35,6 +35,7 @@ net-stability-gui = "net_stability_gui:main"
 [tool.setuptools]
 py-modules = [
     "net_stability",
+    "net_stability_benchmark",
     "net_stability_gui",
     "net_stability_gui_commands",
     "windows_dns_policy",

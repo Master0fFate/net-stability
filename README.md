@@ -16,6 +16,7 @@ It also includes a cross-platform **Repair DNS** action: Windows keeps the deepe
 
 - Creates a restore point **before** applying any change.
 - Applies a weak-link npm profile: fewer per-origin sockets, longer fetch timeouts, more retries, and `prefer-offline`.
+- Runs a read-only pressure-point benchmark with idle baseline probes, bounded HTTPS download load, packet loss, jitter, DNS, HTTPS, throughput, and adapter counter evidence.
 - **Windows**: Restores restricted TCP receive-window auto-tuning, adjusts Wi-Fi power policy and adapter power properties, sets MTU to 1500, enables ECN, disables Delivery Optimization P2P sharing, sets QoS reservable bandwidth to 0%, disables Large Send Offload on Wi-Fi adapters, and tunes TCP retransmission registry values.
 - **Windows DNS policy**: Diagnoses NRPT corruption, DNS Client timeout events, and invalid resolver entries; repairs only invalid DNS server assignments and flushes the DNS cache, without deleting VPN or NRPT rules automatically.
 - **Linux DNS repair**: Flushes the resolver cache when supported and repairs DNS servers to the stable 1.1.1.1 / 1.0.0.1 profile when the current resolver state is missing or invalid.
@@ -60,6 +61,7 @@ The GUI wraps the same CLI, so everything can also be run from a terminal.
 python net_stability.py diagnose
 python net_stability.py audit
 python net_stability.py measure idle
+python net_stability.py benchmark
 python net_stability.py apply
 python net_stability.py apply --npm-only
 python net_stability.py restore latest
@@ -75,6 +77,7 @@ Useful options:
 python net_stability.py diagnose --samples 20 --redact
 python net_stability.py audit --redact
 python net_stability.py measure idle --samples 20 --redact
+python net_stability.py benchmark --load-seconds 30 --parallel-downloads 4 --download-mb 16 --redact
 python net_stability.py apply --dry-run
 python net_stability.py apply --system-only
 python net_stability.py restore latest --npm-only
@@ -90,11 +93,31 @@ The desktop UI is intentionally small and cross-platform:
 - Built with `tkinter`, included with most Python desktop installs.
 - No third-party runtime dependencies.
 - Two primary buttons: **Audit evidence first** and **Full Optimization**.
-- Advanced actions (DNS repair, diagnostics, npm-only, reset network, restore, backups) stay visible but secondary.
+- Advanced actions (DNS repair, idle measurement, pressure-point benchmark, diagnostics, npm-only, reset network, restore, backups) stay visible but secondary.
 - An 8-stage progress panel tracks every step of the pipeline.
 - The log panel streams real command output in a dark terminal-style view.
 
 This keeps the project easy to package later with tools such as PyInstaller or Briefcase.
+
+---
+
+## Pressure-Point Benchmark
+
+Use `benchmark` when idle diagnostics look acceptable but downloads still show loss, jitter, or stutter:
+
+```bash
+python net_stability.py benchmark --redact
+```
+
+The benchmark is read-only apart from its JSON report. It collects an idle baseline, runs bounded HTTPS download traffic, keeps probing the gateway and a public target, checks DNS and HTTPS health, estimates throughput, and on Windows captures adapter statistics before and after the loaded phase.
+
+The pressure-point classifier separates the likely failure layer:
+
+- Gateway loss rises under load: local Wi-Fi, adapter, USB, AP, or router CPU path is suspect.
+- Gateway stays clean but public loss or jitter rises: router/WAN queueing, ISP path, VPN/proxy, or remote target behavior is suspect.
+- Loaded p95 latency rises sharply without gateway loss: evaluate SQM/AQM such as FQ-CoDel or CAKE at the actual bottleneck.
+
+StableNet does not silently mutate router settings. Router queue control remains advisory unless a reviewed router integration is added later.
 
 ---
 
