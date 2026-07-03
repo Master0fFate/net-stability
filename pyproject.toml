@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "net-stability"
-version = "1.0.0"
+version = "1.0.1"
 description = "A conservative, reversible network reliability tuner with a small cross-platform GUI."
 readme = "README.md"
 requires-python = ">=3.9"

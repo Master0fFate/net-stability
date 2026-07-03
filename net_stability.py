@@ -10,8 +10,8 @@ Design principles
 * Standard-library Python only (Python 3.9+).
 * Back up every setting this program changes before changing it.
 * Avoid folklore tweaks: no MTU guessing, DNS replacement, Nagle hacks,
-  TCP auto-tuning changes, QoS-reservation edits, global USB selective-suspend
-  changes, or blanket NIC-offload disabling.
+  TCP auto-tuning disablement, global USB selective-suspend changes,
+  throughput-hostile ECN toggles, or blanket NIC-offload disabling.
 * Keep OS changes narrow:
     Windows: AC Wi-Fi power policy + supported per-adapter NDIS power controls.
     Linux: NetworkManager Wi-Fi powersave for active Wi-Fi profiles.
@@ -84,7 +84,7 @@ import windows_dns_policy
 APP_DISPLAY_NAME = "Net Stability"
 APP_DIR_WINDOWS = "NetStability"
 APP_DIR_UNIX = "netstability"
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 SCHEMA_VERSION = 1
 
 # Stable Windows power-setting GUIDs. Aliases are attempted first, and these
@@ -198,15 +198,14 @@ ANTI_FOLKLORE_DENYLIST: Tuple[str, ...] = (
     # "DNS replacement as a speed boost",
     "TCP ACK/Nagle registry recipes",
     "TCP receive-window autotuning disable",
-    # Overridden: paper-backed selective LSO disable when it causes latency
-    # "blanket NIC offload disable",
+    "blanket NIC offload disable",
     "RSS or VMQ tuning on Wi-Fi",
     # Overridden: paper-backed QoS reservable bandwidth = 0%
     # "NetworkThrottlingIndex or SystemResponsiveness gaming tweaks",
     "forced 5 GHz or maximum channel width",
     "global USB selective suspend disable",
     "Wi-Fi retry-limit reduction",
-    # Overridden: paper-backed BBR on Linux and ECN on Windows
+    # Overridden: paper-backed BBR on Linux
     # "blind CUBIC, BBR, ECN, L4S, or DSCP changes",
     "firewall or antivirus disable",
     "automatic random driver installation",
@@ -1145,7 +1144,7 @@ def restore_windows_system(manifest: Dict[str, Any], restart: bool) -> List[Dict
 
 
 # ---------------------------------------------------------------------------
-# Windows extended tuning (MTU, ECN, Delivery Optimization, QoS, LSO, TCP retrans)
+# Windows extended tuning (MTU, Delivery Optimization, QoS, TCP retrans)
 # ---------------------------------------------------------------------------
 
 WINDOWS_DELIVERY_OPTIMIZATION_PATH = r"HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeliveryOptimization\Config"
@@ -1597,17 +1596,22 @@ def linux_disable_irqbalance() -> CommandResult:
 
 def linux_dns_state() -> Dict[str, Any]:
     resolv = Path("/etc/resolv.conf")
+    read_error: Optional[str] = None
     if resolv.is_file():
         try:
             text = resolv.read_text(encoding="utf-8")
             servers = re.findall(r"(?m)^nameserver\s+(\S+)", text)
             return {"available": True, "servers": servers[:4], "path": str(resolv)}
-        except OSError:
-            pass
+        except OSError as exc:
+            read_error = str(exc)
     result = run_command(["resolvectl", "dns"], timeout=10)
     if result.ok:
-        return {"available": True, "resolvectl": result.stdout.strip(), "servers": []}
-    return {"available": False, "servers": [], "error": "Could not query DNS"}
+        state = {"available": True, "resolvectl": result.stdout.strip(), "servers": []}
+        if read_error:
+            state["resolv_conf_error"] = read_error
+        return state
+    error = f"Could not read {resolv}: {read_error}" if read_error else "Could not query DNS"
+    return {"available": False, "servers": [], "error": error}
 
 
 def linux_set_dns(servers: Optional[Tuple[str, ...]] = None) -> CommandResult:
@@ -1924,20 +1928,6 @@ def apply_windows_extended_tuning(
             else:
                 print_command_failure(f"MTU set on {name}", result)
 
-    """Enable ECN."""
-    ecn_state = state.get("ecn", {})
-    def _ecn_enabled(v: Any) -> bool:
-        return str(v or "").strip().lower() in ("enabled", "1", "true")
-    if ecn_state.get("available") and not _ecn_enabled(ecn_state.get("ecn")):
-        result = windows_enable_ecn()
-        if result.ok:
-            print("  + ECN enabled")
-            _record_applied(manifest, manifest_path, {
-                "type": "ecn", "scope": "windows", "applied": "Enabled",
-            })
-        else:
-            print_command_failure("ECN enable", result)
-
     """Disable Delivery Optimization P2P."""
     do_state = state.get("delivery_optimization", {})
     if do_state.get("available") and do_state.get("value") != 0:
@@ -1963,26 +1953,6 @@ def apply_windows_extended_tuning(
             })
         else:
             print_command_failure("QoS reservable bandwidth", result)
-
-    """Disable LSO on Wi-Fi adapters where it's enabled."""
-    lso_state = state.get("lso", {})
-    if lso_state.get("available"):
-        for adapter in lso_state.get("adapters", []):
-            name = adapter.get("name", "")
-            if not name:
-                continue
-            if adapter.get("ipv4_enabled") or adapter.get("ipv6_enabled"):
-                result = windows_disable_lso(name)
-                if result.ok:
-                    print(f"  + LSO disabled on {name}")
-                    _record_applied(manifest, manifest_path, {
-                        "type": "lso", "scope": "windows", "adapter": name,
-                        "original_ipv4": adapter.get("ipv4_enabled"),
-                        "original_ipv6": adapter.get("ipv6_enabled"),
-                        "applied": "disabled",
-                    })
-                else:
-                    print_command_failure(f"LSO disable on {name}", result)
 
     """Set TCP retransmission registry values."""
     retrans_state = state.get("tcp_retrans", {})
@@ -2375,10 +2345,8 @@ def planned_changes(do_system: bool, do_npm: bool, include_battery: bool, maxsoc
             changes.append("Set the active plan's Wi-Fi policy to Maximum Performance on AC" + (" and battery" if include_battery else ""))
             changes.append("Disable supported NDIS SelectiveSuspend and DeviceSleepOnDisconnect on physical Wi-Fi adapters")
             changes.append("Set MTU to 1500 on Wi-Fi interfaces")
-            changes.append("Enable ECN (Explicit Congestion Notification)")
             changes.append("Disable Windows Delivery Optimization (P2P update sharing)")
             changes.append("Set QoS reservable bandwidth to 0%")
-            changes.append("Disable Large Send Offload on Wi-Fi adapters")
             changes.append("Set TCP retransmission registry values (data=5, connect=3)")
         elif system == "Linux":
             changes.append("Set active NetworkManager Wi-Fi profiles to powersave=2 (disabled)")
@@ -2644,7 +2612,7 @@ def command_apply(args: argparse.Namespace) -> int:
         print(f"  - {change}")
     if do_system and not args.no_restart and platform.system() in {"Windows", "Linux"}:
         print("  - The Wi-Fi adapter/connection may disconnect briefly while settings are activated")
-    print("Paper-backed MTU, DNS, ECN, BBR, TCP auto-tuning, and selective offload changes ARE applied when supported.")
+    print("Paper-backed MTU, DNS, BBR, and TCP auto-tuning repairs ARE applied when supported.")
 
     if args.dry_run:
         print("Dry run complete; no snapshot or setting was written.")
@@ -2697,7 +2665,18 @@ def command_apply(args: argparse.Namespace) -> int:
 
 def snapshot_directories() -> List[Path]:
     root = backups_root()
-    directories = [path for path in root.iterdir() if path.is_dir() and (path / "manifest.json").is_file()]
+    try:
+        candidates = list(root.iterdir())
+    except OSError as exc:
+        raise NetStabilityError(f"Could not list backups under {root}: {exc}") from exc
+    directories: List[Path] = []
+    for path in candidates:
+        try:
+            if path.is_dir() and (path / "manifest.json").is_file():
+                directories.append(path)
+        except OSError:
+            if path.is_dir():
+                directories.append(path)
     return sorted(directories, key=lambda item: item.name, reverse=True)
 
 
@@ -2793,6 +2772,7 @@ def command_list_backups(_args: argparse.Namespace) -> int:
         print(f"No backups found under {backups_root()}")
         return 0
     print(f"Backups in {backups_root()}:")
+    invalid_count = 0
     for directory in directories:
         try:
             manifest = load_json(directory / "manifest.json")
@@ -2802,9 +2782,10 @@ def command_list_backups(_args: argparse.Namespace) -> int:
                 f"  {directory.name}  {manifest.get('created_utc', '?')}  "
                 f"status={manifest.get('status', '?')}  scopes={','.join(scopes) or 'none'}"
             )
-        except NetStabilityError as exc:
+        except (NetStabilityError, OSError) as exc:
+            invalid_count += 1
             print(f"  {directory.name}  invalid: {exc}")
-    return 0
+    return 1 if invalid_count else 0
 
 
 # ---------------------------------------------------------------------------
@@ -3278,13 +3259,6 @@ def capability_matrix() -> List[Dict[str, str]]:
                     "mutation": "snapshot-backed",
                 },
                 {
-                    "capability": "ECN enable",
-                    "available": "conditional",
-                    "source": "Set-NetTCPSetting",
-                    "privilege": "administrator",
-                    "mutation": "snapshot-backed",
-                },
-                {
                     "capability": "Delivery Optimization disable",
                     "available": "conditional",
                     "source": "registry DODownloadMode",
@@ -3295,13 +3269,6 @@ def capability_matrix() -> List[Dict[str, str]]:
                     "capability": "QoS reservable bandwidth 0%",
                     "available": "conditional",
                     "source": "registry NonBestEffortLimit",
-                    "privilege": "administrator",
-                    "mutation": "snapshot-backed",
-                },
-                {
-                    "capability": "LSO disable on Wi-Fi",
-                    "available": "conditional",
-                    "source": "Disable-NetAdapterLso",
                     "privilege": "administrator",
                     "mutation": "snapshot-backed",
                 },
@@ -3904,9 +3871,7 @@ def command_audit(args: argparse.Namespace) -> int:
     print("    Overridden (paper-backed, evidence-guided):")
     print("      - Fixed MTU=1500 on Wi-Fi interfaces")
     print("      - DNS replacement to 1.1.1.1 / 1.0.0.1")
-    print("      - ECN enable on Windows")
     print("      - BBR congestion control + fq_codel on Linux")
-    print("      - Selective LSO disable on Wi-Fi adapters when it causes latency")
     print("      - QoS reservable bandwidth set to 0%")
     print("  Capability matrix:")
     for row in report["capability_matrix"]:
@@ -4383,16 +4348,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         return int(args.function(args))
     except NetStabilityError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 2
+        parser.exit(2, f"Error: {exc}\n")
     except KeyboardInterrupt:
-        print("Interrupted.", file=sys.stderr)
-        return 130
+        parser.exit(130, "Interrupted.\n")
     except Exception as exc:
-        print(f"Unexpected error: {exc}", file=sys.stderr)
         if os.environ.get("NET_STABILITY_DEBUG") == "1":
             raise
-        return 3
+        parser.exit(3, f"Unexpected error: {exc}\n")
 
 
 if __name__ == "__main__":

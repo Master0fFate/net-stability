@@ -26,8 +26,7 @@ UNSAFE_ACTION_PATTERNS: Final = (
     # re.compile(r"\b(?:replace|switch|set|change)\s+(?:the\s+)?dns\b"),
     re.compile(r"\bdisable\s+(?:global\s+)?ipv6\b"),
     re.compile(r"\b(?:tcp\s*ack|tcpackfrequency|nagle|tcpnodelay)\b"),
-    # Selective offload disable is now paper-backed (removed from denylist test)
-    # re.compile(r"\b(?:disable|turn\s+off)\s+(?:all|broad|blanket|global)\s+.*offload\b"),
+    re.compile(r"\b(?:disable|turn\s+off)\s+(?:all|broad|blanket|global)\s+.*offload\b"),
     re.compile(r"\b(?:disable|turn\s+off)\s+global\s+usb\s+selective\s+suspend\b"),
     re.compile(r"\b(?:enable|disable|set|tune)\s+(?:rss|vmq)\s+.*wi-?fi\b"),
     re.compile(r"\b(?:multimedia\s+scheduler|mmcss)\b"),
@@ -169,6 +168,24 @@ class CliGuardrailTests(unittest.TestCase):
         self.assertTrue(state["available"])
         self.assertEqual(state["receive_window_autotuning"], "disabled")
         self.assertTrue(net_stability.windows_tcp_autotuning_needs_repair(state))
+
+    def test_list_backups_when_manifest_is_unreadable_reports_invalid_entry(self) -> None:
+        # Given: an elevated snapshot directory that the current user cannot read.
+        stdout = io.StringIO()
+        blocked = Path("blocked-snapshot")
+
+        # When: list-backups renders the available snapshot table.
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch("net_stability.snapshot_directories", return_value=[blocked]))
+            stack.enter_context(mock.patch("net_stability.backups_root", return_value=Path("backup-root")))
+            stack.enter_context(mock.patch("net_stability.load_json", side_effect=PermissionError("denied")))
+            stack.enter_context(contextlib.redirect_stdout(stdout))
+            return_code = net_stability.command_list_backups(mock.Mock())
+
+        # Then: the unreadable entry is reported without escaping as an unexpected CLI error.
+        self.assertEqual(return_code, 1)
+        self.assertIn("blocked-snapshot", stdout.getvalue())
+        self.assertIn("invalid", stdout.getvalue())
 
     def test_benchmark_help_when_inputs_are_excessive_rejects_before_network_use(self) -> None:
         # Given: benchmark options that would create excessive local traffic or leak URL credentials.

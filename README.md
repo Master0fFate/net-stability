@@ -17,7 +17,7 @@ It also includes a cross-platform **Repair DNS** action: Windows keeps the deepe
 - Creates a restore point **before** applying any change.
 - Applies a weak-link npm profile: fewer per-origin sockets, longer fetch timeouts, more retries, and `prefer-offline`.
 - Runs a read-only pressure-point benchmark with idle baseline probes, bounded HTTPS download load, packet loss, jitter, DNS, HTTPS, throughput, and adapter counter evidence.
-- **Windows**: Restores restricted TCP receive-window auto-tuning, adjusts Wi-Fi power policy and adapter power properties, sets MTU to 1500, enables ECN, disables Delivery Optimization P2P sharing, sets QoS reservable bandwidth to 0%, disables Large Send Offload on Wi-Fi adapters, and tunes TCP retransmission registry values.
+- **Windows**: Restores restricted TCP receive-window auto-tuning, adjusts Wi-Fi power policy and adapter power properties, sets MTU to 1500, disables Delivery Optimization P2P sharing, sets QoS reservable bandwidth to 0%, and tunes TCP retransmission registry values.
 - **Windows DNS policy**: Diagnoses NRPT corruption, DNS Client timeout events, and invalid resolver entries; repairs only invalid DNS server assignments and flushes the DNS cache, without deleting VPN or NRPT rules automatically.
 - **Linux DNS repair**: Flushes the resolver cache when supported and repairs DNS servers to the stable 1.1.1.1 / 1.0.0.1 profile when the current resolver state is missing or invalid.
 - **macOS DNS repair**: Flushes DNS and mDNS responder caches and repairs DNS servers to the stable 1.1.1.1 / 1.0.0.1 profile when needed.
@@ -156,10 +156,8 @@ The tool applies these Windows-specific optimizations:
 - Wi-Fi power policy set to Maximum Performance
 - NDIS SelectiveSuspend and DeviceSleepOnDisconnect disabled on Wi-Fi adapters
 - MTU set to 1500 on Wi-Fi interfaces
-- ECN (Explicit Congestion Notification) enabled
 - Delivery Optimization P2P sharing disabled via registry
 - QoS reservable bandwidth set to 0%
-- Large Send Offload disabled on Wi-Fi adapters
 - TCP retransmission registry: `TcpMaxDataRetransmissions=5`, `TcpMaxConnectRetransmissions=3`
 
 Windows DNS policy repair is available separately via `repair-dns`:
@@ -266,7 +264,7 @@ Net Stability is intentionally conservative:
 - The tool favors documented OS knobs and explicit diagnostics.
 - Reports can be redacted before sharing.
 - Router queue management is advisory only; a PC-side utility cannot directly fix queues inside an ISP modem or router.
-- Some previously-denylisted tweaks (MTU, DNS, ECN, BBR, LSO, QoS) are now applied with **evidence-backed safe values** from the research paper. The `audit` command clearly lists which folklore tweaks are still denied and which are overridden with paper-backed justification.
+- Some previously-denylisted tweaks (MTU, DNS, BBR, QoS) are now applied with **evidence-backed safe values** from the research paper. The `audit` command clearly lists which folklore tweaks are still denied and which are overridden with paper-backed justification.
 - The `reset-network` command is intentionally kept separate from `apply` because it is a destructive operation.
 - Non-evidence-backed folklore tweaks (global IPv6 disable, TCP ACK/Nagle recipes, RSS/VMQ on Wi-Fi, forced band/frequency, global USB suspend disable, firewall/antivirus disable, automatic driver installation) remain permanently denylisted.
 
