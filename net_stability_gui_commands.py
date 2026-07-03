@@ -4,7 +4,9 @@ from dataclasses import dataclass
 from typing import Final, Literal
 
 
-StageName = Literal["check", "audit", "backup", "npm", "system", "tuning", "reset", "done"]
+StageName = Literal[
+    "check", "audit", "backup", "npm", "system", "tuning", "reset", "done"
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,10 +25,26 @@ COMMANDS: Final[tuple[CommandSpec, ...]] = (
         primary=True,
     ),
     CommandSpec(
+        "Verify speed and stability",
+        ("verify", "--redact"),
+        "Run the read-only M-Lab speed gate, Wi-Fi link inspection, and baseline probes.",
+        primary=True,
+    ),
+    CommandSpec(
         "Full Optimization",
         ("apply", "--yes"),
-        "Back up and apply ALL supported DNS policy, TCP/IP, Wi-Fi, and npm reliability optimizations.",
+        "Back up and apply supported DNS policy, TCP/IP, Wi-Fi power, and npm reliability fixes.",
         primary=True,
+    ),
+    CommandSpec(
+        "M-Lab speed test",
+        ("speedtest", "--redact"),
+        "Measure application download and upload goodput through M-Lab NDT7.",
+    ),
+    CommandSpec(
+        "Inspect Wi-Fi link",
+        ("link-quality", "--redact"),
+        "Show signal, link-rate, channel, and adapter evidence exposed by the OS.",
     ),
     CommandSpec(
         "Repair DNS",
@@ -88,13 +106,22 @@ COMMANDS: Final[tuple[CommandSpec, ...]] = (
 
 STAGE_LABELS: Final[dict[StageName, str]] = {
     "check": "Check the connection and platform",
-    "audit": "Map evidence and safe capabilities",
+    "audit": "Map evidence, speed, and safe capabilities",
     "backup": "Create a restore point",
     "npm": "Tune npm for weak links",
-    "system": "Apply OS Wi-Fi power and adapter settings",
+    "system": "Inspect or apply OS Wi-Fi and adapter settings",
     "tuning": "Apply TCP/IP, DNS, and buffer tuning",
     "reset": "Reset network stack",
     "done": "Show the result and restore path",
 }
 
-STAGE_ORDER: Final[tuple[StageName, ...]] = ("check", "audit", "backup", "npm", "system", "tuning", "reset", "done")
+STAGE_ORDER: Final[tuple[StageName, ...]] = (
+    "check",
+    "audit",
+    "system",
+    "backup",
+    "npm",
+    "tuning",
+    "reset",
+    "done",
+)

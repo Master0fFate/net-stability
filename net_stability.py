@@ -7,7 +7,8 @@ trigger disconnects, extreme latency, or repeated fetch failures.
 
 Design principles
 -----------------
-* Standard-library Python only (Python 3.9+).
+* Small, explicit dependency footprint (Python 3.10+; NDT7 speed tests use
+  the maintained websockets client).
 * Back up every setting this program changes before changing it.
 * Avoid folklore tweaks: no MTU guessing, DNS replacement, Nagle hacks,
   TCP auto-tuning disablement, global USB selective-suspend changes,
@@ -78,13 +79,14 @@ from net_stability_benchmark import (
     jitter_metrics,
     summarize_download_results,
 )
+from net_stability_ndt7 import DEFAULT_LOCATE_URL, Ndt7Config, run_ndt7_speedtest
 import windows_dns_policy
 
 
 APP_DISPLAY_NAME = "Net Stability"
 APP_DIR_WINDOWS = "NetStability"
 APP_DIR_UNIX = "netstability"
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 SCHEMA_VERSION = 1
 
 # Stable Windows power-setting GUIDs. Aliases are attempted first, and these
@@ -95,7 +97,12 @@ WINDOWS_WIFI_POWER_SETTING_GUID = "12bbebe6-58d6-4636-95bb-3217ef867c1a"
 DEFAULT_REGISTRY_HOST = "registry.npmjs.org"
 DEFAULT_PUBLIC_PING_TARGET = "1.1.1.1"
 WINDOWS_TCP_AUTOTUNING_NORMAL = "normal"
-WINDOWS_TCP_AUTOTUNING_REPAIR_VALUES = {"disabled", "highlyrestricted", "restricted", "experimental"}
+WINDOWS_TCP_AUTOTUNING_REPAIR_VALUES = {
+    "disabled",
+    "highlyrestricted",
+    "restricted",
+    "experimental",
+}
 
 NPM_PROFILE_BASE: Dict[str, str] = {
     "fetch-retries": "5",
@@ -222,7 +229,9 @@ SECRET_ARG_RE = re.compile(r"(?i)(token|secret|password|passwd|api[_-]?key|auth)
 GUID_RE = re.compile(
     r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"
 )
-PING_TIME_RE = re.compile(r"(?i)(?:time|temps|zeit|tiempo)[=<]\s*([0-9]+(?:[.,][0-9]+)?)\s*ms")
+PING_TIME_RE = re.compile(
+    r"(?i)(?:time|temps|zeit|tiempo)[=<]\s*([0-9]+(?:[.,][0-9]+)?)\s*ms"
+)
 PING_LT_ONE_RE = re.compile(r"(?i)(?:time|temps|zeit|tiempo)<\s*1\s*ms")
 
 
@@ -314,31 +323,50 @@ def run_command(
         )
     except FileNotFoundError as exc:
         duration = (time.perf_counter() - start) * 1000.0
-        return CommandResult(command, 127, "", "", duration, f"command not found: {exc.filename}")
+        return CommandResult(
+            command, 127, "", "", duration, f"command not found: {exc.filename}"
+        )
     except subprocess.TimeoutExpired as exc:
         duration = (time.perf_counter() - start) * 1000.0
         stdout = _decode_bytes(exc.stdout or b"", preferred_encoding)
         stderr = _decode_bytes(exc.stderr or b"", preferred_encoding)
-        return CommandResult(command, 124, stdout, stderr, duration, f"timed out after {timeout:g}s")
+        return CommandResult(
+            command, 124, stdout, stderr, duration, f"timed out after {timeout:g}s"
+        )
     except OSError as exc:
         duration = (time.perf_counter() - start) * 1000.0
         return CommandResult(command, 126, "", "", duration, str(exc))
 
 
 def powershell_executable() -> Optional[str]:
-    return shutil.which("powershell.exe") or shutil.which("powershell") or shutil.which("pwsh")
+    return (
+        shutil.which("powershell.exe")
+        or shutil.which("powershell")
+        or shutil.which("pwsh")
+    )
 
 
 def run_powershell(script: str, *, timeout: float = 30.0) -> CommandResult:
     executable = powershell_executable()
     if not executable:
-        return CommandResult(["powershell"], 127, "", "", 0.0, "PowerShell was not found")
+        return CommandResult(
+            ["powershell"], 127, "", "", 0.0, "PowerShell was not found"
+        )
     prefix = (
         "$ProgressPreference='SilentlyContinue';"
         "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false);"
     )
     return run_command(
-        [executable, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", prefix + script],
+        [
+            executable,
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            prefix + script,
+        ],
         timeout=timeout,
         preferred_encoding="utf-8",
     )
@@ -353,7 +381,12 @@ def windows_dns_policy_health() -> windows_dns_policy.DnsPolicyHealth:
 
 
 def utc_now_iso() -> str:
-    return _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return (
+        _dt.datetime.now(_dt.timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
 
 def snapshot_id() -> str:
@@ -458,7 +491,10 @@ def atomic_write_bytes(
 def atomic_write_json(
     path: Path, data: Mapping[str, Any], *, private_parent: bool = True
 ) -> None:
-    payload = json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False).encode("utf-8") + b"\n"
+    payload = (
+        json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        + b"\n"
+    )
     atomic_write_bytes(path, payload, private_parent=private_parent)
 
 
@@ -507,13 +543,20 @@ def confirm(message: str, assume_yes: bool) -> bool:
     if assume_yes:
         return True
     if not sys.stdin.isatty():
-        raise NetStabilityError("Confirmation is required in a non-interactive terminal; add --yes")
+        raise NetStabilityError(
+            "Confirmation is required in a non-interactive terminal; add --yes"
+        )
     answer = input(f"{message} [y/N] ").strip().lower()
     return answer in {"y", "yes"}
 
 
 def print_command_failure(label: str, result: CommandResult) -> None:
-    detail = result.error or result.stderr.strip() or result.stdout.strip() or f"exit code {result.returncode}"
+    detail = (
+        result.error
+        or result.stderr.strip()
+        or result.stdout.strip()
+        or f"exit code {result.returncode}"
+    )
     print(f"  ! {label}: {_truncate(detail, 500)}", file=sys.stderr)
 
 
@@ -532,23 +575,22 @@ def record_apply_issue(
 
 def parse_json_output(result: CommandResult, label: str) -> Any:
     if not result.ok:
-        raise NetStabilityError(f"{label} failed: {result.error or result.stderr.strip() or result.stdout.strip()}")
+        raise NetStabilityError(
+            f"{label} failed: {result.error or result.stderr.strip() or result.stdout.strip()}"
+        )
     text = result.stdout.strip()
     if not text:
         return []
     try:
         return json.loads(text)
     except json.JSONDecodeError as exc:
-        raise NetStabilityError(f"{label} returned invalid JSON: {_truncate(text, 500)}") from exc
+        raise NetStabilityError(
+            f"{label} returned invalid JSON: {_truncate(text, 500)}"
+        ) from exc
 
 
 def ps_single_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
-
-
-# ---------------------------------------------------------------------------
-# npm backup and tuning
-# ---------------------------------------------------------------------------
 
 
 def npm_executable() -> Optional[str]:
@@ -566,7 +608,9 @@ def npm_environment() -> Dict[str, str]:
 
 
 def npm_user_config_path(npm: str) -> Path:
-    result = run_command([npm, "config", "get", "userconfig"], timeout=15, env=npm_environment())
+    result = run_command(
+        [npm, "config", "get", "userconfig"], timeout=15, env=npm_environment()
+    )
     if result.ok:
         lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
         if lines:
@@ -607,7 +651,9 @@ def capture_npm_state(snapshot_dir: Path) -> Dict[str, Any]:
             mode = stat.S_IMODE(target_stat.st_mode)
             payload = path.read_bytes()
         except OSError as exc:
-            raise NetStabilityError(f"Cannot back up npm user config {path}: {exc}") from exc
+            raise NetStabilityError(
+                f"Cannot back up npm user config {path}: {exc}"
+            ) from exc
         backup_name = "npmrc.before"
         atomic_write_bytes(snapshot_dir / backup_name, payload, mode=0o600)
 
@@ -687,7 +733,10 @@ def apply_npm_profile(
         else:
             print_command_failure(f"npm {key}", result)
             record_apply_issue(
-                manifest, manifest_path, "error", "npm",
+                manifest,
+                manifest_path,
+                "error",
+                "npm",
                 f"Failed to set npm {key}: {record.get('error') or 'unknown error'}",
             )
         manifest.setdefault("applied", {}).setdefault("npm", []).append(record)
@@ -711,7 +760,9 @@ def _archive_current_file(path: Path, snapshot_dir: Path, label: str) -> Optiona
             if path.exists() and path.is_file():
                 atomic_write_bytes(destination, path.read_bytes())
             else:
-                atomic_write_bytes(destination, f"Dangling symlink: {target}\n".encode("utf-8"))
+                atomic_write_bytes(
+                    destination, f"Dangling symlink: {target}\n".encode("utf-8")
+                )
             atomic_write_bytes(
                 snapshot_dir / f"{name}.symlink.txt",
                 f"{target}\n".encode("utf-8"),
@@ -719,7 +770,9 @@ def _archive_current_file(path: Path, snapshot_dir: Path, label: str) -> Optiona
         elif path.is_file():
             atomic_write_bytes(destination, path.read_bytes())
         else:
-            atomic_write_bytes(destination, f"Non-regular path: {path}\n".encode("utf-8"))
+            atomic_write_bytes(
+                destination, f"Non-regular path: {path}\n".encode("utf-8")
+            )
         return name
     except OSError:
         return None
@@ -728,7 +781,10 @@ def _archive_current_file(path: Path, snapshot_dir: Path, label: str) -> Optiona
 def restore_npm_state(manifest: Dict[str, Any], snapshot_dir: Path) -> Dict[str, Any]:
     state = manifest.get("state", {}).get("npm", {})
     if not state.get("available"):
-        return {"ok": True, "skipped": "npm was unavailable when the snapshot was created"}
+        return {
+            "ok": True,
+            "skipped": "npm was unavailable when the snapshot was created",
+        }
 
     path = Path(str(state["path"]))
     existed = bool(state.get("existed"))
@@ -736,13 +792,17 @@ def restore_npm_state(manifest: Dict[str, Any], snapshot_dir: Path) -> Dict[str,
     post_hash = state.get("post_sha256")
     conflict_backup = None
     if current_hash != post_hash and os.path.lexists(path):
-        conflict_backup = _archive_current_file(path, snapshot_dir, "npmrc.before-restore")
+        conflict_backup = _archive_current_file(
+            path, snapshot_dir, "npmrc.before-restore"
+        )
 
     try:
         if existed:
             backup_name = state.get("backup_file")
             if not backup_name:
-                raise NetStabilityError("Snapshot says .npmrc existed, but no backup file is recorded")
+                raise NetStabilityError(
+                    "Snapshot says .npmrc existed, but no backup file is recorded"
+                )
             backup_path = snapshot_dir / str(backup_name)
             if not backup_path.is_file():
                 raise NetStabilityError(f"npm backup is missing: {backup_path}")
@@ -751,48 +811,68 @@ def restore_npm_state(manifest: Dict[str, Any], snapshot_dir: Path) -> Dict[str,
             if state.get("was_symlink") and state.get("resolved_path"):
                 destination = Path(str(state["resolved_path"]))
                 atomic_write_bytes(
-                    destination, payload, mode=int(state.get("mode") or 0o600), private_parent=False
+                    destination,
+                    payload,
+                    mode=int(state.get("mode") or 0o600),
+                    private_parent=False,
                 )
                 desired_link = state.get("link_target")
-                if desired_link and (not path.is_symlink() or os.readlink(path) != desired_link):
-                    _archive_current_file(path, snapshot_dir, "npmrc.link-before-restore")
+                if desired_link and (
+                    not path.is_symlink() or os.readlink(path) != desired_link
+                ):
+                    _archive_current_file(
+                        path, snapshot_dir, "npmrc.link-before-restore"
+                    )
                     with contextlib.suppress(FileNotFoundError):
                         path.unlink()
                     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
                     os.symlink(str(desired_link), path)
             else:
                 atomic_write_bytes(
-                    path, payload, mode=int(state.get("mode") or 0o600), private_parent=False
+                    path,
+                    payload,
+                    mode=int(state.get("mode") or 0o600),
+                    private_parent=False,
                 )
         else:
             if os.path.lexists(path):
                 if path.is_dir() and not path.is_symlink():
-                    raise NetStabilityError(f"Refusing to delete directory at former npm config path: {path}")
+                    raise NetStabilityError(
+                        f"Refusing to delete directory at former npm config path: {path}"
+                    )
                 path.unlink()
         print(f"  + restored npm user config: {path}")
         return {"ok": True, "path": str(path), "conflict_backup": conflict_backup}
     except (OSError, NetStabilityError) as exc:
         print(f"  ! npm restore failed: {exc}", file=sys.stderr)
-        return {"ok": False, "path": str(path), "error": str(exc), "conflict_backup": conflict_backup}
-
-
-# ---------------------------------------------------------------------------
-# Windows system state and tuning
-# ---------------------------------------------------------------------------
+        return {
+            "ok": False,
+            "path": str(path),
+            "error": str(exc),
+            "conflict_backup": conflict_backup,
+        }
 
 
 def windows_power_state() -> Dict[str, Any]:
     active = run_command(["powercfg", "/getactivescheme"], timeout=10)
     if not active.ok:
-        return {"available": False, "error": active.error or active.stderr.strip() or active.stdout.strip()}
+        return {
+            "available": False,
+            "error": active.error or active.stderr.strip() or active.stdout.strip(),
+        }
     match = GUID_RE.search(active.stdout)
     if not match:
-        return {"available": False, "error": f"Could not parse active power scheme: {active.stdout.strip()}"}
+        return {
+            "available": False,
+            "error": f"Could not parse active power scheme: {active.stdout.strip()}",
+        }
     scheme = match.group(0)
 
     query = run_command(["powercfg", "/query", scheme, "SUB_WIFI"], timeout=10)
     if not query.ok:
-        query = run_command(["powercfg", "/query", scheme, WINDOWS_WIFI_SUBGROUP_GUID], timeout=10)
+        query = run_command(
+            ["powercfg", "/query", scheme, WINDOWS_WIFI_SUBGROUP_GUID], timeout=10
+        )
     if not query.ok:
         return {
             "available": False,
@@ -800,8 +880,12 @@ def windows_power_state() -> Dict[str, Any]:
             "error": query.error or query.stderr.strip() or query.stdout.strip(),
         }
 
-    ac_match = re.search(r"(?i)Current\s+AC\s+Power\s+Setting\s+Index\s*:\s*0x([0-9a-f]+)", query.stdout)
-    dc_match = re.search(r"(?i)Current\s+DC\s+Power\s+Setting\s+Index\s*:\s*0x([0-9a-f]+)", query.stdout)
+    ac_match = re.search(
+        r"(?i)Current\s+AC\s+Power\s+Setting\s+Index\s*:\s*0x([0-9a-f]+)", query.stdout
+    )
+    dc_match = re.search(
+        r"(?i)Current\s+DC\s+Power\s+Setting\s+Index\s*:\s*0x([0-9a-f]+)", query.stdout
+    )
     ac_value: Optional[int] = int(ac_match.group(1), 16) if ac_match else None
     dc_value: Optional[int] = int(dc_match.group(1), 16) if dc_match else None
 
@@ -858,11 +942,19 @@ ConvertTo-Json -InputObject @($items) -Depth 5 -Compress
 """
     result = run_powershell(script, timeout=30)
     if not result.ok:
-        return {"available": False, "error": result.error or result.stderr.strip() or result.stdout.strip(), "adapters": []}
+        return {
+            "available": False,
+            "error": result.error or result.stderr.strip() or result.stdout.strip(),
+            "adapters": [],
+        }
     try:
         parsed = json.loads(result.stdout.strip() or "[]")
     except json.JSONDecodeError:
-        return {"available": False, "error": f"Invalid PowerShell JSON: {_truncate(result.stdout, 1000)}", "adapters": []}
+        return {
+            "available": False,
+            "error": f"Invalid PowerShell JSON: {_truncate(result.stdout, 1000)}",
+            "adapters": [],
+        }
     if isinstance(parsed, dict):
         parsed = [parsed]
     if not isinstance(parsed, list):
@@ -914,17 +1006,25 @@ def capture_windows_state() -> Dict[str, Any]:
     }
 
 
-def windows_set_power_value(scheme: str, ac: Optional[int], dc: Optional[int]) -> List[CommandResult]:
+def windows_set_power_value(
+    scheme: str, ac: Optional[int], dc: Optional[int]
+) -> List[CommandResult]:
     results: List[CommandResult] = []
     subgroup = WINDOWS_WIFI_SUBGROUP_GUID
     setting = WINDOWS_WIFI_POWER_SETTING_GUID
     if ac is not None:
         results.append(
-            run_command(["powercfg", "/setacvalueindex", scheme, subgroup, setting, str(ac)], timeout=10)
+            run_command(
+                ["powercfg", "/setacvalueindex", scheme, subgroup, setting, str(ac)],
+                timeout=10,
+            )
         )
     if dc is not None:
         results.append(
-            run_command(["powercfg", "/setdcvalueindex", scheme, subgroup, setting, str(dc)], timeout=10)
+            run_command(
+                ["powercfg", "/setdcvalueindex", scheme, subgroup, setting, str(dc)],
+                timeout=10,
+            )
         )
     results.append(run_command(["powercfg", "/setactive", scheme], timeout=10))
     return results
@@ -965,10 +1065,13 @@ def windows_set_adapter_properties(
         return CommandResult([], 0, "", "", 0.0)
     target_script = windows_adapter_target_script(adapter)
     assignments = "".join(
-        f"$params[{ps_single_quote(key)}]={ps_single_quote(value)};" for key, value in properties.items()
+        f"$params[{ps_single_quote(key)}]={ps_single_quote(value)};"
+        for key, value in properties.items()
     )
     restart_script = (
-        "Restart-NetAdapter -Name $target.Name -Confirm:$false -ErrorAction Stop;" if restart else ""
+        "Restart-NetAdapter -Name $target.Name -Confirm:$false -ErrorAction Stop;"
+        if restart
+        else ""
     )
     script = (
         "$ErrorActionPreference='Stop';"
@@ -992,7 +1095,9 @@ def apply_windows_system(
     state = manifest.get("state", {}).get("system", {})
     tcp_global = state.get("tcp_global", {})
     if isinstance(tcp_global, dict) and windows_tcp_autotuning_needs_repair(tcp_global):
-        original_level = str(tcp_global.get("receive_window_autotuning") or "").strip().lower()
+        original_level = (
+            str(tcp_global.get("receive_window_autotuning") or "").strip().lower()
+        )
         result = windows_set_tcp_autotuning(WINDOWS_TCP_AUTOTUNING_NORMAL)
         if result.ok:
             record = {
@@ -1006,7 +1111,10 @@ def apply_windows_system(
         else:
             print_command_failure("Windows TCP receive-window auto-tuning", result)
             record_apply_issue(
-                manifest, manifest_path, "error", "windows",
+                manifest,
+                manifest_path,
+                "error",
+                "windows",
                 "Windows TCP receive-window auto-tuning repair failed: "
                 f"{result.error or result.stderr.strip() or result.stdout.strip()}",
             )
@@ -1024,13 +1132,19 @@ def apply_windows_system(
             }
             manifest.setdefault("applied", {}).setdefault("system", []).append(record)
             atomic_write_json(manifest_path, manifest)
-            print("  + Windows Wi-Fi power policy: Maximum Performance on AC" + (" and battery" if include_battery else ""))
+            print(
+                "  + Windows Wi-Fi power policy: Maximum Performance on AC"
+                + (" and battery" if include_battery else "")
+            )
         else:
             for result in results:
                 if not result.ok:
                     print_command_failure("Windows Wi-Fi power policy", result)
                     record_apply_issue(
-                        manifest, manifest_path, "error", "windows",
+                        manifest,
+                        manifest_path,
+                        "error",
+                        "windows",
                         f"Windows Wi-Fi power policy failed: {result.error or result.stderr.strip() or result.stdout.strip()}",
                     )
     else:
@@ -1039,7 +1153,9 @@ def apply_windows_system(
         record_apply_issue(manifest, manifest_path, "warning", "windows", message)
 
     adapters_state = state.get("wifi_adapters", {})
-    adapters = adapters_state.get("adapters", []) if isinstance(adapters_state, dict) else []
+    adapters = (
+        adapters_state.get("adapters", []) if isinstance(adapters_state, dict) else []
+    )
     if not adapters:
         print("  - no configurable physical Wi-Fi adapter power properties found")
         return
@@ -1071,18 +1187,31 @@ def apply_windows_system(
             manifest.setdefault("applied", {}).setdefault("system", []).append(record)
             atomic_write_json(manifest_path, manifest)
             description = adapter.get("InterfaceDescription") or adapter.get("Name")
-            suffix = "; adapter restarted" if restart else "; takes effect after reconnect/restart"
-            print(f"  + disabled supported NDIS idle/disconnect power controls on {description}{suffix}")
+            suffix = (
+                "; adapter restarted"
+                if restart
+                else "; takes effect after reconnect/restart"
+            )
+            print(
+                f"  + disabled supported NDIS idle/disconnect power controls on {description}{suffix}"
+            )
         else:
-            print_command_failure(f"adapter power settings for {adapter.get('Name')}", result)
+            print_command_failure(
+                f"adapter power settings for {adapter.get('Name')}", result
+            )
             record_apply_issue(
-                manifest, manifest_path, "error", "windows",
+                manifest,
+                manifest_path,
+                "error",
+                "windows",
                 f"Adapter power settings failed for {adapter.get('Name')}: "
                 f"{result.error or result.stderr.strip() or result.stdout.strip()}",
             )
 
 
-def restore_windows_system(manifest: Dict[str, Any], restart: bool) -> List[Dict[str, Any]]:
+def restore_windows_system(
+    manifest: Dict[str, Any], restart: bool
+) -> List[Dict[str, Any]]:
     state = manifest.get("state", {}).get("system", {})
     applied = manifest.get("applied", {}).get("system", [])
     results: List[Dict[str, Any]] = []
@@ -1091,15 +1220,21 @@ def restore_windows_system(manifest: Dict[str, Any], restart: bool) -> List[Dict
         if item.get("type") != "windows_tcp_autotuning":
             continue
         original_level = str(item.get("original_level") or "").strip().lower()
-        if original_level not in WINDOWS_TCP_AUTOTUNING_REPAIR_VALUES | {WINDOWS_TCP_AUTOTUNING_NORMAL}:
+        if original_level not in WINDOWS_TCP_AUTOTUNING_REPAIR_VALUES | {
+            WINDOWS_TCP_AUTOTUNING_NORMAL
+        }:
             continue
         command = windows_set_tcp_autotuning(original_level)
         record = {"type": "windows_tcp_autotuning", "ok": command.ok}
         if command.ok:
-            print(f"  + restored Windows TCP receive-window auto-tuning: {original_level}")
+            print(
+                f"  + restored Windows TCP receive-window auto-tuning: {original_level}"
+            )
         else:
             record["error"] = command.error or command.stderr.strip()
-            print_command_failure("restore Windows TCP receive-window auto-tuning", command)
+            print_command_failure(
+                "restore Windows TCP receive-window auto-tuning", command
+            )
         results.append(record)
 
     if any(item.get("type") == "windows_wifi_power" for item in applied):
@@ -1114,11 +1249,15 @@ def restore_windows_system(manifest: Dict[str, Any], restart: bool) -> List[Dict
             result_record = {"type": "windows_wifi_power", "ok": ok}
             if not ok:
                 result_record["errors"] = [
-                    command.error or command.stderr.strip() for command in commands if not command.ok
+                    command.error or command.stderr.strip()
+                    for command in commands
+                    if not command.ok
                 ]
                 for command in commands:
                     if not command.ok:
-                        print_command_failure("restore Windows Wi-Fi power policy", command)
+                        print_command_failure(
+                            "restore Windows Wi-Fi power policy", command
+                        )
             else:
                 print("  + restored Windows Wi-Fi power policy")
             results.append(result_record)
@@ -1130,12 +1269,15 @@ def restore_windows_system(manifest: Dict[str, Any], restart: bool) -> List[Dict
         original = {
             key: value
             for key, value in (item.get("original", {}) or {}).items()
-            if key in {"SelectiveSuspend", "DeviceSleepOnDisconnect"} and _valid_pm_value(value)
+            if key in {"SelectiveSuspend", "DeviceSleepOnDisconnect"}
+            and _valid_pm_value(value)
         }
         command = windows_set_adapter_properties(adapter, original, restart)
         record = {"type": "windows_adapter_power", "adapter": adapter, "ok": command.ok}
         if command.ok:
-            print(f"  + restored adapter power settings: {adapter.get('Name') or adapter.get('InterfaceDescription')}")
+            print(
+                f"  + restored adapter power settings: {adapter.get('Name') or adapter.get('InterfaceDescription')}"
+            )
         else:
             record["error"] = command.error or command.stderr.strip()
             print_command_failure(f"restore adapter {adapter.get('Name')}", command)
@@ -1143,11 +1285,9 @@ def restore_windows_system(manifest: Dict[str, Any], restart: bool) -> List[Dict
     return results
 
 
-# ---------------------------------------------------------------------------
-# Windows extended tuning (MTU, Delivery Optimization, QoS, TCP retrans)
-# ---------------------------------------------------------------------------
-
-WINDOWS_DELIVERY_OPTIMIZATION_PATH = r"HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeliveryOptimization\Config"
+WINDOWS_DELIVERY_OPTIMIZATION_PATH = (
+    r"HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeliveryOptimization\Config"
+)
 WINDOWS_QOS_PATH = r"HKLM:\SOFTWARE\Policies\Microsoft\Windows\Psched"
 WINDOWS_TCPIP_PARAMS_PATH = r"HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters"
 
@@ -1212,16 +1352,30 @@ def _filter_interfaces_by_name(
     interfaces: Sequence[Mapping[str, Any]],
     allowed: Sequence[str],
 ) -> List[Dict[str, Any]]:
-    allowed_set = {_normalize_interface_name(name) for name in allowed if str(name).strip()}
+    allowed_set = {
+        _normalize_interface_name(name) for name in allowed if str(name).strip()
+    }
     if not allowed_set:
         return [dict(item) for item in interfaces]
-    return [dict(item) for item in interfaces if _normalize_interface_name(item.get("name")) in allowed_set]
+    return [
+        dict(item)
+        for item in interfaces
+        if _normalize_interface_name(item.get("name")) in allowed_set
+    ]
 
 
-def windows_mtu_state(wifi_interfaces: Optional[Sequence[str]] = None) -> Dict[str, Any]:
-    result = run_command(["netsh", "interface", "ipv4", "show", "subinterface"], timeout=10)
+def windows_mtu_state(
+    wifi_interfaces: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
+    result = run_command(
+        ["netsh", "interface", "ipv4", "show", "subinterface"], timeout=10
+    )
     if not result.ok:
-        return {"available": False, "error": result.error or result.stderr.strip(), "interfaces": []}
+        return {
+            "available": False,
+            "error": result.error or result.stderr.strip(),
+            "interfaces": [],
+        }
     interfaces = windows_parse_subinterface_output(result.stdout)
     if wifi_interfaces:
         interfaces = _filter_interfaces_by_name(interfaces, wifi_interfaces)
@@ -1230,7 +1384,16 @@ def windows_mtu_state(wifi_interfaces: Optional[Sequence[str]] = None) -> Dict[s
 
 def windows_set_mtu(interface_name: str, mtu: int = 1500) -> CommandResult:
     return run_command(
-        ["netsh", "interface", "ipv4", "set", "subinterface", interface_name, f"mtu={mtu}", "store=persistent"],
+        [
+            "netsh",
+            "interface",
+            "ipv4",
+            "set",
+            "subinterface",
+            interface_name,
+            f"mtu={mtu}",
+            "store=persistent",
+        ],
         timeout=10,
     )
 
@@ -1275,7 +1438,9 @@ def windows_disable_delivery_optimization() -> CommandResult:
 
 
 def windows_restore_delivery_optimization(original_value: int) -> CommandResult:
-    return _set_registry_dword(WINDOWS_DELIVERY_OPTIMIZATION_PATH, "DODownloadMode", original_value)
+    return _set_registry_dword(
+        WINDOWS_DELIVERY_OPTIMIZATION_PATH, "DODownloadMode", original_value
+    )
 
 
 def windows_qos_state() -> Dict[str, Any]:
@@ -1287,7 +1452,9 @@ def windows_set_qos_reserve(value: int = 0) -> CommandResult:
     return _set_registry_dword(WINDOWS_QOS_PATH, "NonBestEffortLimit", value)
 
 
-def windows_lso_state(wifi_interfaces: Optional[Sequence[str]] = None) -> Dict[str, Any]:
+def windows_lso_state(
+    wifi_interfaces: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
     script = (
         "Get-NetAdapterLso -ErrorAction SilentlyContinue "
         "| Select-Object Name,IPv4Enabled,IPv6Enabled "
@@ -1306,11 +1473,20 @@ def windows_lso_state(wifi_interfaces: Optional[Sequence[str]] = None) -> Dict[s
                 "ipv4_enabled": bool(a.get("IPv4Enabled")),
                 "ipv6_enabled": bool(a.get("IPv6Enabled")),
             }
-            for a in parsed if isinstance(a, dict)
+            for a in parsed
+            if isinstance(a, dict)
         ]
         if wifi_interfaces:
-            allowed_set = {_normalize_interface_name(name) for name in wifi_interfaces if str(name).strip()}
-            adapters = [adapter for adapter in adapters if _normalize_interface_name(adapter.get("name")) in allowed_set]
+            allowed_set = {
+                _normalize_interface_name(name)
+                for name in wifi_interfaces
+                if str(name).strip()
+            }
+            adapters = [
+                adapter
+                for adapter in adapters
+                if _normalize_interface_name(adapter.get("name")) in allowed_set
+            ]
         return {"available": True, "adapters": adapters}
     except (json.JSONDecodeError, TypeError):
         return {"available": False, "adapters": []}
@@ -1332,7 +1508,9 @@ def windows_enable_lso(adapter_name: str) -> CommandResult:
 
 def windows_tcp_retrans_state() -> Dict[str, Any]:
     data = _read_registry_dword(WINDOWS_TCPIP_PARAMS_PATH, "TcpMaxDataRetransmissions")
-    connect = _read_registry_dword(WINDOWS_TCPIP_PARAMS_PATH, "TcpMaxConnectRetransmissions")
+    connect = _read_registry_dword(
+        WINDOWS_TCPIP_PARAMS_PATH, "TcpMaxConnectRetransmissions"
+    )
     return {
         "available": True,
         "TcpMaxDataRetransmissions": data,
@@ -1340,22 +1518,32 @@ def windows_tcp_retrans_state() -> Dict[str, Any]:
     }
 
 
-def windows_set_tcp_retransmissions(data: int = 5, connect: int = 3) -> List[CommandResult]:
+def windows_set_tcp_retransmissions(
+    data: int = 5, connect: int = 3
+) -> List[CommandResult]:
     results: List[CommandResult] = []
-    r1 = _set_registry_dword(WINDOWS_TCPIP_PARAMS_PATH, "TcpMaxDataRetransmissions", data)
+    r1 = _set_registry_dword(
+        WINDOWS_TCPIP_PARAMS_PATH, "TcpMaxDataRetransmissions", data
+    )
     results.append(r1)
-    r2 = _set_registry_dword(WINDOWS_TCPIP_PARAMS_PATH, "TcpMaxConnectRetransmissions", connect)
+    r2 = _set_registry_dword(
+        WINDOWS_TCPIP_PARAMS_PATH, "TcpMaxConnectRetransmissions", connect
+    )
     results.append(r2)
     return results
 
 
 def windows_reset_network_stack() -> List[CommandResult]:
     results: List[CommandResult] = []
-    results.append(run_command(["netsh", "int", "ip", "reset", "reset.log"], timeout=30))
+    results.append(
+        run_command(["netsh", "int", "ip", "reset", "reset.log"], timeout=30)
+    )
     results.append(run_command(["netsh", "winsock", "reset"], timeout=30))
     dns_reset = run_command(["ipconfig", "/flushdns"], timeout=10)
     if not dns_reset.ok:
-        dns_reset = run_powershell("Clear-DnsClientCache -ErrorAction SilentlyContinue; $true", timeout=10)
+        dns_reset = run_powershell(
+            "Clear-DnsClientCache -ErrorAction SilentlyContinue; $true", timeout=10
+        )
     results.append(dns_reset)
     return results
 
@@ -1372,17 +1560,14 @@ def windows_parse_subinterface_output(output: str) -> List[Dict[str, Any]]:
     return interfaces
 
 
-# ---------------------------------------------------------------------------
-# macOS tuning (DNS, TCP buffers, sysctl persistence, reset network config)
-# ---------------------------------------------------------------------------
-
-
 def macos_dns_state() -> Dict[str, Any]:
     result = run_command(["networksetup", "-getdnsservers", "Wi-Fi"], timeout=10)
     if not result.ok:
         result = run_command(["scutil", "--dns"], timeout=10)
         if result.ok:
-            servers = re.findall(r"(?m)^\s+nameserver\s+\[[^\]]+\]\s*:\s*(\S+)", result.stdout)
+            servers = re.findall(
+                r"(?m)^\s+nameserver\s+\[[^\]]+\]\s*:\s*(\S+)", result.stdout
+            )
             return {"available": True, "servers": servers[:4], "service": "Wi-Fi"}
         return {"available": False, "error": "Could not query DNS", "servers": []}
     lines = [
@@ -1392,7 +1577,9 @@ def macos_dns_state() -> Dict[str, Any]:
     ]
     return {
         "available": True,
-        "servers": [line for line in lines if line and not line.startswith("networksetup")],
+        "servers": [
+            line for line in lines if line and not line.startswith("networksetup")
+        ],
         "service": "Wi-Fi",
     }
 
@@ -1400,7 +1587,9 @@ def macos_dns_state() -> Dict[str, Any]:
 def macos_set_dns(servers: Optional[Tuple[str, ...]] = None) -> CommandResult:
     targets = list(servers or DEFAULT_DNS_SERVERS)
     # Try Wi-Fi first, fall back to any active service
-    result = run_command(["networksetup", "-setdnsservers", "Wi-Fi"] + targets, timeout=10)
+    result = run_command(
+        ["networksetup", "-setdnsservers", "Wi-Fi"] + targets, timeout=10
+    )
     if result.ok:
         return result
     # Fallback: detect active service
@@ -1408,8 +1597,14 @@ def macos_set_dns(servers: Optional[Tuple[str, ...]] = None) -> CommandResult:
     if detect.ok:
         for line in detect.stdout.splitlines():
             name = line.strip()
-            if name and name != "An asterisk (*) denotes that a network service is disabled.":
-                result = run_command(["networksetup", "-setdnsservers", name] + targets, timeout=10)
+            if (
+                name
+                and name
+                != "An asterisk (*) denotes that a network service is disabled."
+            ):
+                result = run_command(
+                    ["networksetup", "-setdnsservers", name] + targets, timeout=10
+                )
                 if result.ok:
                     return result
     return result
@@ -1421,13 +1616,23 @@ def macos_clear_dns(service: str = "Wi-Fi") -> CommandResult:
 
 def macos_tcp_buffer_state() -> Dict[str, Any]:
     result = run_command(["sysctl", "-n", "net.inet.tcp.sendspace"], timeout=5)
-    sendspace = int(result.stdout.strip()) if result.ok and result.stdout.strip().isdigit() else None
+    sendspace = (
+        int(result.stdout.strip())
+        if result.ok and result.stdout.strip().isdigit()
+        else None
+    )
     result = run_command(["sysctl", "-n", "net.inet.tcp.recvspace"], timeout=5)
-    recvspace = int(result.stdout.strip()) if result.ok and result.stdout.strip().isdigit() else None
+    recvspace = (
+        int(result.stdout.strip())
+        if result.ok and result.stdout.strip().isdigit()
+        else None
+    )
     return {"available": True, "sendspace": sendspace, "recvspace": recvspace}
 
 
-def macos_set_tcp_buffers(sendspace: int = 131072, recvspace: int = 131072) -> List[CommandResult]:
+def macos_set_tcp_buffers(
+    sendspace: int = 131072, recvspace: int = 131072
+) -> List[CommandResult]:
     results: List[CommandResult] = []
     r1 = run_command(["sysctl", "-w", f"net.inet.tcp.sendspace={sendspace}"], timeout=5)
     results.append(r1)
@@ -1440,7 +1645,9 @@ def macos_sysctl_conf_path() -> Path:
     return Path("/etc/sysctl.conf")
 
 
-def macos_write_sysctl_conf(sendspace: int = 131072, recvspace: int = 131072) -> CommandResult:
+def macos_write_sysctl_conf(
+    sendspace: int = 131072, recvspace: int = 131072
+) -> CommandResult:
     content = (
         "# Net Stability - network buffer tuning\n"
         f"net.inet.tcp.sendspace={sendspace}\n"
@@ -1471,9 +1678,15 @@ def macos_reset_network_config() -> List[CommandResult]:
                 try:
                     shutil.copy2(path, backup)
                     path.unlink()
-                    results.append(CommandResult(["mv", str(path), str(backup)], 0, "", "", 0.0))
+                    results.append(
+                        CommandResult(["mv", str(path), str(backup)], 0, "", "", 0.0)
+                    )
                 except OSError as exc:
-                    results.append(CommandResult(["mv", str(path), str(backup)], 1, "", str(exc), 0.0))
+                    results.append(
+                        CommandResult(
+                            ["mv", str(path), str(backup)], 1, "", str(exc), 0.0
+                        )
+                    )
     route_result = run_command(["/usr/sbin/route", "-n", "flush"], timeout=10)
     results.append(route_result)
     dns_result = run_command(["dscacheutil", "-flushcache"], timeout=5)
@@ -1481,11 +1694,6 @@ def macos_reset_network_config() -> List[CommandResult]:
     mDNS_result = run_command(["killall", "-HUP", "mDNSResponder"], timeout=5)
     results.append(mDNS_result)
     return results
-
-
-# ---------------------------------------------------------------------------
-# Linux extended tuning (sysctl, BBR, ring buffers, IRQ balance, DNS)
-# ---------------------------------------------------------------------------
 
 
 LINUX_SYSCTL_CONF_PATH = Path("/etc/sysctl.d/99-net-optimizer.conf")
@@ -1517,9 +1725,15 @@ def linux_current_sysctl_values(keys: Sequence[str]) -> Dict[str, Optional[str]]
     return values
 
 
-def linux_write_sysctl_conf(values: Optional[Mapping[str, str]] = None) -> CommandResult:
+def linux_write_sysctl_conf(
+    values: Optional[Mapping[str, str]] = None,
+) -> CommandResult:
     entries = dict(values or LINUX_SYSCTL_TUNING)
-    content = "# Net Stability - network optimization tuning\n# Applied: " + utc_now_iso() + "\n"
+    content = (
+        "# Net Stability - network optimization tuning\n# Applied: "
+        + utc_now_iso()
+        + "\n"
+    )
     for key, value in entries.items():
         content += f"{key} = {value}\n"
     try:
@@ -1527,7 +1741,9 @@ def linux_write_sysctl_conf(values: Optional[Mapping[str, str]] = None) -> Comma
         LINUX_SYSCTL_CONF_PATH.write_text(content, encoding="utf-8")
         return CommandResult(["write", str(LINUX_SYSCTL_CONF_PATH)], 0, "", "", 0.0)
     except OSError as exc:
-        return CommandResult(["write", str(LINUX_SYSCTL_CONF_PATH)], 1, "", str(exc), 0.0)
+        return CommandResult(
+            ["write", str(LINUX_SYSCTL_CONF_PATH)], 1, "", str(exc), 0.0
+        )
 
 
 def linux_apply_sysctl() -> CommandResult:
@@ -1538,14 +1754,20 @@ def linux_restore_sysctl_conf(original: Mapping[str, Optional[str]]) -> CommandR
     entries = {k: v for k, v in original.items() if v is not None}
     if not entries:
         return CommandResult(["rm", str(LINUX_SYSCTL_CONF_PATH)], 0, "", "", 0.0)
-    content = "# Net Stability - restored original values\n# Restored: " + utc_now_iso() + "\n"
+    content = (
+        "# Net Stability - restored original values\n# Restored: "
+        + utc_now_iso()
+        + "\n"
+    )
     for key, value in entries.items():
         content += f"{key} = {value}\n"
     try:
         LINUX_SYSCTL_CONF_PATH.write_text(content, encoding="utf-8")
         return CommandResult(["write", str(LINUX_SYSCTL_CONF_PATH)], 0, "", "", 0.0)
     except OSError as exc:
-        return CommandResult(["write", str(LINUX_SYSCTL_CONF_PATH)], 1, "", str(exc), 0.0)
+        return CommandResult(
+            ["write", str(LINUX_SYSCTL_CONF_PATH)], 1, "", str(exc), 0.0
+        )
 
 
 def linux_nic_ring_buffer_state() -> Dict[str, Any]:
@@ -1555,7 +1777,11 @@ def linux_nic_ring_buffer_state() -> Dict[str, Any]:
     ip = shutil.which("ip") or "/sbin/ip"
     result = run_command([ip, "-brief", "link", "show"], timeout=10)
     if not result.ok:
-        return {"available": False, "error": "Could not list interfaces", "interfaces": []}
+        return {
+            "available": False,
+            "error": "Could not list interfaces",
+            "interfaces": [],
+        }
     interfaces: List[Dict[str, Any]] = []
     for line in result.stdout.splitlines():
         parts = line.strip().split()
@@ -1569,11 +1795,15 @@ def linux_nic_ring_buffer_state() -> Dict[str, Any]:
     return {"available": True, "ethtool": ethtool, "interfaces": interfaces}
 
 
-def linux_set_nic_ring_buffer(interface: str, rx: int = 4096, tx: int = 4096) -> CommandResult:
+def linux_set_nic_ring_buffer(
+    interface: str, rx: int = 4096, tx: int = 4096
+) -> CommandResult:
     ethtool = shutil.which("ethtool")
     if not ethtool:
         return CommandResult(["ethtool"], 127, "", "", 0.0, "ethtool was not found")
-    return run_command([ethtool, "-G", interface, "rx", str(rx), "tx", str(tx)], timeout=10)
+    return run_command(
+        [ethtool, "-G", interface, "rx", str(rx), "tx", str(tx)], timeout=10
+    )
 
 
 def linux_irqbalance_state() -> Dict[str, Any]:
@@ -1610,7 +1840,11 @@ def linux_dns_state() -> Dict[str, Any]:
         if read_error:
             state["resolv_conf_error"] = read_error
         return state
-    error = f"Could not read {resolv}: {read_error}" if read_error else "Could not query DNS"
+    error = (
+        f"Could not read {resolv}: {read_error}"
+        if read_error
+        else "Could not query DNS"
+    )
     return {"available": False, "servers": [], "error": error}
 
 
@@ -1635,7 +1869,9 @@ def linux_set_dns(servers: Optional[Tuple[str, ...]] = None) -> CommandResult:
 def linux_reset_network() -> List[CommandResult]:
     results: List[CommandResult] = []
     if shutil.which("systemctl"):
-        results.append(run_command(["systemctl", "restart", "NetworkManager"], timeout=30))
+        results.append(
+            run_command(["systemctl", "restart", "NetworkManager"], timeout=30)
+        )
     if shutil.which("resolvectl"):
         results.append(run_command(["resolvectl", "flush-caches"], timeout=5))
     return results
@@ -1651,11 +1887,6 @@ def linux_flush_dns_cache() -> List[CommandResult]:
     if systemd_resolve:
         results.append(run_command([systemd_resolve, "--flush-caches"], timeout=5))
     return results
-
-
-# ---------------------------------------------------------------------------
-# Linux NetworkManager state and tuning
-# ---------------------------------------------------------------------------
 
 
 def capture_linux_state() -> Dict[str, Any]:
@@ -1682,13 +1913,32 @@ def capture_linux_state() -> Dict[str, Any]:
         uuid, connection_type, device = fields
         if connection_type not in {"802-11-wireless", "wifi", "wireless"}:
             continue
-        name_result = run_command([nmcli, "-g", "connection.id", "connection", "show", "uuid", uuid], timeout=10)
-        power_result = run_command(
-            [nmcli, "-g", "802-11-wireless.powersave", "connection", "show", "uuid", uuid],
+        name_result = run_command(
+            [nmcli, "-g", "connection.id", "connection", "show", "uuid", uuid],
             timeout=10,
         )
-        name = name_result.stdout.strip().splitlines()[0] if name_result.ok and name_result.stdout.strip() else uuid
-        powersave = power_result.stdout.strip().splitlines()[0] if power_result.ok and power_result.stdout.strip() else ""
+        power_result = run_command(
+            [
+                nmcli,
+                "-g",
+                "802-11-wireless.powersave",
+                "connection",
+                "show",
+                "uuid",
+                uuid,
+            ],
+            timeout=10,
+        )
+        name = (
+            name_result.stdout.strip().splitlines()[0]
+            if name_result.ok and name_result.stdout.strip()
+            else uuid
+        )
+        powersave = (
+            power_result.stdout.strip().splitlines()[0]
+            if power_result.ok and power_result.stdout.strip()
+            else ""
+        )
         connections.append(
             {
                 "uuid": uuid,
@@ -1697,7 +1947,13 @@ def capture_linux_state() -> Dict[str, Any]:
                 "powersave": powersave,
             }
         )
-    return {"networkmanager": {"available": True, "nmcli": nmcli, "connections": connections}}
+    return {
+        "networkmanager": {
+            "available": True,
+            "nmcli": nmcli,
+            "connections": connections,
+        }
+    }
 
 
 def apply_linux_system(
@@ -1725,13 +1981,26 @@ def apply_linux_system(
             continue
         uuid = str(connection["uuid"])
         result = run_command(
-            [nmcli, "connection", "modify", "uuid", uuid, "802-11-wireless.powersave", "2"],
+            [
+                nmcli,
+                "connection",
+                "modify",
+                "uuid",
+                uuid,
+                "802-11-wireless.powersave",
+                "2",
+            ],
             timeout=20,
         )
         if not result.ok:
-            print_command_failure(f"NetworkManager profile {connection.get('name')}", result)
+            print_command_failure(
+                f"NetworkManager profile {connection.get('name')}", result
+            )
             record_apply_issue(
-                manifest, manifest_path, "error", "linux",
+                manifest,
+                manifest_path,
+                "error",
+                "linux",
                 f"Failed to modify NetworkManager profile {connection.get('name')}: "
                 f"{result.error or result.stderr.strip() or result.stdout.strip()}",
             )
@@ -1739,12 +2008,22 @@ def apply_linux_system(
 
         reapplied = None
         if restart and connection.get("device"):
-            reapply = run_command([nmcli, "device", "reapply", str(connection["device"])], timeout=20)
+            reapply = run_command(
+                [nmcli, "device", "reapply", str(connection["device"])], timeout=20
+            )
             if reapply.ok:
                 reapplied = "reapply"
             else:
                 reconnect = run_command(
-                    [nmcli, "connection", "up", "uuid", uuid, "ifname", str(connection["device"])],
+                    [
+                        nmcli,
+                        "connection",
+                        "up",
+                        "uuid",
+                        uuid,
+                        "ifname",
+                        str(connection["device"]),
+                    ],
                     timeout=45,
                 )
                 if reconnect.ok:
@@ -1754,7 +2033,10 @@ def apply_linux_system(
                     print_command_failure("NetworkManager reapply", reapply)
                     print_command_failure("NetworkManager reconnect", reconnect)
                     record_apply_issue(
-                        manifest, manifest_path, "warning", "linux",
+                        manifest,
+                        manifest_path,
+                        "warning",
+                        "linux",
                         f"Profile {connection.get('name')} was changed but could not be reactivated automatically",
                     )
 
@@ -1767,10 +2049,14 @@ def apply_linux_system(
         manifest.setdefault("applied", {}).setdefault("system", []).append(record)
         atomic_write_json(manifest_path, manifest)
         suffix = "" if restart else " (takes effect after reconnect)"
-        print(f"  + disabled NetworkManager Wi-Fi powersave for {connection.get('name')}{suffix}")
+        print(
+            f"  + disabled NetworkManager Wi-Fi powersave for {connection.get('name')}{suffix}"
+        )
 
 
-def restore_linux_system(manifest: Dict[str, Any], restart: bool) -> List[Dict[str, Any]]:
+def restore_linux_system(
+    manifest: Dict[str, Any], restart: bool
+) -> List[Dict[str, Any]]:
     nm_state = manifest.get("state", {}).get("system", {}).get("networkmanager", {})
     nmcli = str(nm_state.get("nmcli") or shutil.which("nmcli") or "nmcli")
     results: List[Dict[str, Any]] = []
@@ -1782,34 +2068,55 @@ def restore_linux_system(manifest: Dict[str, Any], restart: bool) -> List[Dict[s
         original = str(connection.get("powersave") or "")
         value = original if original in {"0", "1", "2", "3"} else ""
         command = run_command(
-            [nmcli, "connection", "modify", "uuid", uuid, "802-11-wireless.powersave", value],
+            [
+                nmcli,
+                "connection",
+                "modify",
+                "uuid",
+                uuid,
+                "802-11-wireless.powersave",
+                value,
+            ],
             timeout=20,
         )
-        record: Dict[str, Any] = {"type": "linux_nm_powersave", "uuid": uuid, "ok": command.ok}
+        record: Dict[str, Any] = {
+            "type": "linux_nm_powersave",
+            "uuid": uuid,
+            "ok": command.ok,
+        }
         if not command.ok:
             record["error"] = command.error or command.stderr.strip()
-            print_command_failure(f"restore NetworkManager profile {connection.get('name')}", command)
+            print_command_failure(
+                f"restore NetworkManager profile {connection.get('name')}", command
+            )
             results.append(record)
             continue
 
         if restart and connection.get("device"):
-            reapply = run_command([nmcli, "device", "reapply", str(connection["device"])], timeout=20)
+            reapply = run_command(
+                [nmcli, "device", "reapply", str(connection["device"])], timeout=20
+            )
             if not reapply.ok:
                 reconnect = run_command(
-                    [nmcli, "connection", "up", "uuid", uuid, "ifname", str(connection["device"])],
+                    [
+                        nmcli,
+                        "connection",
+                        "up",
+                        "uuid",
+                        uuid,
+                        "ifname",
+                        str(connection["device"]),
+                    ],
                     timeout=45,
                 )
                 record["activation_ok"] = reconnect.ok
             else:
                 record["activation_ok"] = True
-        print(f"  + restored NetworkManager Wi-Fi powersave for {connection.get('name')}")
+        print(
+            f"  + restored NetworkManager Wi-Fi powersave for {connection.get('name')}"
+        )
         results.append(record)
     return results
-
-
-# ---------------------------------------------------------------------------
-# Cross-platform snapshots/apply/restore
-# ---------------------------------------------------------------------------
 
 
 def capture_system_state() -> Dict[str, Any]:
@@ -1826,7 +2133,9 @@ def capture_system_state() -> Dict[str, Any]:
         state["tcp_retrans"] = windows_tcp_retrans_state()
     elif system == "Linux":
         state = capture_linux_state()
-        state["sysctl_current"] = linux_current_sysctl_values(list(LINUX_SYSCTL_TUNING.keys()))
+        state["sysctl_current"] = linux_current_sysctl_values(
+            list(LINUX_SYSCTL_TUNING.keys())
+        )
         state["ring_buffers"] = linux_nic_ring_buffer_state()
         state["irqbalance"] = linux_irqbalance_state()
         state["dns"] = linux_dns_state()
@@ -1838,16 +2147,16 @@ def capture_system_state() -> Dict[str, Any]:
         state["dns"] = macos_dns_state()
         state["tcp_buffers"] = macos_tcp_buffer_state()
     else:
-        return {"supported_changes": [], "note": f"No system tuning implemented for {system}."}
+        return {
+            "supported_changes": [],
+            "note": f"No system tuning implemented for {system}.",
+        }
     return state
 
 
-# ---------------------------------------------------------------------------
-# Extended OS tuning: apply and restore
-# ---------------------------------------------------------------------------
-
-
-def _record_applied(manifest: Dict[str, Any], manifest_path: Path, record: Dict[str, Any]) -> None:
+def _record_applied(
+    manifest: Dict[str, Any], manifest_path: Path, record: Dict[str, Any]
+) -> None:
     manifest.setdefault("applied", {}).setdefault("system", []).append(record)
     atomic_write_json(manifest_path, manifest)
 
@@ -1870,7 +2179,10 @@ def apply_windows_dns_policy_repair(
         if action.ok:
             print(f"  + Windows DNS policy: {action.name}")
         else:
-            print(f"  ! Windows DNS policy {action.name}: {action.detail}", file=sys.stderr)
+            print(
+                f"  ! Windows DNS policy {action.name}: {action.detail}",
+                file=sys.stderr,
+            )
 
     record = {
         "type": "windows_dns_policy_repair",
@@ -1913,7 +2225,9 @@ def apply_windows_extended_tuning(
     """Apply MTU=1500 on Wi-Fi interfaces."""
     mtu_state = state.get("mtu", {})
     if mtu_state.get("available"):
-        wifi_interfaces = [i for i in mtu_state.get("interfaces", []) if i.get("mtu", 0) != 1500]
+        wifi_interfaces = [
+            i for i in mtu_state.get("interfaces", []) if i.get("mtu", 0) != 1500
+        ]
         for iface in wifi_interfaces:
             name = iface.get("name", "")
             if not name or "Loopback" in name:
@@ -1921,10 +2235,17 @@ def apply_windows_extended_tuning(
             result = windows_set_mtu(name, 1500)
             if result.ok:
                 print(f"  + MTU set to 1500 on {name}")
-                _record_applied(manifest, manifest_path, {
-                    "type": "mtu", "scope": "windows", "interface": name,
-                    "original_mtu": iface.get("mtu"), "applied": 1500,
-                })
+                _record_applied(
+                    manifest,
+                    manifest_path,
+                    {
+                        "type": "mtu",
+                        "scope": "windows",
+                        "interface": name,
+                        "original_mtu": iface.get("mtu"),
+                        "applied": 1500,
+                    },
+                )
             else:
                 print_command_failure(f"MTU set on {name}", result)
 
@@ -1934,10 +2255,16 @@ def apply_windows_extended_tuning(
         result = windows_disable_delivery_optimization()
         if result.ok:
             print("  + Delivery Optimization P2P disabled")
-            _record_applied(manifest, manifest_path, {
-                "type": "delivery_optimization", "scope": "windows",
-                "original_value": do_state.get("value"), "applied": 0,
-            })
+            _record_applied(
+                manifest,
+                manifest_path,
+                {
+                    "type": "delivery_optimization",
+                    "scope": "windows",
+                    "original_value": do_state.get("value"),
+                    "applied": 0,
+                },
+            )
         else:
             print_command_failure("Delivery Optimization disable", result)
 
@@ -1947,10 +2274,16 @@ def apply_windows_extended_tuning(
         result = windows_set_qos_reserve(0)
         if result.ok:
             print("  + QoS reservable bandwidth set to 0%")
-            _record_applied(manifest, manifest_path, {
-                "type": "qos", "scope": "windows",
-                "original_value": qos_state.get("value"), "applied": 0,
-            })
+            _record_applied(
+                manifest,
+                manifest_path,
+                {
+                    "type": "qos",
+                    "scope": "windows",
+                    "original_value": qos_state.get("value"),
+                    "applied": 0,
+                },
+            )
         else:
             print_command_failure("QoS reservable bandwidth", result)
 
@@ -1966,15 +2299,26 @@ def apply_windows_extended_tuning(
             ok = all(r.ok for r in results)
             if ok:
                 print("  + TCP retransmission settings: data=5, connect=3")
-                _record_applied(manifest, manifest_path, {
-                    "type": "tcp_retrans", "scope": "windows",
-                    "original_data": orig_data, "original_connect": orig_connect,
-                    "applied_data": 5, "applied_connect": 3,
-                })
+                _record_applied(
+                    manifest,
+                    manifest_path,
+                    {
+                        "type": "tcp_retrans",
+                        "scope": "windows",
+                        "original_data": orig_data,
+                        "original_connect": orig_connect,
+                        "applied_data": 5,
+                        "applied_connect": 3,
+                    },
+                )
             else:
                 for i, r in enumerate(results):
                     if not r.ok:
-                        label = "TcpMaxDataRetransmissions" if i == 0 else "TcpMaxConnectRetransmissions"
+                        label = (
+                            "TcpMaxDataRetransmissions"
+                            if i == 0
+                            else "TcpMaxConnectRetransmissions"
+                        )
                         print_command_failure(label, r)
 
     print("  + Windows extended tuning: complete")
@@ -1988,10 +2332,15 @@ def restore_windows_extended_tuning(manifest: Dict[str, Any]) -> List[Dict[str, 
             repair = item.get("repair", {})
             actions = repair.get("actions", []) if isinstance(repair, dict) else []
             for action in actions:
-                if not isinstance(action, dict) or action.get("name") != "set_clean_dns_servers":
+                if (
+                    not isinstance(action, dict)
+                    or action.get("name") != "set_clean_dns_servers"
+                ):
                     continue
                 alias = str(action.get("interface_alias") or "")
-                original = [str(server) for server in action.get("original_servers", [])]
+                original = [
+                    str(server) for server in action.get("original_servers", [])
+                ]
                 if not alias:
                     continue
                 restore = windows_dns_policy.restore_dns_servers(
@@ -2003,7 +2352,10 @@ def restore_windows_extended_tuning(manifest: Dict[str, Any]) -> List[Dict[str, 
                 if restore.ok:
                     print(f"  + restored DNS servers on {alias}")
                 else:
-                    print(f"  ! restore DNS servers on {alias}: {restore.detail}", file=sys.stderr)
+                    print(
+                        f"  ! restore DNS servers on {alias}: {restore.detail}",
+                        file=sys.stderr,
+                    )
 
         elif item.get("type") == "mtu":
             name = item.get("interface", "")
@@ -2093,11 +2445,16 @@ def apply_linux_extended_tuning(
         r = linux_write_sysctl_conf()
         if r.ok:
             print("  + wrote sysctl tuning: /etc/sysctl.d/99-net-optimizer.conf")
-            _record_applied(manifest, manifest_path, {
-                "type": "sysctl_conf", "scope": "linux",
-                "original": dict(current),
-                "applied": dict(LINUX_SYSCTL_TUNING),
-            })
+            _record_applied(
+                manifest,
+                manifest_path,
+                {
+                    "type": "sysctl_conf",
+                    "scope": "linux",
+                    "original": dict(current),
+                    "applied": dict(LINUX_SYSCTL_TUNING),
+                },
+            )
             apply_r = linux_apply_sysctl()
             if apply_r.ok:
                 print("  + applied sysctl settings")
@@ -2117,10 +2474,17 @@ def apply_linux_extended_tuning(
                 r = linux_set_nic_ring_buffer(name, 4096, 4096)
                 if r.ok:
                     print(f"  + ring buffer: {name} rx=4096 tx=4096")
-                    _record_applied(manifest, manifest_path, {
-                        "type": "ring_buffer", "scope": "linux",
-                        "interface": name, "applied_rx": 4096, "applied_tx": 4096,
-                    })
+                    _record_applied(
+                        manifest,
+                        manifest_path,
+                        {
+                            "type": "ring_buffer",
+                            "scope": "linux",
+                            "interface": name,
+                            "applied_rx": 4096,
+                            "applied_tx": 4096,
+                        },
+                    )
                 else:
                     print_command_failure(f"ring buffer on {name}", r)
 
@@ -2130,11 +2494,16 @@ def apply_linux_extended_tuning(
         r = linux_enable_irqbalance()
         if r.ok:
             print("  + irqbalance enabled and started")
-            _record_applied(manifest, manifest_path, {
-                "type": "irqbalance", "scope": "linux",
-                "original_enabled": irq_state.get("enabled"),
-                "original_active": irq_state.get("active"),
-            })
+            _record_applied(
+                manifest,
+                manifest_path,
+                {
+                    "type": "irqbalance",
+                    "scope": "linux",
+                    "original_enabled": irq_state.get("enabled"),
+                    "original_active": irq_state.get("active"),
+                },
+            )
         else:
             print_command_failure("irqbalance enable", r)
 
@@ -2146,11 +2515,16 @@ def apply_linux_extended_tuning(
             r = linux_set_dns()
             if r.ok:
                 print("  + DNS set to 1.1.1.1, 1.0.0.1")
-                _record_applied(manifest, manifest_path, {
-                    "type": "dns", "scope": "linux",
-                    "original_servers": current_servers,
-                    "applied": list(DEFAULT_DNS_SERVERS),
-                })
+                _record_applied(
+                    manifest,
+                    manifest_path,
+                    {
+                        "type": "dns",
+                        "scope": "linux",
+                        "original_servers": current_servers,
+                        "applied": list(DEFAULT_DNS_SERVERS),
+                    },
+                )
             else:
                 print_command_failure("DNS set", r)
 
@@ -2209,11 +2583,16 @@ def apply_macos_extended_tuning(
             r = macos_set_dns()
             if r.ok:
                 print("  + DNS set to 1.1.1.1, 1.0.0.1")
-                _record_applied(manifest, manifest_path, {
-                    "type": "dns", "scope": "macos",
-                    "original_servers": servers,
-                    "applied": list(DEFAULT_DNS_SERVERS),
-                })
+                _record_applied(
+                    manifest,
+                    manifest_path,
+                    {
+                        "type": "dns",
+                        "scope": "macos",
+                        "original_servers": servers,
+                        "applied": list(DEFAULT_DNS_SERVERS),
+                    },
+                )
             else:
                 print_command_failure("macOS DNS set", r)
 
@@ -2227,11 +2606,18 @@ def apply_macos_extended_tuning(
             ok = all(r.ok for r in rs)
             if ok:
                 print("  + TCP buffers: send=131072 recv=131072")
-                _record_applied(manifest, manifest_path, {
-                    "type": "tcp_buffers", "scope": "macos",
-                    "original_send": send, "original_recv": recv,
-                    "applied_send": 131072, "applied_recv": 131072,
-                })
+                _record_applied(
+                    manifest,
+                    manifest_path,
+                    {
+                        "type": "tcp_buffers",
+                        "scope": "macos",
+                        "original_send": send,
+                        "original_recv": recv,
+                        "applied_send": 131072,
+                        "applied_recv": 131072,
+                    },
+                )
                 conf_r = macos_write_sysctl_conf(131072, 131072)
                 if conf_r.ok:
                     print("  + wrote persistent sysctl.conf")
@@ -2306,7 +2692,9 @@ def apply_system_state(
         print(f"  - {system}: no system tuning is implemented")
 
 
-def restore_system_state(manifest: Dict[str, Any], restart: bool) -> List[Dict[str, Any]]:
+def restore_system_state(
+    manifest: Dict[str, Any], restart: bool
+) -> List[Dict[str, Any]]:
     system = str(manifest.get("platform", {}).get("system") or platform.system())
     if system != platform.system():
         raise NetStabilityError(
@@ -2335,22 +2723,289 @@ def platform_metadata() -> Dict[str, Any]:
     }
 
 
-def planned_changes(do_system: bool, do_npm: bool, include_battery: bool, maxsockets: int) -> List[str]:
+def _parse_key_value_lines(output: str) -> Dict[str, str]:
+    parsed: Dict[str, str] = {}
+    for line in output.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        normalized = re.sub(r"\s+", "_", key.strip().lower())
+        if normalized:
+            parsed[normalized] = value.strip()
+    return parsed
+
+
+def parse_windows_wlan_interfaces(output: str) -> List[Dict[str, str]]:
+    interfaces: List[Dict[str, str]] = []
+    current: Dict[str, str] = {}
+    useful_keys = {
+        "state",
+        "ssid",
+        "bssid",
+        "signal",
+        "receive_rate_(mbps)",
+        "transmit_rate_(mbps)",
+    }
+    for line in output.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            if current:
+                interfaces.append(current)
+                current = {}
+            continue
+        if ":" not in stripped:
+            continue
+        key, value = stripped.split(":", 1)
+        normalized = re.sub(r"\s+", "_", key.strip().lower())
+        if normalized == "name" and current:
+            interfaces.append(current)
+            current = {}
+        current[normalized] = value.strip()
+    if current:
+        interfaces.append(current)
+    return [item for item in interfaces if useful_keys.intersection(item)]
+
+
+def collect_wifi_link_quality() -> Dict[str, Any]:
+    system = platform.system()
+    if system == "Windows":
+        result = run_command(["netsh", "wlan", "show", "interfaces"], timeout=15)
+        return {
+            "available": result.ok,
+            "platform": "Windows",
+            "source": "netsh wlan show interfaces",
+            "interfaces": parse_windows_wlan_interfaces(result.stdout)
+            if result.ok
+            else [],
+            "raw": result.to_report(limit=40_000),
+            "mutation": "none",
+        }
+    if system == "Linux":
+        reports: Dict[str, Any] = {}
+        if shutil.which("nmcli"):
+            reports["nmcli_wifi"] = run_command(
+                [
+                    "nmcli",
+                    "-f",
+                    "IN-USE,SSID,MODE,CHAN,RATE,SIGNAL,BARS,SECURITY,DEVICE",
+                    "device",
+                    "wifi",
+                    "list",
+                    "--rescan",
+                    "no",
+                ],
+                timeout=20,
+            ).to_report(limit=40_000)
+        if shutil.which("iw"):
+            iw_dev = run_command(["iw", "dev"], timeout=10)
+            reports["iw_dev"] = iw_dev.to_report(limit=20_000)
+            interface_names = re.findall(r"(?m)^\s*Interface\s+(\S+)", iw_dev.stdout)
+            reports["iw_links"] = {
+                name: run_command(["iw", "dev", name, "link"], timeout=10).to_report(
+                    limit=20_000
+                )
+                for name in interface_names[:8]
+            }
+        return {
+            "available": bool(reports),
+            "platform": "Linux",
+            "source": "nmcli and iw when available",
+            "reports": reports,
+            "mutation": "none",
+        }
+    if system == "Darwin":
+        hardware = run_command(["networksetup", "-listallhardwareports"], timeout=15)
+        profiler = run_command(
+            ["system_profiler", "SPAirPortDataType", "-detailLevel", "mini"], timeout=45
+        )
+        return {
+            "available": hardware.ok or profiler.ok,
+            "platform": "macOS",
+            "source": "networksetup and system_profiler",
+            "reports": {
+                "hardware_ports": hardware.to_report(limit=20_000),
+                "airport_profiler": profiler.to_report(limit=40_000),
+            },
+            "mutation": "none",
+        }
+    return {
+        "available": False,
+        "platform": system,
+        "source": "unsupported platform",
+        "reports": {},
+        "mutation": "none",
+    }
+
+
+def bufferbloat_assessment(
+    baseline: Mapping[str, Any],
+    load: Optional[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    if load is None:
+        return {
+            "available": False,
+            "severity": "unknown",
+            "evidence": [],
+            "recommendation": "Run benchmark or verify --loaded to measure loaded latency.",
+        }
+    base_public = baseline.get("public_ping", {})
+    load_public = load.get("public_ping", {})
+    gateway = load.get("gateway_ping", {})
+    base_median = base_public.get("median_ms")
+    load_p95 = load_public.get("p95_ms")
+    if base_median is None or load_p95 is None or not load_public.get("available"):
+        return {
+            "available": False,
+            "severity": "unknown",
+            "evidence": ["public latency summary unavailable"],
+            "recommendation": "Repeat with an ICMP-reachable public target or compare with HTTPS timings.",
+        }
+
+    base_value = float(base_median)
+    load_value = float(load_p95)
+    gateway_loss = float(gateway.get("loss_percent") or 0.0)
+    ratio = round(load_value / max(base_value, 1.0), 2)
+    delta = round(load_value - base_value, 3)
+    if gateway_loss >= 10.0:
+        severity = "local_link_or_router"
+        recommendation = "Gateway degraded under load; inspect Wi-Fi signal, adapter placement, USB path, AP load, and router CPU before router SQM."
+    elif load_value >= max(200.0, base_value * 4.0):
+        severity = "high"
+        recommendation = "Evaluate SQM/FQ-CoDel/CAKE at the WAN bottleneck; keep PC-side TCP folklore disabled."
+    elif load_value >= max(100.0, base_value * 2.0):
+        severity = "medium"
+        recommendation = "Loaded latency rose materially; repeat with separate download/upload load before changing router policy."
+    else:
+        severity = "low"
+        recommendation = "No strong bufferbloat signal in this short run."
+    return {
+        "available": True,
+        "severity": severity,
+        "idle_public_median_ms": base_value,
+        "load_public_p95_ms": load_value,
+        "latency_delta_ms": delta,
+        "latency_ratio": ratio,
+        "gateway_loss_percent": gateway_loss,
+        "recommendation": recommendation,
+    }
+
+
+def optimizer_action_ledger() -> List[Dict[str, Any]]:
+    return [
+        {
+            "id": "measure-idle",
+            "title": "Idle DNS, HTTPS, gateway, and public latency probes",
+            "platforms": ["Windows", "Linux", "macOS"],
+            "mutation": "none",
+            "evidence": "local ping plus DNS and HTTPS probes",
+            "precheck": "network command availability",
+            "postcheck": "JSON report with loss, latency, jitter, DNS, and HTTPS summaries",
+            "reversible": "not applicable",
+        },
+        {
+            "id": "measure-ndt7",
+            "title": "M-Lab NDT7 application goodput test",
+            "platforms": ["Windows", "Linux", "macOS"],
+            "mutation": "none",
+            "evidence": "M-Lab Locate API v2 and NDT7 WebSocket/TLS protocol",
+            "precheck": "Locate API returns usable WSS download/upload URLs",
+            "postcheck": "download/upload Mbps and server metadata saved without access tokens",
+            "reversible": "not applicable",
+        },
+        {
+            "id": "inspect-wifi-link",
+            "title": "Wi-Fi link quality inventory",
+            "platforms": ["Windows", "Linux", "macOS"],
+            "mutation": "none",
+            "evidence": "documented OS diagnostic commands",
+            "precheck": "netsh, nmcli/iw, or networksetup/system_profiler availability",
+            "postcheck": "signal/link-rate/channel evidence stored in the report when exposed by the OS",
+            "reversible": "not applicable",
+        },
+        {
+            "id": "apply-npm-weak-link-profile",
+            "title": "npm weak-link retry and concurrency profile",
+            "platforms": ["Windows", "Linux", "macOS"],
+            "mutation": "user npm configuration only",
+            "evidence": "npm user config semantics",
+            "precheck": "npm executable and non-root user context",
+            "postcheck": "snapshot-backed manifest and npm config readback",
+            "reversible": "restore command restores exact previous user config",
+        },
+        {
+            "id": "apply-windows-dns-policy-repair",
+            "title": "Windows DNS policy and invalid resolver repair",
+            "platforms": ["Windows"],
+            "mutation": "DNS cache flush plus invalid DNS server replacement only",
+            "evidence": "Get-DnsClientNrptPolicy, DNS Client events, DNS server inventory",
+            "precheck": "NRPT health, event counts, and invalid resolver entries",
+            "postcheck": "repair result and follow-up health evidence in manifest",
+            "reversible": "snapshot-backed DNS server restore; NRPT rules are never deleted automatically",
+        },
+        {
+            "id": "apply-wifi-power-stability",
+            "title": "Adapter-scoped Wi-Fi power stability profile",
+            "platforms": ["Windows", "Linux"],
+            "mutation": "documented power-management settings only",
+            "evidence": "powercfg/NetAdapterPowerManagement and NetworkManager powersave fields",
+            "precheck": "active physical Wi-Fi adapter/profile detected",
+            "postcheck": "manifest records changed values and any skipped adapters",
+            "reversible": "snapshot-backed restore",
+        },
+        {
+            "id": "apply-transport-safe-values",
+            "title": "Evidence-backed transport and DNS safe values",
+            "platforms": ["Windows", "Linux", "macOS"],
+            "mutation": "documented MTU, DNS, QoS, retransmission, sysctl, or buffer settings by platform",
+            "evidence": "project evidence policy and platform command support",
+            "precheck": "platform, privilege, and current state checks",
+            "postcheck": "manifest records applied, skipped, and failed operations",
+            "reversible": "snapshot-backed restore where the platform exposes previous state",
+        },
+        {
+            "id": "deny-folklore",
+            "title": "Deny unsafe or unproven optimizer folklore",
+            "platforms": ["Windows", "Linux", "macOS"],
+            "mutation": "none",
+            "evidence": "explicit denylist and regression tests",
+            "precheck": "planned action text and audit denylist",
+            "postcheck": "guardrail tests reject advertised unsafe actions",
+            "reversible": "not applicable",
+        },
+    ]
+
+
+def planned_changes(
+    do_system: bool, do_npm: bool, include_battery: bool, maxsockets: int
+) -> List[str]:
     changes: List[str] = []
     system = platform.system()
     if do_system:
         if system == "Windows":
-            changes.append("Check and repair Windows DNS policy corruption, DNS Client timeouts, and invalid resolver entries")
-            changes.append("Restore Windows TCP receive-window auto-tuning to normal when restricted or disabled")
-            changes.append("Set the active plan's Wi-Fi policy to Maximum Performance on AC" + (" and battery" if include_battery else ""))
-            changes.append("Disable supported NDIS SelectiveSuspend and DeviceSleepOnDisconnect on physical Wi-Fi adapters")
+            changes.append(
+                "Check and repair Windows DNS policy corruption, DNS Client timeouts, and invalid resolver entries"
+            )
+            changes.append(
+                "Restore Windows TCP receive-window auto-tuning to normal when restricted or disabled"
+            )
+            changes.append(
+                "Set the active plan's Wi-Fi policy to Maximum Performance on AC"
+                + (" and battery" if include_battery else "")
+            )
+            changes.append(
+                "Disable supported NDIS SelectiveSuspend and DeviceSleepOnDisconnect on physical Wi-Fi adapters"
+            )
             changes.append("Set MTU to 1500 on Wi-Fi interfaces")
             changes.append("Disable Windows Delivery Optimization (P2P update sharing)")
             changes.append("Set QoS reservable bandwidth to 0%")
             changes.append("Set TCP retransmission registry values (data=5, connect=3)")
         elif system == "Linux":
-            changes.append("Set active NetworkManager Wi-Fi profiles to powersave=2 (disabled)")
-            changes.append("Write sysctl TCP/IP tuning (buffers, SACK, window scaling, timestamps, fastopen)")
+            changes.append(
+                "Set active NetworkManager Wi-Fi profiles to powersave=2 (disabled)"
+            )
+            changes.append(
+                "Write sysctl TCP/IP tuning (buffers, SACK, window scaling, timestamps, fastopen)"
+            )
             changes.append("Enable BBR congestion control and fq_codel qdisc")
             changes.append("Set NIC ring buffers to 4096 (rx/tx)")
             changes.append("Enable and start irqbalance daemon")
@@ -2361,7 +3016,9 @@ def planned_changes(do_system: bool, do_npm: bool, include_battery: bool, maxsoc
         else:
             changes.append(f"No system setting for {system}")
     if do_npm:
-        changes.append(f"Apply weak-link npm profile (maxsockets={maxsockets}, retries, longer timeout, prefer-offline)")
+        changes.append(
+            f"Apply weak-link npm profile (maxsockets={maxsockets}, retries, longer timeout, prefer-offline)"
+        )
     return changes
 
 
@@ -2389,6 +3046,7 @@ def create_snapshot(do_system: bool, do_npm: bool) -> Tuple[Path, Path, Dict[str
         "created_utc": utc_now_iso(),
         "platform": platform_metadata(),
         "selection": {"system": do_system, "npm": do_npm},
+        "optimizer_action_ledger": optimizer_action_ledger(),
         "state": {},
         "applied": {"system": [], "npm": []},
         "status": "capturing",
@@ -2418,11 +3076,15 @@ def command_reset_network(args: argparse.Namespace) -> int:
 
     if system == "Windows":
         if not is_windows_admin():
-            raise NetStabilityError("Windows network reset requires an Administrator terminal")
+            raise NetStabilityError(
+                "Windows network reset requires an Administrator terminal"
+            )
         results = windows_reset_network_stack()
         all_ok = all(r.ok for r in results)
         for i, r in enumerate(results):
-            label = ["netsh int ip reset", "netsh winsock reset", "ipconfig /flushdns"][i]
+            label = ["netsh int ip reset", "netsh winsock reset", "ipconfig /flushdns"][
+                i
+            ]
             if r.ok:
                 print(f"  + {label}")
             else:
@@ -2439,7 +3101,12 @@ def command_reset_network(args: argparse.Namespace) -> int:
             print("  - Some reset steps require root. Run with sudo for full effect.")
         results = macos_reset_network_config()
         for i, r in enumerate(results):
-            label = ["mv config plists", "route -n flush", "dscacheutil -flushcache", "killall mDNSResponder"][i]
+            label = [
+                "mv config plists",
+                "route -n flush",
+                "dscacheutil -flushcache",
+                "killall mDNSResponder",
+            ][i]
             if r.ok:
                 print(f"  + {label}")
             else:
@@ -2452,7 +3119,11 @@ def command_reset_network(args: argparse.Namespace) -> int:
             print("  - Some reset steps require root. Run with sudo for full effect.")
         results = linux_reset_network()
         for i, r in enumerate(results):
-            label = ["systemctl restart NetworkManager", "resolvectl flush-caches"][i] if i < len(results) else "reset"
+            label = (
+                ["systemctl restart NetworkManager", "resolvectl flush-caches"][i]
+                if i < len(results)
+                else "reset"
+            )
             if r.ok:
                 print(f"  + {label}")
             else:
@@ -2499,7 +3170,9 @@ def command_repair_windows_dns(args: argparse.Namespace) -> int:
         print("Dry run complete; DNS cache and resolver settings were not changed.")
         return 0
     if not is_windows_admin():
-        raise NetStabilityError("Windows DNS policy repair requires an Administrator terminal")
+        raise NetStabilityError(
+            "Windows DNS policy repair requires an Administrator terminal"
+        )
     if not confirm("Repair Windows DNS policy state?", args.yes):
         print("Cancelled.")
         return 1
@@ -2608,11 +3281,17 @@ def command_apply(args: argparse.Namespace) -> int:
     do_npm = not args.system_only
 
     print("Planned changes:")
-    for change in planned_changes(do_system, do_npm, args.include_battery, args.npm_maxsockets):
+    for change in planned_changes(
+        do_system, do_npm, args.include_battery, args.npm_maxsockets
+    ):
         print(f"  - {change}")
     if do_system and not args.no_restart and platform.system() in {"Windows", "Linux"}:
-        print("  - The Wi-Fi adapter/connection may disconnect briefly while settings are activated")
-    print("Paper-backed MTU, DNS, BBR, and TCP auto-tuning repairs ARE applied when supported.")
+        print(
+            "  - The Wi-Fi adapter/connection may disconnect briefly while settings are activated"
+        )
+    print(
+        "Paper-backed MTU, DNS, BBR, and TCP auto-tuning repairs ARE applied when supported."
+    )
 
     if args.dry_run:
         print("Dry run complete; no snapshot or setting was written.")
@@ -2641,7 +3320,11 @@ def command_apply(args: argparse.Namespace) -> int:
         has_errors = any(item.get("severity") == "error" for item in issues)
         has_warnings = any(item.get("severity") == "warning" for item in issues)
         manifest["status"] = (
-            "applied_with_errors" if has_errors else "applied_with_warnings" if has_warnings else "applied"
+            "applied_with_errors"
+            if has_errors
+            else "applied_with_warnings"
+            if has_warnings
+            else "applied"
         )
         manifest["completed_utc"] = utc_now_iso()
         atomic_write_json(manifest_path, manifest)
@@ -2656,10 +3339,16 @@ def command_apply(args: argparse.Namespace) -> int:
         f'Restore command: "{sys.executable}" "{Path(sys.argv[0]).resolve()}" '
         f"restore {manifest['snapshot_id']}"
     )
-    errors = [item for item in manifest.get("issues", []) if item.get("severity") == "error"]
-    warnings = [item for item in manifest.get("issues", []) if item.get("severity") == "warning"]
+    errors = [
+        item for item in manifest.get("issues", []) if item.get("severity") == "error"
+    ]
+    warnings = [
+        item for item in manifest.get("issues", []) if item.get("severity") == "warning"
+    ]
     if errors or warnings:
-        print(f"Apply issues: {len(errors)} error(s), {len(warnings)} warning(s). See the snapshot manifest.")
+        print(
+            f"Apply issues: {len(errors)} error(s), {len(warnings)} warning(s). See the snapshot manifest."
+        )
     return 2 if errors else 0
 
 
@@ -2701,11 +3390,20 @@ def manifest_has_system_changes(manifest: Mapping[str, Any]) -> bool:
 
 
 def manifest_has_npm_state(manifest: Mapping[str, Any]) -> bool:
-    return bool(manifest.get("selection", {}).get("npm")) and "npm" in manifest.get("state", {})
+    return bool(manifest.get("selection", {}).get("npm")) and "npm" in manifest.get(
+        "state", {}
+    )
 
 
-def validate_restore_context(manifest: Mapping[str, Any], do_system: bool, do_npm: bool) -> None:
-    if platform.system() == "Windows" and do_system and manifest_has_system_changes(manifest) and not is_windows_admin():
+def validate_restore_context(
+    manifest: Mapping[str, Any], do_system: bool, do_npm: bool
+) -> None:
+    if (
+        platform.system() == "Windows"
+        and do_system
+        and manifest_has_system_changes(manifest)
+        and not is_windows_admin()
+    ):
         raise NetStabilityError(
             "Restoring Windows system settings requires an Administrator terminal. "
             "Use --npm-only to restore only npm without elevation."
@@ -2724,7 +3422,9 @@ def command_restore(args: argparse.Namespace) -> int:
     validate_restore_context(manifest, do_system, do_npm)
 
     print(f"Snapshot: {manifest.get('snapshot_id')} ({manifest.get('created_utc')})")
-    print(f"Source platform: {manifest.get('platform', {}).get('system')} {manifest.get('platform', {}).get('release')}")
+    print(
+        f"Source platform: {manifest.get('platform', {}).get('system')} {manifest.get('platform', {}).get('release')}"
+    )
     if do_npm and manifest_has_npm_state(manifest):
         print("  - Restore the exact pre-change npm user configuration")
     if do_system and manifest_has_system_changes(manifest):
@@ -2747,7 +3447,9 @@ def command_restore(args: argparse.Namespace) -> int:
     if do_npm and manifest_has_npm_state(manifest):
         restore_record["results"]["npm"] = restore_npm_state(manifest, snapshot_dir)
     if do_system and manifest_has_system_changes(manifest):
-        restore_record["results"]["system"] = restore_system_state(manifest, restart=not args.no_restart)
+        restore_record["results"]["system"] = restore_system_state(
+            manifest, restart=not args.no_restart
+        )
     restore_record["completed_utc"] = utc_now_iso()
     manifest.setdefault("restore_history", []).append(restore_record)
     atomic_write_json(snapshot_dir / "manifest.json", manifest)
@@ -2760,7 +3462,9 @@ def command_restore(args: argparse.Namespace) -> int:
         if not item.get("ok", True):
             failures.append(str(item.get("type", "system")))
     if failures:
-        print(f"Restore completed with failures: {', '.join(failures)}", file=sys.stderr)
+        print(
+            f"Restore completed with failures: {', '.join(failures)}", file=sys.stderr
+        )
         return 2
     print("Restore completed.")
     return 0
@@ -2788,11 +3492,6 @@ def command_list_backups(_args: argparse.Namespace) -> int:
     return 1 if invalid_count else 0
 
 
-# ---------------------------------------------------------------------------
-# Diagnostics and command-under-load monitoring
-# ---------------------------------------------------------------------------
-
-
 def default_gateway() -> Optional[str]:
     system = platform.system()
     if system == "Windows":
@@ -2803,7 +3502,11 @@ def default_gateway() -> Optional[str]:
             "if($null -ne $r){[string]$r.NextHop}"
         )
         result = run_powershell(script, timeout=10)
-        value = result.stdout.strip().splitlines()[-1] if result.ok and result.stdout.strip() else ""
+        value = (
+            result.stdout.strip().splitlines()[-1]
+            if result.ok and result.stdout.strip()
+            else ""
+        )
         return value or None
     if system == "Linux":
         ip = shutil.which("ip")
@@ -2841,11 +3544,24 @@ def ping_once(host: str, timeout_seconds: float = 1.5) -> Dict[str, Any]:
     elif system == "Darwin":
         command = ["ping", "-n", "-c", "1", "-W", str(timeout_ms), host]
     else:
-        command = ["ping", "-n", "-c", "1", "-W", str(max(1, math.ceil(timeout_seconds))), host]
+        command = [
+            "ping",
+            "-n",
+            "-c",
+            "1",
+            "-W",
+            str(max(1, math.ceil(timeout_seconds))),
+            host,
+        ]
 
     result = run_command(command, timeout=timeout_seconds + 1.5)
     if result.error and "command not found" in result.error:
-        return {"available": False, "success": False, "host": host, "error": result.error}
+        return {
+            "available": False,
+            "success": False,
+            "host": host,
+            "error": result.error,
+        }
     latency: Optional[float] = None
     match = PING_TIME_RE.search(result.stdout)
     if match:
@@ -2868,7 +3584,9 @@ def ping_once(host: str, timeout_seconds: float = 1.5) -> Dict[str, Any]:
     }
 
 
-def call_with_timeout(function: Callable[[], Dict[str, Any]], timeout: float) -> Dict[str, Any]:
+def call_with_timeout(
+    function: Callable[[], Dict[str, Any]], timeout: float
+) -> Dict[str, Any]:
     output: "queue.Queue[Tuple[bool, Any]]" = queue.Queue(maxsize=1)
 
     def runner() -> None:
@@ -2923,7 +3641,10 @@ def https_probe(host: str, timeout: float = 5.0) -> Dict[str, Any]:
             connection.request(
                 "GET",
                 "/-/ping",
-                headers={"User-Agent": f"NetStability/{VERSION}", "Accept": "application/json,text/plain"},
+                headers={
+                    "User-Agent": f"NetStability/{VERSION}",
+                    "Accept": "application/json,text/plain",
+                },
             )
             response = connection.getresponse()
             response.read(4096)
@@ -3016,16 +3737,26 @@ def percentile(values: Sequence[float], fraction: float) -> Optional[float]:
 
 def ping_summary(samples: Sequence[Mapping[str, Any]], key: str) -> Dict[str, Any]:
     records = [sample.get(key) for sample in samples if sample.get(key) is not None]
-    available = [record for record in records if isinstance(record, dict) and record.get("available", True)]
+    available = [
+        record
+        for record in records
+        if isinstance(record, dict) and record.get("available", True)
+    ]
     successes = [record for record in available if record.get("success")]
-    latencies = [float(record["latency_ms"]) for record in successes if record.get("latency_ms") is not None]
+    latencies = [
+        float(record["latency_ms"])
+        for record in successes
+        if record.get("latency_ms") is not None
+    ]
     if not available:
         return {"available": False, "attempts": 0}
     summary = {
         "available": True,
         "attempts": len(available),
         "successes": len(successes),
-        "loss_percent": round(100.0 * (len(available) - len(successes)) / len(available), 2),
+        "loss_percent": round(
+            100.0 * (len(available) - len(successes)) / len(available), 2
+        ),
         "median_ms": round(statistics.median(latencies), 3) if latencies else None,
         "p95_ms": round(percentile(latencies, 0.95), 3) if latencies else None,
         "min_ms": round(min(latencies), 3) if latencies else None,
@@ -3036,16 +3767,24 @@ def ping_summary(samples: Sequence[Mapping[str, Any]], key: str) -> Dict[str, An
 
 
 def service_summary(samples: Sequence[Mapping[str, Any]], key: str) -> Dict[str, Any]:
-    records = [sample.get(key) for sample in samples if isinstance(sample.get(key), dict)]
+    records = [
+        sample.get(key) for sample in samples if isinstance(sample.get(key), dict)
+    ]
     if not records:
         return {"available": False, "attempts": 0}
     successes = [record for record in records if record.get("success")]
-    latencies = [float(record["latency_ms"]) for record in successes if record.get("latency_ms") is not None]
+    latencies = [
+        float(record["latency_ms"])
+        for record in successes
+        if record.get("latency_ms") is not None
+    ]
     return {
         "available": True,
         "attempts": len(records),
         "successes": len(successes),
-        "failure_percent": round(100.0 * (len(records) - len(successes)) / len(records), 2),
+        "failure_percent": round(
+            100.0 * (len(records) - len(successes)) / len(records), 2
+        ),
         "median_ms": round(statistics.median(latencies), 3) if latencies else None,
         "p95_ms": round(percentile(latencies, 0.95), 3) if latencies else None,
     }
@@ -3080,13 +3819,17 @@ def format_metric(summary: Mapping[str, Any], failure_key: str = "loss_percent")
     return ", ".join(parts) or "no successful measurements"
 
 
-def print_sample_summary(summary: Mapping[str, Any], title: Optional[str] = None) -> None:
+def print_sample_summary(
+    summary: Mapping[str, Any], title: Optional[str] = None
+) -> None:
     if title:
         print(title)
     print(f"  Gateway ICMP: {format_metric(summary['gateway_ping'])}")
     print(f"  Public ICMP:  {format_metric(summary['public_ping'])}")
     print(f"  DNS lookup:   {format_metric(summary['dns'], 'failure_percent')}")
-    print(f"  npm registry: {format_metric(summary['registry_https'], 'failure_percent')}")
+    print(
+        f"  npm registry: {format_metric(summary['registry_https'], 'failure_percent')}"
+    )
 
 
 def compare_phases(
@@ -3108,7 +3851,10 @@ def compare_phases(
                 "Gateway replies deteriorated under load. This suggests the local Wi-Fi/USB/driver/router path, "
                 "though some routers deprioritize ICMP."
             )
-    if load_registry.get("available") and float(load_registry.get("failure_percent") or 0.0) > 0:
+    if (
+        load_registry.get("available")
+        and float(load_registry.get("failure_percent") or 0.0) > 0
+    ):
         if float(load_gateway.get("loss_percent") or 0.0) < 5.0:
             signals.append(
                 "The gateway remained reachable while npm-registry HTTPS probes failed; investigate DNS, ISP/router uplink, "
@@ -3118,7 +3864,10 @@ def compare_phases(
     load_p95 = load_public.get("p95_ms")
     if base_med is not None and load_p95 is not None:
         threshold = max(200.0, float(base_med) * 4.0)
-        if float(load_p95) >= threshold and float(load_gateway.get("loss_percent") or 0.0) < 10.0:
+        if (
+            float(load_p95) >= threshold
+            and float(load_gateway.get("loss_percent") or 0.0) < 10.0
+        ):
             signals.append(
                 "Public latency rose sharply under load while the gateway was mostly reachable. This is consistent with "
                 "bufferbloat at the router/ISP bottleneck; confirm with a router-side loaded-latency test."
@@ -3148,21 +3897,38 @@ def collect_platform_diagnostics() -> Dict[str, Any]:
 $items=@(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Select-Object Name,InterfaceDescription,InterfaceGuid,Status,LinkSpeed,DriverInformation,DriverFileName,DriverVersionString,PnPDeviceID)
 ConvertTo-Json -InputObject $items -Depth 4 -Compress
 """
-        data["windows_netadapters"] = run_powershell(adapter_script, timeout=20).to_report()
+        data["windows_netadapters"] = run_powershell(
+            adapter_script, timeout=20
+        ).to_report()
         data["windows_dns_policy_health"] = windows_dns_policy_health().to_report()
         driver_script = r"""
 $items=@(Get-CimInstance Win32_PnPSignedDriver -ErrorAction SilentlyContinue | Where-Object {$_.DeviceClass -eq 'NET'} | Select-Object DeviceName,Manufacturer,DriverProviderName,DriverVersion,DriverDate,InfName,DeviceID)
 ConvertTo-Json -InputObject $items -Depth 4 -Compress
 """
-        data["windows_network_drivers"] = run_powershell(driver_script, timeout=30).to_report()
+        data["windows_network_drivers"] = run_powershell(
+            driver_script, timeout=30
+        ).to_report()
     elif system == "Linux":
         if shutil.which("nmcli"):
             commands.extend(
                 [
-                    ("nmcli_devices", ["nmcli", "-f", "GENERAL,IP4,IP6", "device", "show"], 20),
+                    (
+                        "nmcli_devices",
+                        ["nmcli", "-f", "GENERAL,IP4,IP6", "device", "show"],
+                        20,
+                    ),
                     (
                         "nmcli_wifi",
-                        ["nmcli", "-f", "IN-USE,SSID,MODE,CHAN,RATE,SIGNAL,BARS,SECURITY,DEVICE", "device", "wifi", "list", "--rescan", "no"],
+                        [
+                            "nmcli",
+                            "-f",
+                            "IN-USE,SSID,MODE,CHAN,RATE,SIGNAL,BARS,SECURITY,DEVICE",
+                            "device",
+                            "wifi",
+                            "list",
+                            "--rescan",
+                            "no",
+                        ],
                         20,
                     ),
                 ]
@@ -3180,7 +3946,11 @@ ConvertTo-Json -InputObject $items -Depth 4 -Compress
         commands.extend(
             [
                 ("hardware_ports", ["networksetup", "-listallhardwareports"], 15),
-                ("airport_profiler", ["system_profiler", "SPAirPortDataType", "-detailLevel", "mini"], 45),
+                (
+                    "airport_profiler",
+                    ["system_profiler", "SPAirPortDataType", "-detailLevel", "mini"],
+                    45,
+                ),
                 ("route", ["route", "-n", "get", "default"], 10),
             ]
         )
@@ -3192,6 +3962,7 @@ ConvertTo-Json -InputObject $items -Depth 4 -Compress
 
     for label, command, timeout in commands:
         data[label] = run_command(command, timeout=timeout).to_report()
+    data["wifi_link_quality"] = collect_wifi_link_quality()
     return data
 
 
@@ -3218,6 +3989,20 @@ def capability_matrix() -> List[Dict[str, str]]:
             "source": "stdlib HTTPS load plus gateway/public/DNS/HTTPS probes",
             "privilege": "none",
             "mutation": "none, report output only",
+        },
+        {
+            "capability": "M-Lab NDT7 application speed test",
+            "available": "yes",
+            "source": "M-Lab Locate API v2 plus NDT7 WebSocket/TLS",
+            "privilege": "none",
+            "mutation": "none, report output only",
+        },
+        {
+            "capability": "Cross-platform Wi-Fi link quality inspection",
+            "available": "conditional",
+            "source": "netsh wlan, nmcli/iw, or networksetup/system_profiler",
+            "privilege": "none",
+            "mutation": "none",
         },
         {
             "capability": "npm weak-link profile",
@@ -3414,6 +4199,8 @@ def repository_map() -> Dict[str, Any]:
         "public_commands": [
             "diagnose",
             "measure idle",
+            "speedtest",
+            "verify",
             "benchmark",
             "watch -- <command>",
             "audit",
@@ -3441,7 +4228,6 @@ def repository_map() -> Dict[str, Any]:
         ],
         "tests": "standard-library smoke checks plus policy tests",
         "remaining_gaps": [
-            "Native Wi-Fi ctypes backend is not yet implemented",
             "Linux nl80211 counter backend is not yet implemented",
             "Out-of-process rollback watchdog is not yet implemented",
             "Benchmark acceptance still requires repeated external workloads",
@@ -3535,7 +4321,10 @@ def classify_measurement(
             observation_record(
                 "remote_path_loss",
                 "high",
-                [f"public_loss_percent={public_loss:g}", f"gateway_loss_percent={gateway_loss:g}"],
+                [
+                    f"public_loss_percent={public_loss:g}",
+                    f"gateway_loss_percent={gateway_loss:g}",
+                ],
                 0.76,
                 ["A single public target can be rate-limited or filtered."],
             )
@@ -3560,7 +4349,9 @@ def classify_measurement(
                 "medium",
                 [f"dns_failure_percent={dns_fail:g}", "https_probe_success=true"],
                 0.66,
-                ["The current probe does not separate cached from uncached resolver responses."],
+                [
+                    "The current probe does not separate cached from uncached resolver responses."
+                ],
             )
         )
         recommendations.append(
@@ -3581,7 +4372,11 @@ def classify_measurement(
         base_median = base_public.get("median_ms")
         load_p95 = public.get("p95_ms")
         public_jitter = float(public.get("jitter_avg_ms") or 0.0)
-        if public.get("available") and gateway_loss < 5.0 and (public_loss >= 5.0 or public_jitter >= 15.0):
+        if (
+            public.get("available")
+            and gateway_loss < 5.0
+            and (public_loss >= 5.0 or public_jitter >= 15.0)
+        ):
             observations.append(
                 observation_record(
                     "download_loaded_loss_or_jitter",
@@ -3592,7 +4387,9 @@ def classify_measurement(
                         f"load_gateway_loss_percent={gateway_loss:g}",
                     ],
                     0.84,
-                    ["Remote ICMP can be rate-limited; corroborate with HTTPS throughput and target diversity."],
+                    [
+                        "Remote ICMP can be rate-limited; corroborate with HTTPS throughput and target diversity."
+                    ],
                 )
             )
             recommendations.append(
@@ -3614,9 +4411,14 @@ def classify_measurement(
                     observation_record(
                         "loaded_latency_inflation",
                         "high",
-                        [f"idle_public_median_ms={float(base_median):g}", f"load_public_p95_ms={float(load_p95):g}"],
+                        [
+                            f"idle_public_median_ms={float(base_median):g}",
+                            f"load_public_p95_ms={float(load_p95):g}",
+                        ],
                         0.82,
-                        ["Short runs are preliminary; repeat with upload/download direction separated."],
+                        [
+                            "Short runs are preliminary; repeat with upload/download direction separated."
+                        ],
                     )
                 )
                 recommendations.append(
@@ -3703,7 +4505,13 @@ def maybe_generate_windows_wlan_report(enabled: bool) -> Optional[Dict[str, Any]
         return None
     result = run_command(["netsh", "wlan", "show", "wlanreport"], timeout=90)
     program_data = os.environ.get("PROGRAMDATA") or r"C:\ProgramData"
-    expected = Path(program_data) / "Microsoft" / "Windows" / "WlanReport" / "wlan-report-latest.html"
+    expected = (
+        Path(program_data)
+        / "Microsoft"
+        / "Windows"
+        / "WlanReport"
+        / "wlan-report-latest.html"
+    )
     record = result.to_report()
     record["expected_report_path"] = str(expected)
     record["report_exists"] = expected.is_file()
@@ -3735,7 +4543,10 @@ ConvertTo-Json -InputObject $items -Depth 4 -Compress
 """
     result = run_powershell(script, timeout=20)
     if not result.ok or not result.stdout.strip():
-        return {"available": False, "error": result.error or result.stderr.strip() or result.stdout.strip()}
+        return {
+            "available": False,
+            "error": result.error or result.stderr.strip() or result.stdout.strip(),
+        }
     try:
         parsed = json.loads(result.stdout.strip())
     except json.JSONDecodeError:
@@ -3743,7 +4554,10 @@ ConvertTo-Json -InputObject $items -Depth 4 -Compress
     if isinstance(parsed, dict):
         parsed = [parsed]
     if not isinstance(parsed, list):
-        return {"available": False, "error": "Adapter statistics returned an unexpected shape"}
+        return {
+            "available": False,
+            "error": "Adapter statistics returned an unexpected shape",
+        }
     return {"available": True, "adapters": parsed}
 
 
@@ -3751,7 +4565,12 @@ def adapter_counter_delta(
     before: Optional[Mapping[str, Any]],
     after: Optional[Mapping[str, Any]],
 ) -> Optional[Dict[str, Any]]:
-    if not before or not after or not before.get("available") or not after.get("available"):
+    if (
+        not before
+        or not after
+        or not before.get("available")
+        or not after.get("available")
+    ):
         return None
     before_items = before.get("adapters", [])
     after_items = after.get("adapters", [])
@@ -3799,7 +4618,9 @@ def run_download_load(
         timeout_seconds=config.load_seconds,
     )
     started = time.perf_counter()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=config.parallel_downloads) as executor:
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=config.parallel_downloads
+    ) as executor:
         futures = [
             executor.submit(download_worker, download_config, stop_event)
             for _ in range(config.parallel_downloads)
@@ -3819,7 +4640,13 @@ def run_download_load(
             try:
                 workers.append(future.result(timeout=3.0))
             except concurrent.futures.TimeoutError:
-                workers.append({"success": False, "bytes_read": 0, "error": "download worker did not stop"})
+                workers.append(
+                    {
+                        "success": False,
+                        "bytes_read": 0,
+                        "error": "download worker did not stop",
+                    }
+                )
     duration_ms = (time.perf_counter() - started) * 1000.0
     return (
         load_samples,
@@ -3844,6 +4671,7 @@ def command_audit(args: argparse.Namespace) -> int:
         "control_layers": list(CONTROL_LAYERS),
         "capability_matrix": capability_matrix(),
         "evidence_policy": list(EVIDENCE_POLICY),
+        "optimizer_action_ledger": optimizer_action_ledger(),
         "anti_folklore_denylist": list(ANTI_FOLKLORE_DENYLIST),
         "normal_mode_boundaries": [
             "audit, diagnose, measure, watch, and list-backups are read-only apart from explicit report files",
@@ -3857,7 +4685,9 @@ def command_audit(args: argparse.Namespace) -> int:
         report["platform_diagnostics"] = collect_platform_diagnostics()
     if args.redact:
         report = redact_report_value(report)
-    destination = Path(args.output).expanduser() if args.output else report_path("audit")
+    destination = (
+        Path(args.output).expanduser() if args.output else report_path("audit")
+    )
     atomic_write_json(destination, report, private_parent=not bool(args.output))
 
     print("Evidence audit:")
@@ -3876,6 +4706,9 @@ def command_audit(args: argparse.Namespace) -> int:
     print("  Capability matrix:")
     for row in report["capability_matrix"]:
         print(f"    - {row['capability']}: {row['available']} ({row['mutation']})")
+    print("  Optimizer action ledger:")
+    for row in report["optimizer_action_ledger"]:
+        print(f"    - {row['title']}: {row['mutation']}")
     print(f"Report saved: {destination}")
     return 0
 
@@ -3907,6 +4740,7 @@ def command_diagnose(args: argparse.Namespace) -> int:
         "observations": observations,
         "recommendations": recommendations,
         "capability_matrix": capability_matrix(),
+        "optimizer_action_ledger": optimizer_action_ledger(),
         "platform_diagnostics": collect_platform_diagnostics(),
         "network_quality": maybe_run_network_quality(args.network_quality),
         "windows_wlan_report": maybe_generate_windows_wlan_report(args.wlan_report),
@@ -3917,7 +4751,9 @@ def command_diagnose(args: argparse.Namespace) -> int:
     }
     if args.redact:
         report = redact_report_value(report)
-    destination = Path(args.output).expanduser() if args.output else report_path("diagnose")
+    destination = (
+        Path(args.output).expanduser() if args.output else report_path("diagnose")
+    )
     atomic_write_json(destination, report, private_parent=not bool(args.output))
     print(f"Report saved: {destination}")
     return 0
@@ -3925,6 +4761,255 @@ def command_diagnose(args: argparse.Namespace) -> int:
 
 def command_measure_idle(args: argparse.Namespace) -> int:
     return command_diagnose(args)
+
+
+def ndt7_config_from_args(args: argparse.Namespace) -> Ndt7Config:
+    run_download = not getattr(args, "skip_download", False)
+    run_upload = not getattr(args, "skip_upload", False)
+    if not run_download and not run_upload:
+        raise NetStabilityError("speedtest requires at least one direction")
+    return Ndt7Config(
+        locate_url=args.locate_url,
+        timeout_seconds=args.timeout,
+        user_agent=f"NetStability/{VERSION} ({platform.system()} {platform.machine()})",
+        run_download=run_download,
+        run_upload=run_upload,
+    )
+
+
+def print_ndt7_summary(speedtest: Mapping[str, Any]) -> None:
+    locate = speedtest.get("locate")
+    if isinstance(locate, dict):
+        targets = locate.get("targets")
+        if isinstance(targets, list) and targets:
+            first = targets[0]
+            print(f"M-Lab target: {first.get('machine') or 'unknown'}")
+    for key, label in (("download", "Download"), ("upload", "Upload")):
+        result = speedtest.get(key)
+        if result is None:
+            print(f"{label}: skipped")
+            continue
+        if not isinstance(result, dict) or not result.get("success"):
+            error = result.get("error") if isinstance(result, dict) else "not available"
+            print(f"{label}: unavailable ({error})")
+            continue
+        print(
+            f"{label}: {float(result.get('throughput_mbps') or 0.0):g} Mbps, "
+            f"{int(result.get('bytes') or 0)} bytes, {float(result.get('duration_ms') or 0.0):g} ms"
+        )
+
+
+def command_speedtest(args: argparse.Namespace) -> int:
+    print("Locating M-Lab NDT7 server...")
+    config = ndt7_config_from_args(args)
+    speedtest = run_ndt7_speedtest(config)
+    print_ndt7_summary(speedtest)
+    report: Dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "tool": {"name": APP_DISPLAY_NAME, "version": VERSION},
+        "created_utc": utc_now_iso(),
+        "platform": platform_metadata(),
+        "speedtest": speedtest,
+        "capability_matrix": capability_matrix(),
+        "optimizer_action_ledger": optimizer_action_ledger(),
+    }
+    if args.redact:
+        report = redact_report_value(report)
+    destination = (
+        Path(args.output).expanduser() if args.output else report_path("speedtest")
+    )
+    atomic_write_json(destination, report, private_parent=not bool(args.output))
+    print(f"Report saved: {destination}")
+    requested = [
+        speedtest.get("download") if config.run_download else None,
+        speedtest.get("upload") if config.run_upload else None,
+    ]
+    completed = [
+        item for item in requested if isinstance(item, dict) and item.get("success")
+    ]
+    return 0 if completed else 1
+
+
+def command_link_quality(args: argparse.Namespace) -> int:
+    quality = collect_wifi_link_quality()
+    print("Wi-Fi link quality:")
+    print(f"  Platform: {quality.get('platform')}")
+    print(f"  Source: {quality.get('source')}")
+    print(f"  Available: {'yes' if quality.get('available') else 'no'}")
+    if platform.system() == "Windows":
+        for item in quality.get("interfaces", []):
+            if not isinstance(item, dict):
+                continue
+            print(
+                "  - "
+                f"{item.get('name', 'Wi-Fi')}: state={item.get('state', 'unknown')}, "
+                f"signal={item.get('signal', 'unknown')}, "
+                f"receive={item.get('receive_rate_mbps', item.get('receive_rate_(mbps)', 'unknown'))} Mbps, "
+                f"transmit={item.get('transmit_rate_mbps', item.get('transmit_rate_(mbps)', 'unknown'))} Mbps"
+            )
+    report: Dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "tool": {"name": APP_DISPLAY_NAME, "version": VERSION},
+        "created_utc": utc_now_iso(),
+        "platform": platform_metadata(),
+        "wifi_link_quality": quality,
+        "capability_matrix": capability_matrix(),
+        "optimizer_action_ledger": optimizer_action_ledger(),
+    }
+    if args.redact:
+        report = redact_report_value(report)
+    destination = (
+        Path(args.output).expanduser() if args.output else report_path("link-quality")
+    )
+    atomic_write_json(destination, report, private_parent=not bool(args.output))
+    print(f"Report saved: {destination}")
+    return 0 if quality.get("available") else 1
+
+
+def classify_speed_verification(
+    speedtest: Optional[Mapping[str, Any]],
+    min_download_mbps: float,
+    min_upload_mbps: float,
+) -> Tuple[str, List[str]]:
+    if speedtest is None:
+        return "baseline-only", ["NDT7 speed test was skipped"]
+    findings: List[str] = []
+    status = "pass"
+    download = speedtest.get("download")
+    if isinstance(download, dict):
+        if not download.get("success"):
+            status = "inconclusive"
+            findings.append(
+                f"download unavailable: {download.get('error') or 'unknown error'}"
+            )
+        else:
+            mbps = float(download.get("throughput_mbps") or 0.0)
+            if mbps < min_download_mbps:
+                status = "degraded"
+                findings.append(
+                    f"download {mbps:g} Mbps is below {min_download_mbps:g} Mbps threshold"
+                )
+            else:
+                findings.append(
+                    f"download {mbps:g} Mbps meets {min_download_mbps:g} Mbps threshold"
+                )
+    upload = speedtest.get("upload")
+    if isinstance(upload, dict) and min_upload_mbps > 0.0:
+        if not upload.get("success"):
+            status = "inconclusive" if status == "pass" else status
+            findings.append(
+                f"upload unavailable: {upload.get('error') or 'unknown error'}"
+            )
+        else:
+            mbps = float(upload.get("throughput_mbps") or 0.0)
+            if mbps < min_upload_mbps and status != "degraded":
+                status = "degraded"
+            findings.append(
+                f"upload {mbps:g} Mbps compared with {min_upload_mbps:g} Mbps threshold"
+            )
+    if not findings:
+        return "inconclusive", ["no requested NDT7 direction returned a usable result"]
+    return status, findings
+
+
+def command_verify(args: argparse.Namespace) -> int:
+    gateway = default_gateway()
+    print(f"Default gateway: {gateway or 'not detected'}")
+    print("Collecting verification baseline")
+    samples = collect_samples(
+        args.samples,
+        args.interval,
+        gateway,
+        args.public_target,
+        args.registry_host,
+        "verify_idle",
+    )
+    summary = summarize_samples(samples)
+    print_sample_summary(summary, "Baseline:")
+
+    print("Inspecting Wi-Fi link quality")
+    wifi_link_quality = collect_wifi_link_quality()
+    print(
+        f"  Link inspector: {'available' if wifi_link_quality.get('available') else 'unavailable'}"
+    )
+
+    speedtest: Optional[Dict[str, Any]] = None
+    if not args.skip_speedtest:
+        print("Running M-Lab NDT7 speed test")
+        speedtest = run_ndt7_speedtest(ndt7_config_from_args(args))
+        print_ndt7_summary(speedtest)
+
+    load_samples: Optional[List[Dict[str, Any]]] = None
+    load_summary: Optional[Dict[str, Any]] = None
+    download_report: Optional[Dict[str, Any]] = None
+    if args.loaded:
+        config = BenchmarkRunConfig(
+            baseline_seconds=0.0,
+            load_seconds=args.load_seconds,
+            interval=args.interval,
+            public_target=args.public_target,
+            registry_host=args.registry_host,
+            download_url=args.download_url,
+            parallel_downloads=args.parallel_downloads,
+            download_mb=args.download_mb,
+        )
+        print(
+            "Running loaded-latency check: "
+            f"{config.parallel_downloads} stream(s), {config.download_mb} MiB each, {config.load_seconds:g}s"
+        )
+        load_samples, download_report = run_download_load(config, gateway)
+        load_summary = summarize_samples(load_samples)
+        print_sample_summary(load_summary, "During download load:")
+
+    assessment = bufferbloat_assessment(summary, load_summary)
+    if assessment.get("available"):
+        print(f"Bufferbloat: {assessment['severity']} ({assessment['recommendation']})")
+
+    status, findings = classify_speed_verification(
+        speedtest, args.min_download_mbps, args.min_upload_mbps
+    )
+    print(f"Verification status: {status}")
+    for finding in findings:
+        print(f"  - {finding}")
+
+    report: Dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "tool": {"name": APP_DISPLAY_NAME, "version": VERSION},
+        "created_utc": utc_now_iso(),
+        "platform": platform_metadata(),
+        "gateway": gateway,
+        "targets": {"public_ping": args.public_target, "registry": args.registry_host},
+        "samples": samples,
+        "summary": summary,
+        "wifi_link_quality": wifi_link_quality,
+        "speedtest": speedtest,
+        "loaded_samples": load_samples,
+        "loaded_summary": load_summary,
+        "download_load": download_report,
+        "bufferbloat": assessment,
+        "verification": {
+            "status": status,
+            "findings": findings,
+            "min_download_mbps": args.min_download_mbps,
+            "min_upload_mbps": args.min_upload_mbps,
+        },
+        "capability_matrix": capability_matrix(),
+        "optimizer_action_ledger": optimizer_action_ledger(),
+        "notes": [
+            "Verification is read-only except for report output and intentional NDT7/download test traffic.",
+            "A low NDT7 result is evidence for investigation, not permission to apply unsafe TCP or adapter folklore.",
+        ],
+    }
+    if args.redact:
+        report = redact_report_value(report)
+    destination = (
+        Path(args.output).expanduser() if args.output else report_path("verify")
+    )
+    atomic_write_json(destination, report, private_parent=not bool(args.output))
+    print(f"Report saved: {destination}")
+    if status in {"pass", "baseline-only"}:
+        return 0
+    return 1
 
 
 def command_benchmark(args: argparse.Namespace) -> int:
@@ -3972,12 +5057,19 @@ def command_benchmark(args: argparse.Namespace) -> int:
     )
     signals = compare_phases(baseline_summary, load_summary)
     observations, recommendations = classify_measurement(baseline_summary, load_summary)
+    assessment = bufferbloat_assessment(baseline_summary, load_summary)
     print("Pressure-point interpretation:")
     for signal in signals:
         print(f"  - {signal}")
     for recommendation in recommendations:
         if recommendation.get("id") == "rec-download-sqm-aqm":
-            print("  - SQM/AQM candidate: enable FQ-CoDel or CAKE at the router/WAN bottleneck.")
+            print(
+                "  - SQM/AQM candidate: enable FQ-CoDel or CAKE at the router/WAN bottleneck."
+            )
+    if assessment.get("available"):
+        print(
+            f"  - Bufferbloat assessment: {assessment['severity']} ({assessment['recommendation']})"
+        )
 
     report: Dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -3994,7 +5086,10 @@ def command_benchmark(args: argparse.Namespace) -> int:
             "parallel_downloads": config.parallel_downloads,
             "download_mb_per_worker": config.download_mb,
         },
-        "targets": {"public_ping": config.public_target, "registry": config.registry_host},
+        "targets": {
+            "public_ping": config.public_target,
+            "registry": config.registry_host,
+        },
         "baseline_samples": baseline_samples,
         "load_samples": load_samples,
         "baseline_summary": baseline_summary,
@@ -4006,9 +5101,11 @@ def command_benchmark(args: argparse.Namespace) -> int:
             "delta": counter_delta,
         },
         "interpretation": signals,
+        "bufferbloat": assessment,
         "observations": observations,
         "recommendations": recommendations,
         "capability_matrix": capability_matrix(),
+        "optimizer_action_ledger": optimizer_action_ledger(),
         "notes": [
             "This benchmark intentionally creates download traffic; reduce --download-mb or --parallel-downloads on metered links.",
             "Stable gateway with loaded public loss/jitter points toward router queue, WAN, ISP path, VPN, proxy, or target behavior.",
@@ -4019,7 +5116,9 @@ def command_benchmark(args: argparse.Namespace) -> int:
         report["platform_diagnostics"] = collect_platform_diagnostics()
     if args.redact:
         report = redact_report_value(report)
-    destination = Path(args.output).expanduser() if args.output else report_path("benchmark")
+    destination = (
+        Path(args.output).expanduser() if args.output else report_path("benchmark")
+    )
     atomic_write_json(destination, report, private_parent=not bool(args.output))
     print(f"Report saved: {destination}")
     return 0
@@ -4037,12 +5136,16 @@ def command_watch(args: argparse.Namespace) -> int:
     if command and command[0] == "--":
         command = command[1:]
     if not command:
-        raise NetStabilityError("watch requires a command after --, for example: watch -- npm install")
+        raise NetStabilityError(
+            "watch requires a command after --, for example: watch -- npm install"
+        )
 
     gateway = default_gateway()
     baseline_count = max(1, int(math.ceil(args.baseline_seconds / args.interval)))
     print(f"Default gateway: {gateway or 'not detected'}")
-    print(f"Collecting {args.baseline_seconds:g}s baseline before launching: {' '.join(command)}")
+    print(
+        f"Collecting {args.baseline_seconds:g}s baseline before launching: {' '.join(command)}"
+    )
     baseline_samples = collect_samples(
         baseline_count,
         args.interval,
@@ -4094,7 +5197,9 @@ def command_watch(args: argparse.Namespace) -> int:
 
     if not load_samples:
         load_samples.append(
-            collect_sample(gateway, args.public_target, args.registry_host, True, "load")
+            collect_sample(
+                gateway, args.public_target, args.registry_host, True, "load"
+            )
         )
     load_summary = summarize_samples(load_samples)
     print_sample_summary(load_summary, "During command:")
@@ -4129,15 +5234,12 @@ def command_watch(args: argparse.Namespace) -> int:
     }
     if args.redact:
         report = redact_report_value(report)
-    destination = Path(args.output).expanduser() if args.output else report_path("watch")
+    destination = (
+        Path(args.output).expanduser() if args.output else report_path("watch")
+    )
     atomic_write_json(destination, report, private_parent=not bool(args.output))
     print(f"Report saved: {destination}")
     return 130 if interrupted else returncode
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 
 def positive_int(value: str) -> int:
@@ -4151,6 +5253,13 @@ def positive_float(value: str) -> float:
     number = float(value)
     if number <= 0:
         raise argparse.ArgumentTypeError("must be greater than 0")
+    return number
+
+
+def non_negative_float(value: str) -> float:
+    number = float(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be at least 0")
     return number
 
 
@@ -4179,16 +5288,54 @@ def benchmark_download_url(value: str) -> str:
 
 def add_scope_options(parser: argparse.ArgumentParser) -> None:
     group = parser.add_mutually_exclusive_group()
-    group.add_argument("--system-only", action="store_true", help="change/restore only OS settings")
-    group.add_argument("--npm-only", action="store_true", help="change/restore only the npm user configuration")
+    group.add_argument(
+        "--system-only", action="store_true", help="change/restore only OS settings"
+    )
+    group.add_argument(
+        "--npm-only",
+        action="store_true",
+        help="change/restore only the npm user configuration",
+    )
 
 
 def add_probe_options(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--interval", type=positive_float, default=1.0, help="seconds between samples (default: 1)")
-    parser.add_argument("--public-target", default=DEFAULT_PUBLIC_PING_TARGET, help="public ICMP target")
-    parser.add_argument("--registry-host", default=DEFAULT_REGISTRY_HOST, help="HTTPS/DNS probe host")
+    parser.add_argument(
+        "--interval",
+        type=positive_float,
+        default=1.0,
+        help="seconds between samples (default: 1)",
+    )
+    parser.add_argument(
+        "--public-target", default=DEFAULT_PUBLIC_PING_TARGET, help="public ICMP target"
+    )
+    parser.add_argument(
+        "--registry-host", default=DEFAULT_REGISTRY_HOST, help="HTTPS/DNS probe host"
+    )
     parser.add_argument("--output", help="write JSON report to this path")
-    parser.add_argument("--redact", action="store_true", help="redact MAC addresses in the saved report")
+    parser.add_argument(
+        "--redact", action="store_true", help="redact MAC addresses in the saved report"
+    )
+
+
+def add_ndt7_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--timeout",
+        type=lambda value: bounded_positive_float(value, maximum=60.0),
+        default=14.0,
+        help="seconds allowed for each NDT7 direction (default: 14)",
+    )
+    parser.add_argument(
+        "--locate-url",
+        type=benchmark_download_url,
+        default=DEFAULT_LOCATE_URL,
+        help="M-Lab Locate API v2 URL",
+    )
+    parser.add_argument(
+        "--skip-download", action="store_true", help="skip the NDT7 download direction"
+    )
+    parser.add_argument(
+        "--skip-upload", action="store_true", help="skip the NDT7 upload direction"
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -4199,9 +5346,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     subparsers = parser.add_subparsers(dest="command_name", required=True)
 
-    audit = subparsers.add_parser("audit", help="write a read-only evidence, capability, and safety-policy report")
+    audit = subparsers.add_parser(
+        "audit", help="write a read-only evidence, capability, and safety-policy report"
+    )
     audit.add_argument("--output", help="write JSON report to this path")
-    audit.add_argument("--redact", action="store_true", help="redact identifiers in the saved report")
+    audit.add_argument(
+        "--redact", action="store_true", help="redact identifiers in the saved report"
+    )
     audit.add_argument(
         "--no-platform-diagnostics",
         dest="platform_diagnostics",
@@ -4210,8 +5361,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     audit.set_defaults(function=command_audit, platform_diagnostics=True)
 
-    diagnose = subparsers.add_parser("diagnose", help="collect idle network and adapter diagnostics")
-    diagnose.add_argument("--samples", type=positive_int, default=10, help="number of network samples (default: 10)")
+    diagnose = subparsers.add_parser(
+        "diagnose", help="collect idle network and adapter diagnostics"
+    )
+    diagnose.add_argument(
+        "--samples",
+        type=positive_int,
+        default=10,
+        help="number of network samples (default: 10)",
+    )
     diagnose.add_argument(
         "--network-quality",
         action="store_true",
@@ -4225,10 +5383,19 @@ def build_parser() -> argparse.ArgumentParser:
     add_probe_options(diagnose)
     diagnose.set_defaults(function=command_diagnose)
 
-    measure = subparsers.add_parser("measure", help="measurement-first diagnostics without applying settings")
+    measure = subparsers.add_parser(
+        "measure", help="measurement-first diagnostics without applying settings"
+    )
     measure_subparsers = measure.add_subparsers(dest="measure_name", required=True)
-    measure_idle = measure_subparsers.add_parser("idle", help="collect idle baseline samples")
-    measure_idle.add_argument("--samples", type=positive_int, default=10, help="number of network samples (default: 10)")
+    measure_idle = measure_subparsers.add_parser(
+        "idle", help="collect idle baseline samples"
+    )
+    measure_idle.add_argument(
+        "--samples",
+        type=positive_int,
+        default=10,
+        help="number of network samples (default: 10)",
+    )
     measure_idle.add_argument(
         "--network-quality",
         action="store_true",
@@ -4241,6 +5408,87 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_probe_options(measure_idle)
     measure_idle.set_defaults(function=command_measure_idle)
+
+    speedtest = subparsers.add_parser(
+        "speedtest",
+        help="run a read-only M-Lab NDT7 download/upload speed test",
+    )
+    add_ndt7_options(speedtest)
+    speedtest.add_argument("--output", help="write JSON report to this path")
+    speedtest.add_argument(
+        "--redact", action="store_true", help="redact identifiers in the saved report"
+    )
+    speedtest.set_defaults(function=command_speedtest)
+
+    link_quality = subparsers.add_parser(
+        "link-quality",
+        help="inspect current Wi-Fi signal/link-rate evidence without changing settings",
+    )
+    link_quality.add_argument("--output", help="write JSON report to this path")
+    link_quality.add_argument(
+        "--redact", action="store_true", help="redact identifiers in the saved report"
+    )
+    link_quality.set_defaults(function=command_link_quality)
+
+    verify = subparsers.add_parser(
+        "verify",
+        help="verify speed, Wi-Fi link evidence, and optional loaded-latency health",
+    )
+    verify.add_argument(
+        "--samples",
+        type=positive_int,
+        default=5,
+        help="number of idle samples (default: 5)",
+    )
+    verify.add_argument(
+        "--min-download-mbps",
+        type=non_negative_float,
+        default=15.0,
+        help="download threshold for pass/fail verification (default: 15)",
+    )
+    verify.add_argument(
+        "--min-upload-mbps",
+        type=non_negative_float,
+        default=0.0,
+        help="optional upload threshold; 0 disables upload pass/fail gating (default: 0)",
+    )
+    verify.add_argument(
+        "--skip-speedtest",
+        action="store_true",
+        help="skip NDT7 and write a baseline-only report",
+    )
+    verify.add_argument(
+        "--loaded",
+        action="store_true",
+        help="also run a bounded download-loaded latency check",
+    )
+    verify.add_argument(
+        "--load-seconds",
+        type=lambda value: bounded_positive_float(value, maximum=120.0),
+        default=10.0,
+        help="loaded check duration when --loaded is used (default: 10)",
+    )
+    verify.add_argument(
+        "--parallel-downloads",
+        type=lambda value: bounded_positive_int(value, maximum=8),
+        default=2,
+        help="loaded check parallel HTTPS streams when --loaded is used (default: 2)",
+    )
+    verify.add_argument(
+        "--download-mb",
+        type=lambda value: bounded_positive_int(value, maximum=128),
+        default=8,
+        help="loaded check MiB per stream when --loaded is used (default: 8)",
+    )
+    verify.add_argument(
+        "--download-url",
+        type=benchmark_download_url,
+        default=DEFAULT_DOWNLOAD_URL,
+        help="HTTPS URL used for optional loaded check",
+    )
+    add_probe_options(verify)
+    add_ndt7_options(verify)
+    verify.set_defaults(function=command_verify)
 
     benchmark = subparsers.add_parser(
         "benchmark",
@@ -4285,7 +5533,9 @@ def build_parser() -> argparse.ArgumentParser:
     add_probe_options(benchmark)
     benchmark.set_defaults(function=command_benchmark, platform_diagnostics=True)
 
-    watch = subparsers.add_parser("watch", help="monitor gateway/public/registry health while a command runs")
+    watch = subparsers.add_parser(
+        "watch", help="monitor gateway/public/registry health while a command runs"
+    )
     watch.add_argument(
         "--baseline-seconds",
         type=positive_float,
@@ -4293,10 +5543,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="idle baseline duration before launching the command (default: 5)",
     )
     add_probe_options(watch)
-    watch.add_argument("command", nargs=argparse.REMAINDER, help="command after --, e.g. -- npm install")
+    watch.add_argument(
+        "command",
+        nargs=argparse.REMAINDER,
+        help="command after --, e.g. -- npm install",
+    )
     watch.set_defaults(function=command_watch)
 
-    apply_parser = subparsers.add_parser("apply", help="back up current state, then apply reliability tuning")
+    apply_parser = subparsers.add_parser(
+        "apply", help="back up current state, then apply reliability tuning"
+    )
     add_scope_options(apply_parser)
     apply_parser.add_argument(
         "--include-battery",
@@ -4309,35 +5565,66 @@ def build_parser() -> argparse.ArgumentParser:
         default=4,
         help="npm connections per origin for the weak-link profile (default: 4)",
     )
-    apply_parser.add_argument("--no-restart", action="store_true", help="do not restart/reapply the Wi-Fi adapter")
-    apply_parser.add_argument("--dry-run", action="store_true", help="show intended changes only")
-    apply_parser.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    apply_parser.add_argument(
+        "--no-restart",
+        action="store_true",
+        help="do not restart/reapply the Wi-Fi adapter",
+    )
+    apply_parser.add_argument(
+        "--dry-run", action="store_true", help="show intended changes only"
+    )
+    apply_parser.add_argument(
+        "--yes", action="store_true", help="skip the confirmation prompt"
+    )
     apply_parser.set_defaults(function=command_apply)
 
-    restore = subparsers.add_parser("restore", help="restore an exact pre-change snapshot")
-    restore.add_argument("snapshot", nargs="?", default="latest", help="snapshot ID or 'latest' (default: latest)")
+    restore = subparsers.add_parser(
+        "restore", help="restore an exact pre-change snapshot"
+    )
+    restore.add_argument(
+        "snapshot",
+        nargs="?",
+        default="latest",
+        help="snapshot ID or 'latest' (default: latest)",
+    )
     add_scope_options(restore)
-    restore.add_argument("--no-restart", action="store_true", help="do not restart/reapply the Wi-Fi adapter")
-    restore.add_argument("--dry-run", action="store_true", help="show intended restore only")
-    restore.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    restore.add_argument(
+        "--no-restart",
+        action="store_true",
+        help="do not restart/reapply the Wi-Fi adapter",
+    )
+    restore.add_argument(
+        "--dry-run", action="store_true", help="show intended restore only"
+    )
+    restore.add_argument(
+        "--yes", action="store_true", help="skip the confirmation prompt"
+    )
     restore.set_defaults(function=command_restore)
 
-    listing = subparsers.add_parser("list-backups", help="list available restore snapshots")
+    listing = subparsers.add_parser(
+        "list-backups", help="list available restore snapshots"
+    )
     listing.set_defaults(function=command_list_backups)
 
     reset = subparsers.add_parser(
         "reset-network",
         help="reset TCP/IP, Winsock, and DNS to OS defaults (requires reboot)",
     )
-    reset.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    reset.add_argument(
+        "--yes", action="store_true", help="skip the confirmation prompt"
+    )
     reset.set_defaults(function=command_reset_network)
 
     repair_dns = subparsers.add_parser(
         "repair-dns",
         help="diagnose and repair platform DNS policy, cache, and resolver state",
     )
-    repair_dns.add_argument("--dry-run", action="store_true", help="show intended DNS repair only")
-    repair_dns.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    repair_dns.add_argument(
+        "--dry-run", action="store_true", help="show intended DNS repair only"
+    )
+    repair_dns.add_argument(
+        "--yes", action="store_true", help="skip the confirmation prompt"
+    )
     repair_dns.set_defaults(function=command_repair_dns)
     return parser
 

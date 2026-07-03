@@ -11,7 +11,7 @@ import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import ttk
-from typing import Final
+from typing import Final, List
 
 from net_stability_gui_commands import COMMANDS, STAGE_LABELS, STAGE_ORDER, CommandSpec
 
@@ -25,13 +25,15 @@ class NetStabilityGui:
         self.events: queue.Queue[str] = queue.Queue()
         self.stage_vars = {name: tk.StringVar(value="Waiting") for name in STAGE_ORDER}
         self.status_var = tk.StringVar(value="Ready")
+        self.buttons: List[ttk.Button] = []
         self.running = False
 
         self.root.title(APP_TITLE)
-        self.root.geometry("960x980")
+        self.root.geometry("960x920")
         self.root.minsize(720, 600)
         self._configure_style()
         self._build()
+        self.root.bind("<Control-l>", lambda _event: self.log.focus_set())
         self.root.after(120, self._drain_events)
 
     def _configure_style(self) -> None:
@@ -39,15 +41,36 @@ class NetStabilityGui:
         style = ttk.Style()
         style.theme_use("clam")
         style.configure("TFrame", background="#f6f7f9")
-        style.configure("Panel.TFrame", background="#ffffff", relief="solid", borderwidth=1)
-        style.configure("TLabel", background="#f6f7f9", foreground="#172033", font=("Segoe UI", 10))
-        style.configure("Title.TLabel", font=("Segoe UI", 24, "bold"), foreground="#172033")
+        style.configure(
+            "Panel.TFrame", background="#ffffff", relief="solid", borderwidth=1
+        )
+        style.configure(
+            "TLabel", background="#f6f7f9", foreground="#172033", font=("Segoe UI", 10)
+        )
+        style.configure(
+            "Title.TLabel", font=("Segoe UI", 24, "bold"), foreground="#172033"
+        )
         style.configure("Lead.TLabel", font=("Segoe UI", 11), foreground="#40516f")
-        style.configure("Stage.TLabel", background="#ffffff", foreground="#172033", font=("Segoe UI", 10))
-        style.configure("StageStatus.TLabel", background="#ffffff", foreground="#556987", font=("Segoe UI", 10, "bold"))
-        style.configure("Primary.TButton", font=("Segoe UI", 14, "bold"), padding=(24, 16))
-        style.configure("Danger.TButton", font=("Segoe UI", 12, "bold"), padding=(18, 14))
+        style.configure(
+            "Stage.TLabel",
+            background="#ffffff",
+            foreground="#172033",
+            font=("Segoe UI", 10),
+        )
+        style.configure(
+            "StageStatus.TLabel",
+            background="#ffffff",
+            foreground="#556987",
+            font=("Segoe UI", 10, "bold"),
+        )
+        style.configure(
+            "Primary.TButton", font=("Segoe UI", 14, "bold"), padding=(24, 16)
+        )
+        style.configure(
+            "Danger.TButton", font=("Segoe UI", 12, "bold"), padding=(18, 14)
+        )
         style.configure("TButton", font=("Segoe UI", 10), padding=(14, 8))
+        style.map("TButton", foreground=[("disabled", "#7a8798")])
 
     def _build(self) -> None:
         outer = ttk.Frame(self.root, padding=28)
@@ -71,21 +94,33 @@ class NetStabilityGui:
                 text=spec.label,
                 style="Primary.TButton",
                 command=lambda item=spec: self._start(item),
+                takefocus=True,
             )
             btn.pack(fill=tk.X, pady=(4, 4))
+            self.buttons.append(btn)
 
-        ttk.Label(outer, textvariable=self.status_var, style="Lead.TLabel").pack(anchor=tk.W, pady=(14, 12))
+        ttk.Label(outer, textvariable=self.status_var, style="Lead.TLabel").pack(
+            anchor=tk.W, pady=(14, 12)
+        )
 
         stage_panel = ttk.Frame(outer, style="Panel.TFrame", padding=14)
         stage_panel.pack(fill=tk.X, pady=(0, 14))
         for index, name in enumerate(STAGE_ORDER):
-            ttk.Label(stage_panel, text=f"{index + 1}. {STAGE_LABELS[name]}", style="Stage.TLabel").grid(
+            ttk.Label(
+                stage_panel,
+                text=f"{index + 1}. {STAGE_LABELS[name]}",
+                style="Stage.TLabel",
+            ).grid(
                 row=index,
                 column=0,
                 sticky=tk.W,
                 pady=3,
             )
-            ttk.Label(stage_panel, textvariable=self.stage_vars[name], style="StageStatus.TLabel").grid(
+            ttk.Label(
+                stage_panel,
+                textvariable=self.stage_vars[name],
+                style="StageStatus.TLabel",
+            ).grid(
                 row=index,
                 column=1,
                 sticky=tk.E,
@@ -94,9 +129,7 @@ class NetStabilityGui:
             )
         stage_panel.columnconfigure(0, weight=1)
 
-        advanced_header = ttk.Label(
-            outer, text="Advanced actions", style="Lead.TLabel"
-        )
+        advanced_header = ttk.Label(outer, text="Advanced actions", style="Lead.TLabel")
         advanced_header.pack(anchor=tk.W, pady=(0, 6))
 
         advanced = ttk.Frame(outer)
@@ -108,7 +141,11 @@ class NetStabilityGui:
             column = index % grid_cols
             style = "Danger.TButton" if "Reset" in spec.label else "TButton"
             button = ttk.Button(
-                advanced, text=spec.label, style=style, command=lambda item=spec: self._start(item)
+                advanced,
+                text=spec.label,
+                style=style,
+                command=lambda item=spec: self._start(item),
+                takefocus=True,
             )
             button.grid(
                 row=row,
@@ -117,8 +154,12 @@ class NetStabilityGui:
                 padx=(0 if column == 0 else 8, 0),
                 pady=(0 if row == 0 else 6, 0),
             )
+            self.buttons.append(button)
             advanced.columnconfigure(column, weight=1)
 
+        ttk.Label(outer, text="Command output", style="Lead.TLabel").pack(
+            anchor=tk.W, pady=(0, 6)
+        )
         log_frame = ttk.Frame(outer, style="Panel.TFrame", padding=10)
         log_frame.pack(fill=tk.BOTH, expand=True)
         self.log = tk.Text(
@@ -130,20 +171,27 @@ class NetStabilityGui:
             relief=tk.FLAT,
             wrap=tk.WORD,
             font=("Consolas", 10),
+            state=tk.DISABLED,
+            takefocus=True,
         )
         scroll = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log.yview)
         self.log.configure(yscrollcommand=scroll.set)
         self.log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        if self.buttons:
+            self.buttons[0].focus_set()
 
     def _start(self, spec: CommandSpec) -> None:
         if self.running:
             self._write_log("A task is already running.\n")
             return
         self.running = True
+        self._set_controls_state(tk.DISABLED)
         self.status_var.set(spec.description)
         self._reset_stages()
+        self.log.configure(state=tk.NORMAL)
         self.log.delete("1.0", tk.END)
+        self.log.configure(state=tk.DISABLED)
         thread = threading.Thread(target=self._run_command, args=(spec,), daemon=True)
         thread.start()
 
@@ -167,7 +215,9 @@ class NetStabilityGui:
             self.events.put(line)
             self._infer_stage(line)
         return_code = process.wait()
-        self.events.put("STAGE:done:Complete" if return_code == 0 else "STAGE:done:Needs attention")
+        self.events.put(
+            "STAGE:done:Complete" if return_code == 0 else "STAGE:done:Needs attention"
+        )
         self.events.put(f"\nFinished with exit code {return_code}.\n")
         self.events.put("DONE")
 
@@ -175,21 +225,34 @@ class NetStabilityGui:
         lowered = line.lower()
         if "evidence audit" in lowered or "capability matrix" in lowered:
             self.events.put("STAGE:audit:Running")
+        if "m-lab" in lowered or "ndt7" in lowered or "verification status" in lowered:
+            self.events.put("STAGE:audit:Running")
+        if "wi-fi link quality" in lowered or "link inspector" in lowered:
+            self.events.put("STAGE:system:Running")
         if "backup created" in lowered or "restore point" in lowered:
             self.events.put("STAGE:backup:Complete")
         if "npm " in lowered and "reset" not in lowered:
             self.events.put("STAGE:npm:Running")
-        if "wi-fi" in lowered or "networkmanager" in lowered or "adapter" in lowered or "powersave" in lowered:
+        if (
+            "wi-fi" in lowered
+            or "networkmanager" in lowered
+            or "adapter" in lowered
+            or "powersave" in lowered
+        ):
             self.events.put("STAGE:system:Running")
-        if "mtu" in lowered or "ecn" in lowered or "delivery optimization" in lowered or "qos" in lowered:
+        if "mtu" in lowered or "delivery optimization" in lowered or "qos" in lowered:
             self.events.put("STAGE:tuning:Running")
-        if "lso" in lowered or "tcp retrans" in lowered or "sysctl" in lowered or "ring buffer" in lowered:
+        if "tcp retrans" in lowered or "sysctl" in lowered or "ring buffer" in lowered:
             self.events.put("STAGE:tuning:Running")
         if "irqbalance" in lowered or "dns set" in lowered or "tcp buffer" in lowered:
             self.events.put("STAGE:tuning:Running")
         if "dns policy" in lowered or "nrpt" in lowered or "resolver" in lowered:
             self.events.put("STAGE:tuning:Running")
-        if "network stack" in lowered or "netsh int ip reset" in lowered or "winsock" in lowered:
+        if (
+            "network stack" in lowered
+            or "netsh int ip reset" in lowered
+            or "winsock" in lowered
+        ):
             self.events.put("STAGE:reset:Running")
         if "route -n flush" in lowered or "systemctl restart networkmanager" in lowered:
             self.events.put("STAGE:reset:Running")
@@ -204,6 +267,7 @@ class NetStabilityGui:
             if event == "DONE":
                 self.running = False
                 self.status_var.set("Ready")
+                self._set_controls_state(tk.NORMAL)
                 continue
             if event.startswith("STAGE:"):
                 parts = event.strip().split(":", 2)
@@ -220,8 +284,14 @@ class NetStabilityGui:
             self.stage_vars[name].set("Waiting")
 
     def _write_log(self, text: str) -> None:
+        self.log.configure(state=tk.NORMAL)
         self.log.insert(tk.END, text)
         self.log.see(tk.END)
+        self.log.configure(state=tk.DISABLED)
+
+    def _set_controls_state(self, state: str) -> None:
+        for button in self.buttons:
+            button.configure(state=state)
 
 
 def smoke_check() -> int:
@@ -229,9 +299,11 @@ def smoke_check() -> int:
         print(f"Missing CLI script: {SCRIPT_PATH}", file=sys.stderr)
         return 1
     print(f"{APP_TITLE} GUI smoke check passed on {platform.system()}.")
-    print("Primary actions: Audit evidence first, Full Optimization")
     print(
-        "Advanced actions: Repair DNS, Measure idle baseline, Benchmark pressure points, Run full diagnostics, "
+        "Primary actions: Audit evidence first, Verify speed and stability, Full Optimization"
+    )
+    print(
+        "Advanced actions: M-Lab speed test, Inspect Wi-Fi link, Repair DNS, Measure idle baseline, Benchmark pressure points, Run full diagnostics, "
         "Optimize connection, Optimize npm only, Reset Network Stack, Restore latest backup, Show backups"
     )
     return 0
@@ -239,7 +311,11 @@ def smoke_check() -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Launch the Net Stability desktop UI.")
-    parser.add_argument("--smoke", action="store_true", help="verify GUI assets without opening a window")
+    parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help="verify GUI assets without opening a window",
+    )
     args = parser.parse_args()
     if args.smoke:
         return smoke_check()

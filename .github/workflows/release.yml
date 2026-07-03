@@ -1,0 +1,101 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows
+          - os: ubuntu-latest
+            platform: linux
+          - os: macos-latest
+            platform: macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[build]"
+      - name: Build platform executables
+        env:
+          RUNNER_ARCH: ${{ runner.arch }}
+        run: python scripts/build_release.py --platform ${{ matrix.platform }}
+      - name: Package macOS disk image
+        if: runner.os == 'macOS'
+        run: |
+          cd release-artifacts
+          for dir in macos-*; do
+            ARCH="${dir#macos-}"
+            rm -rf dmg-stage
+            mkdir -p "dmg-stage/Net Stability"
+            find "$dir" -maxdepth 1 -type f \( -name "net-stability-macos-*" -o -name "net-stability-gui-macos-*" \) ! -name "*.tar.gz" -exec cp {} "dmg-stage/Net Stability/" \;
+            hdiutil create \
+              -volname "Net Stability ${ARCH}" \
+              -srcfolder "dmg-stage/Net Stability" \
+              -ov \
+              -format UDZO \
+              -o "$dir/net-stability-${{ github.event.inputs.tag || github.ref_name }}-macos-${ARCH}.dmg"
+            rm -rf dmg-stage
+          done
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: net-stability-${{ matrix.platform }}-${{ runner.os }}-${{ runner.arch }}
+          path: |
+            release-artifacts/**/*.tar.gz
+            release-artifacts/**/*.exe
+            release-artifacts/**/*.dmg
+            release-artifacts/**/net-stability-*
+            release-artifacts/**/checksums.txt
+            !release-artifacts/**/build/**
+            !release-artifacts/**/specs/**
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+      - name: Prepare release upload set
+        run: |
+          mkdir -p release-upload
+          find release-artifacts -type f \
+            ! -name checksums.txt \
+            ! -path '*/build/*' \
+            ! -path '*/specs/*' \
+            -print0 |
+          while IFS= read -r -d '' file; do
+            cp "$file" "release-upload/$(basename "$file")"
+          done
+          cd release-upload
+          sha256sum $(find . -maxdepth 1 -type f ! -name checksums.txt -printf '%P\n' | sort) > checksums.txt
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: "Net Stability ${{ github.event.inputs.tag || github.ref_name }}"
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            release-upload/*

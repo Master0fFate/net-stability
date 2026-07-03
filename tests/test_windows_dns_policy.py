@@ -100,6 +100,7 @@ class WindowsDnsPolicyTests(unittest.TestCase):
 
         # Then: the DNS policy repair button is advertised.
         self.assertEqual(result.returncode, 0, output)
+        self.assertIn("Verify speed and stability", output)
         self.assertIn("Repair DNS", output)
 
     def test_repair_dns_when_linux_dry_run_reports_platform_repair(self) -> None:

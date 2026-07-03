@@ -19,6 +19,7 @@ MAC_SENTINEL: Final = "00:11:22:aa:bb:cc"
 
 sys.path.insert(0, str(ROOT))
 import net_stability  # noqa: E402
+import net_stability_ndt7  # noqa: E402
 
 UNSAFE_ACTION_PATTERNS: Final = (
     # MTU and DNS are now paper-backed overrides (removed from denylist test)
@@ -26,7 +27,9 @@ UNSAFE_ACTION_PATTERNS: Final = (
     # re.compile(r"\b(?:replace|switch|set|change)\s+(?:the\s+)?dns\b"),
     re.compile(r"\bdisable\s+(?:global\s+)?ipv6\b"),
     re.compile(r"\b(?:tcp\s*ack|tcpackfrequency|nagle|tcpnodelay)\b"),
-    re.compile(r"\b(?:disable|turn\s+off)\s+(?:all|broad|blanket|global)\s+.*offload\b"),
+    re.compile(
+        r"\b(?:disable|turn\s+off)\s+(?:all|broad|blanket|global)\s+.*offload\b"
+    ),
     re.compile(r"\b(?:disable|turn\s+off)\s+global\s+usb\s+selective\s+suspend\b"),
     re.compile(r"\b(?:enable|disable|set|tune)\s+(?:rss|vmq)\s+.*wi-?fi\b"),
     re.compile(r"\b(?:multimedia\s+scheduler|mmcss)\b"),
@@ -63,7 +66,12 @@ def unavailable_summary():
 
 def loaded_loss_summary():
     return {
-        "gateway_ping": {"available": True, "loss_percent": 0.0, "median_ms": 2.0, "p95_ms": 4.0},
+        "gateway_ping": {
+            "available": True,
+            "loss_percent": 0.0,
+            "median_ms": 2.0,
+            "p95_ms": 4.0,
+        },
         "public_ping": {
             "available": True,
             "loss_percent": 10.5,
@@ -97,12 +105,22 @@ class CliGuardrailTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 assert_no_unsafe_actions(self, result.stdout + result.stderr)
 
-    def test_apply_dry_run_when_planning_changes_does_not_expose_unsafe_actions(self) -> None:
+    def test_apply_dry_run_when_planning_changes_does_not_expose_unsafe_actions(
+        self,
+    ) -> None:
         # Given: dry-run apply scopes that should be non-destructive.
         scenarios = (
             ("npm-only", ("apply", "--dry-run", "--npm-only"), "Linux"),
-            ("windows-system", ("apply", "--dry-run", "--system-only", "--no-restart"), "Windows"),
-            ("linux-system", ("apply", "--dry-run", "--system-only", "--no-restart"), "Linux"),
+            (
+                "windows-system",
+                ("apply", "--dry-run", "--system-only", "--no-restart"),
+                "Windows",
+            ),
+            (
+                "linux-system",
+                ("apply", "--dry-run", "--system-only", "--no-restart"),
+                "Linux",
+            ),
         )
 
         for name, argv, platform_name in scenarios:
@@ -113,10 +131,14 @@ class CliGuardrailTests(unittest.TestCase):
                 # When: the dry-run path is executed without writing settings.
                 with contextlib.ExitStack() as stack:
                     stack.enter_context(
-                        mock.patch("net_stability.platform.system", return_value=platform_name)
+                        mock.patch(
+                            "net_stability.platform.system", return_value=platform_name
+                        )
                     )
                     stack.enter_context(
-                        mock.patch("net_stability.validate_apply_context", return_value=None)
+                        mock.patch(
+                            "net_stability.validate_apply_context", return_value=None
+                        )
                     )
                     stack.enter_context(contextlib.redirect_stdout(stdout))
                     stack.enter_context(contextlib.redirect_stderr(stderr))
@@ -131,27 +153,41 @@ class CliGuardrailTests(unittest.TestCase):
                 )
                 assert_no_unsafe_actions(self, planned_lines)
 
-    def test_windows_system_plan_when_dry_run_repairs_restricted_tcp_autotuning(self) -> None:
+    def test_windows_system_plan_when_dry_run_repairs_restricted_tcp_autotuning(
+        self,
+    ) -> None:
         # Given: Windows system tuning is rendered without writing settings.
         stdout = io.StringIO()
         stderr = io.StringIO()
 
         # When: the dry-run plan is generated for Windows.
         with contextlib.ExitStack() as stack:
-            stack.enter_context(mock.patch("net_stability.platform.system", return_value="Windows"))
-            stack.enter_context(mock.patch("net_stability.validate_apply_context", return_value=None))
+            stack.enter_context(
+                mock.patch("net_stability.platform.system", return_value="Windows")
+            )
+            stack.enter_context(
+                mock.patch("net_stability.validate_apply_context", return_value=None)
+            )
             stack.enter_context(contextlib.redirect_stdout(stdout))
             stack.enter_context(contextlib.redirect_stderr(stderr))
-            return_code = net_stability.main(("apply", "--dry-run", "--system-only", "--no-restart"))
+            return_code = net_stability.main(
+                ("apply", "--dry-run", "--system-only", "--no-restart")
+            )
 
         # Then: the system plan includes repair of receive-window autotuning.
         self.assertEqual(return_code, 0, stderr.getvalue())
         output = stdout.getvalue()
-        self.assertIn("Restore Windows TCP receive-window auto-tuning to normal", output)
-        planned_lines = "\n".join(line for line in output.splitlines() if line.startswith("  - "))
+        self.assertIn(
+            "Restore Windows TCP receive-window auto-tuning to normal", output
+        )
+        planned_lines = "\n".join(
+            line for line in output.splitlines() if line.startswith("  - ")
+        )
         assert_no_unsafe_actions(self, planned_lines)
 
-    def test_windows_tcp_state_when_autotuning_disabled_marks_repair_needed(self) -> None:
+    def test_windows_tcp_state_when_autotuning_disabled_marks_repair_needed(
+        self,
+    ) -> None:
         # Given: netsh reports the local throughput-hostile state seen on this machine.
         result = net_stability.CommandResult(
             ["netsh", "interface", "tcp", "show", "global"],
@@ -169,16 +205,28 @@ class CliGuardrailTests(unittest.TestCase):
         self.assertEqual(state["receive_window_autotuning"], "disabled")
         self.assertTrue(net_stability.windows_tcp_autotuning_needs_repair(state))
 
-    def test_list_backups_when_manifest_is_unreadable_reports_invalid_entry(self) -> None:
+    def test_list_backups_when_manifest_is_unreadable_reports_invalid_entry(
+        self,
+    ) -> None:
         # Given: an elevated snapshot directory that the current user cannot read.
         stdout = io.StringIO()
         blocked = Path("blocked-snapshot")
 
         # When: list-backups renders the available snapshot table.
         with contextlib.ExitStack() as stack:
-            stack.enter_context(mock.patch("net_stability.snapshot_directories", return_value=[blocked]))
-            stack.enter_context(mock.patch("net_stability.backups_root", return_value=Path("backup-root")))
-            stack.enter_context(mock.patch("net_stability.load_json", side_effect=PermissionError("denied")))
+            stack.enter_context(
+                mock.patch("net_stability.snapshot_directories", return_value=[blocked])
+            )
+            stack.enter_context(
+                mock.patch(
+                    "net_stability.backups_root", return_value=Path("backup-root")
+                )
+            )
+            stack.enter_context(
+                mock.patch(
+                    "net_stability.load_json", side_effect=PermissionError("denied")
+                )
+            )
             stack.enter_context(contextlib.redirect_stdout(stdout))
             return_code = net_stability.command_list_backups(mock.Mock())
 
@@ -187,7 +235,9 @@ class CliGuardrailTests(unittest.TestCase):
         self.assertIn("blocked-snapshot", stdout.getvalue())
         self.assertIn("invalid", stdout.getvalue())
 
-    def test_benchmark_help_when_inputs_are_excessive_rejects_before_network_use(self) -> None:
+    def test_benchmark_help_when_inputs_are_excessive_rejects_before_network_use(
+        self,
+    ) -> None:
         # Given: benchmark options that would create excessive local traffic or leak URL credentials.
         scenarios = (
             ("--parallel-downloads", "17"),
@@ -205,7 +255,118 @@ class CliGuardrailTests(unittest.TestCase):
 
 
 class ReportGuardrailTests(unittest.TestCase):
-    def test_redacted_diagnose_report_when_generated_removes_mac_and_token_like_values(self) -> None:
+    def test_ndt7_targets_when_locate_v2_response_extracts_wss_urls_without_tokens(
+        self,
+    ) -> None:
+        # Given: the Locate API v2 response shape with complete tokenized service URLs.
+        payload = {
+            "results": [
+                {
+                    "machine": "mlab1.example.net",
+                    "location": {"city": "Testville", "country": "US"},
+                    "urls": {
+                        "wss:///ndt/v7/download": "wss://mlab1.example.net/ndt/v7/download?access_token=secret",
+                        "wss:///ndt/v7/upload": "wss://mlab1.example.net/ndt/v7/upload?access_token=secret",
+                    },
+                }
+            ]
+        }
+
+        # When: StableNet extracts usable NDT7 targets.
+        targets = net_stability_ndt7.extract_ndt7_targets(payload)
+
+        # Then: both directions are available internally, and report URLs can be stripped safely.
+        self.assertEqual(targets[0]["machine"], "mlab1.example.net")
+        self.assertIn("access_token=secret", targets[0]["download_url"])
+        self.assertEqual(
+            net_stability_ndt7.public_url(targets[0]["download_url"]),
+            "wss://mlab1.example.net/ndt/v7/download",
+        )
+
+    def test_verify_when_download_is_below_threshold_marks_report_degraded(
+        self,
+    ) -> None:
+        # Given: a deterministic M-Lab result matching the user's "near 10 Mbps is bad" case.
+        speedtest = {
+            "available": True,
+            "protocol": "ndt7",
+            "locate": {"targets": [{"machine": "mlab1.example.net"}]},
+            "download": {
+                "success": True,
+                "throughput_mbps": 10.0,
+                "bytes": 1_000_000,
+                "duration_ms": 800.0,
+            },
+            "upload": None,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "verify.json"
+
+            # When: verify runs through the public parser with all network surfaces mocked.
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(
+                    mock.patch(
+                        "net_stability.default_gateway", return_value="192.168.1.1"
+                    )
+                )
+                stack.enter_context(
+                    mock.patch(
+                        "net_stability.collect_samples",
+                        return_value=[{"phase": "verify_idle"}],
+                    )
+                )
+                stack.enter_context(
+                    mock.patch(
+                        "net_stability.summarize_samples",
+                        return_value=unavailable_summary(),
+                    )
+                )
+                stack.enter_context(
+                    mock.patch(
+                        "net_stability.collect_wifi_link_quality",
+                        return_value={
+                            "available": True,
+                            "platform": "test",
+                            "mutation": "none",
+                        },
+                    )
+                )
+                stack.enter_context(
+                    mock.patch(
+                        "net_stability.run_ndt7_speedtest", return_value=speedtest
+                    )
+                )
+                stack.enter_context(
+                    mock.patch(
+                        "net_stability.platform_metadata",
+                        return_value={"system": "test"},
+                    )
+                )
+                return_code = net_stability.main(
+                    (
+                        "verify",
+                        "--samples",
+                        "1",
+                        "--skip-upload",
+                        "--min-download-mbps",
+                        "15",
+                        "--output",
+                        str(output),
+                    )
+                )
+
+            # Then: the command exits nonzero and the report explains the failing threshold.
+            self.assertEqual(return_code, 1)
+            report = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(report["verification"]["status"], "degraded")
+            self.assertIn(
+                "below 15 Mbps threshold", report["verification"]["findings"][0]
+            )
+
+    def test_redacted_diagnose_report_when_generated_removes_mac_and_token_like_values(
+        self,
+    ) -> None:
         # Given: generated report inputs containing share-unsafe identifiers.
         sample = {
             "phase": "idle",
@@ -218,28 +379,43 @@ class ReportGuardrailTests(unittest.TestCase):
 
             # When: diagnose writes a redacted report through the public CLI path.
             with contextlib.ExitStack() as stack:
-                stack.enter_context(mock.patch("net_stability.default_gateway", return_value=None))
-                stack.enter_context(mock.patch("net_stability.collect_samples", return_value=[sample]))
                 stack.enter_context(
-                    mock.patch("net_stability.summarize_samples", return_value=unavailable_summary())
+                    mock.patch("net_stability.default_gateway", return_value=None)
+                )
+                stack.enter_context(
+                    mock.patch("net_stability.collect_samples", return_value=[sample])
                 )
                 stack.enter_context(
                     mock.patch(
-                    "net_stability.platform_metadata",
-                    return_value={"adapter": MAC_SENTINEL, "credential": TOKEN_SENTINEL},
+                        "net_stability.summarize_samples",
+                        return_value=unavailable_summary(),
                     )
                 )
                 stack.enter_context(
                     mock.patch(
-                    "net_stability.collect_platform_diagnostics",
-                    return_value={"raw": f"{MAC_SENTINEL} {TOKEN_SENTINEL}"},
+                        "net_stability.platform_metadata",
+                        return_value={
+                            "adapter": MAC_SENTINEL,
+                            "credential": TOKEN_SENTINEL,
+                        },
                     )
                 )
                 stack.enter_context(
-                    mock.patch("net_stability.maybe_run_network_quality", return_value=None)
+                    mock.patch(
+                        "net_stability.collect_platform_diagnostics",
+                        return_value={"raw": f"{MAC_SENTINEL} {TOKEN_SENTINEL}"},
+                    )
                 )
                 stack.enter_context(
-                    mock.patch("net_stability.maybe_generate_windows_wlan_report", return_value=None)
+                    mock.patch(
+                        "net_stability.maybe_run_network_quality", return_value=None
+                    )
+                )
+                stack.enter_context(
+                    mock.patch(
+                        "net_stability.maybe_generate_windows_wlan_report",
+                        return_value=None,
+                    )
                 )
                 return_code = net_stability.main(
                     ("diagnose", "--samples", "1", "--redact", "--output", str(output))
@@ -253,7 +429,9 @@ class ReportGuardrailTests(unittest.TestCase):
             report = json.loads(report_text)
             self.assertEqual(report["samples"][0]["adapter"], "<redacted-mac>")
 
-    def test_watch_when_child_exits_preserves_exact_return_code_without_network(self) -> None:
+    def test_watch_when_child_exits_preserves_exact_return_code_without_network(
+        self,
+    ) -> None:
         # Given: command monitoring with all network probes replaced by deterministic samples.
         with tempfile.TemporaryDirectory() as temp_dir:
             output = Path(temp_dir) / "watch.json"
@@ -261,21 +439,37 @@ class ReportGuardrailTests(unittest.TestCase):
 
             # When: the monitored child exits with a distinctive status.
             with contextlib.ExitStack() as stack:
-                stack.enter_context(mock.patch("net_stability.default_gateway", return_value=None))
                 stack.enter_context(
-                    mock.patch("net_stability.collect_samples", return_value=[{"phase": "baseline"}])
+                    mock.patch("net_stability.default_gateway", return_value=None)
                 )
                 stack.enter_context(
-                    mock.patch("net_stability.collect_sample", return_value={"phase": "load"})
+                    mock.patch(
+                        "net_stability.collect_samples",
+                        return_value=[{"phase": "baseline"}],
+                    )
                 )
                 stack.enter_context(
-                    mock.patch("net_stability.summarize_samples", return_value=unavailable_summary())
+                    mock.patch(
+                        "net_stability.collect_sample", return_value={"phase": "load"}
+                    )
                 )
                 stack.enter_context(
-                    mock.patch("net_stability.compare_phases", return_value=["deterministic child"])
+                    mock.patch(
+                        "net_stability.summarize_samples",
+                        return_value=unavailable_summary(),
+                    )
                 )
                 stack.enter_context(
-                    mock.patch("net_stability.platform_metadata", return_value={"system": "test"})
+                    mock.patch(
+                        "net_stability.compare_phases",
+                        return_value=["deterministic child"],
+                    )
+                )
+                stack.enter_context(
+                    mock.patch(
+                        "net_stability.platform_metadata",
+                        return_value={"system": "test"},
+                    )
                 )
                 return_code = net_stability.main(
                     (
@@ -310,11 +504,18 @@ class ReportGuardrailTests(unittest.TestCase):
         self.assertEqual(summary["jitter_avg_ms"], 14.333)
         self.assertEqual(summary["jitter_max_ms"], 16.0)
 
-    def test_pressure_classification_when_download_loss_spares_gateway_recommends_sqm(self) -> None:
+    def test_pressure_classification_when_download_loss_spares_gateway_recommends_sqm(
+        self,
+    ) -> None:
         # Given: download load shows the user's symptom: remote loss and jitter, stable gateway.
         baseline = {
             "gateway_ping": {"available": True, "loss_percent": 0.0, "median_ms": 2.0},
-            "public_ping": {"available": True, "loss_percent": 0.0, "median_ms": 25.0, "p95_ms": 30.0},
+            "public_ping": {
+                "available": True,
+                "loss_percent": 0.0,
+                "median_ms": 25.0,
+                "p95_ms": 30.0,
+            },
             "dns": {"available": True, "failure_percent": 0.0},
             "registry_https": {"available": True, "failure_percent": 0.0},
         }
@@ -326,7 +527,9 @@ class ReportGuardrailTests(unittest.TestCase):
         )
 
         # Then: the report points at router/WAN queue pressure instead of DNS tweaks.
-        self.assertIn("obs-download_loaded_loss_or_jitter", {item["id"] for item in observations})
+        self.assertIn(
+            "obs-download_loaded_loss_or_jitter", {item["id"] for item in observations}
+        )
         self.assertIn("rec-download-sqm-aqm", {item["id"] for item in recommendations})
 
     def test_benchmark_when_mocked_writes_loaded_report(self) -> None:
@@ -336,12 +539,22 @@ class ReportGuardrailTests(unittest.TestCase):
 
             # When: the benchmark command is driven through the real CLI parser.
             with contextlib.ExitStack() as stack:
-                stack.enter_context(mock.patch("net_stability.default_gateway", return_value="192.168.1.1"))
                 stack.enter_context(
-                    mock.patch("net_stability.collect_samples", return_value=[{"phase": "baseline"}])
+                    mock.patch(
+                        "net_stability.default_gateway", return_value="192.168.1.1"
+                    )
                 )
                 stack.enter_context(
-                    mock.patch("net_stability.summarize_samples", side_effect=[unavailable_summary(), loaded_loss_summary()])
+                    mock.patch(
+                        "net_stability.collect_samples",
+                        return_value=[{"phase": "baseline"}],
+                    )
+                )
+                stack.enter_context(
+                    mock.patch(
+                        "net_stability.summarize_samples",
+                        side_effect=[unavailable_summary(), loaded_loss_summary()],
+                    )
                 )
                 stack.enter_context(
                     mock.patch(
@@ -360,8 +573,15 @@ class ReportGuardrailTests(unittest.TestCase):
                         ),
                     )
                 )
-                stack.enter_context(mock.patch("net_stability.adapter_counter_state", return_value=None))
-                stack.enter_context(mock.patch("net_stability.platform_metadata", return_value={"system": "test"}))
+                stack.enter_context(
+                    mock.patch("net_stability.adapter_counter_state", return_value=None)
+                )
+                stack.enter_context(
+                    mock.patch(
+                        "net_stability.platform_metadata",
+                        return_value={"system": "test"},
+                    )
+                )
                 return_code = net_stability.main(
                     (
                         "benchmark",
@@ -384,8 +604,13 @@ class ReportGuardrailTests(unittest.TestCase):
             self.assertEqual(return_code, 0)
             report = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual(report["benchmark"]["direction"], "download")
-            self.assertEqual(report["load_summary"]["public_ping"]["jitter_avg_ms"], 16.0)
-            self.assertIn("rec-download-sqm-aqm", {item["id"] for item in report["recommendations"]})
+            self.assertEqual(
+                report["load_summary"]["public_ping"]["jitter_avg_ms"], 16.0
+            )
+            self.assertIn(
+                "rec-download-sqm-aqm",
+                {item["id"] for item in report["recommendations"]},
+            )
 
 
 if __name__ == "__main__":
