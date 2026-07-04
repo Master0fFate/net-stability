@@ -3029,6 +3029,8 @@ def parse_windows_wlan_interfaces(output: str) -> List[Dict[str, str]]:
         "state",
         "ssid",
         "bssid",
+        "radio_type",
+        "channel",
         "signal",
         "receive_rate_(mbps)",
         "transmit_rate_(mbps)",
@@ -3053,11 +3055,93 @@ def parse_windows_wlan_interfaces(output: str) -> List[Dict[str, str]]:
     return [item for item in interfaces if useful_keys.intersection(item)]
 
 
+def _first_number(value: Any) -> Optional[float]:
+    match = re.search(r"-?\d+(?:[.,]\d+)?", str(value or ""))
+    if not match:
+        return None
+    try:
+        return float(match.group(0).replace(",", "."))
+    except ValueError:
+        return None
+
+
+def wifi_link_recommendations(quality: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    recommendations: List[Dict[str, Any]] = []
+    if quality.get("platform") != "Windows":
+        return recommendations
+    interfaces = quality.get("interfaces", [])
+    if not isinstance(interfaces, list):
+        return recommendations
+    for item in interfaces:
+        if not isinstance(item, Mapping):
+            continue
+        name = str(item.get("name") or "Wi-Fi")
+        radio = str(item.get("radio_type") or "").lower()
+        channel = _first_number(item.get("channel"))
+        signal = _first_number(item.get("signal"))
+        if (
+            channel is not None
+            and 1 <= channel <= 14
+            and int(channel)
+            not in {
+                1,
+                6,
+                11,
+            }
+        ):
+            recommendations.append(
+                {
+                    "id": "two_four_ghz_overlap_channel",
+                    "severity": "medium",
+                    "interface": name,
+                    "evidence": {
+                        "radio_type": item.get("radio_type"),
+                        "channel": int(channel),
+                        "signal": item.get("signal"),
+                    },
+                    "detail": (
+                        f"{name} is on 2.4 GHz channel {int(channel)}, which overlaps "
+                        "the standard 1/6/11 channel plan and can reduce throughput under contention."
+                    ),
+                    "action": (
+                        "Change the router or access point 2.4 GHz channel to the least busy "
+                        "of 1, 6, or 11, or use a 5 GHz SSID if the adapter/router path supports it."
+                    ),
+                    "mutation": "router-side advisory only",
+                }
+            )
+        if ("802.11n" in radio or (channel is not None and channel <= 14)) and (
+            signal is not None and signal < 70
+        ):
+            recommendations.append(
+                {
+                    "id": "marginal_two_four_ghz_signal",
+                    "severity": "medium",
+                    "interface": name,
+                    "evidence": {
+                        "radio_type": item.get("radio_type"),
+                        "channel": item.get("channel"),
+                        "signal": item.get("signal"),
+                    },
+                    "detail": (
+                        f"{name} signal is {signal:g}%; this is usable but marginal for "
+                        "stable 18+ Mbps downloads on 2.4 GHz under load."
+                    ),
+                    "action": (
+                        "Improve adapter placement, reduce obstruction, or test a short USB extension "
+                        "to move the nano adapter away from the PC chassis."
+                    ),
+                    "mutation": "physical-placement advisory only",
+                }
+            )
+    return recommendations
+
+
 def collect_wifi_link_quality() -> Dict[str, Any]:
     system = platform.system()
     if system == "Windows":
         result = run_command(["netsh", "wlan", "show", "interfaces"], timeout=15)
-        return {
+        quality = {
             "available": result.ok,
             "platform": "Windows",
             "source": "netsh wlan show interfaces",
@@ -3067,6 +3151,8 @@ def collect_wifi_link_quality() -> Dict[str, Any]:
             "raw": result.to_report(limit=40_000),
             "mutation": "none",
         }
+        quality["recommendations"] = wifi_link_recommendations(quality)
+        return quality
     if system == "Linux":
         reports: Dict[str, Any] = {}
         if shutil.which("nmcli"):
@@ -5134,9 +5220,21 @@ def command_link_quality(args: argparse.Namespace) -> int:
             print(
                 "  - "
                 f"{item.get('name', 'Wi-Fi')}: state={item.get('state', 'unknown')}, "
+                f"radio={item.get('radio_type', 'unknown')}, "
+                f"channel={item.get('channel', 'unknown')}, "
                 f"signal={item.get('signal', 'unknown')}, "
                 f"receive={item.get('receive_rate_mbps', item.get('receive_rate_(mbps)', 'unknown'))} Mbps, "
                 f"transmit={item.get('transmit_rate_mbps', item.get('transmit_rate_(mbps)', 'unknown'))} Mbps"
+            )
+    recommendations = quality.get("recommendations", [])
+    if isinstance(recommendations, list) and recommendations:
+        print("  Recommendations:")
+        for recommendation in recommendations:
+            if not isinstance(recommendation, dict):
+                continue
+            print(f"  - {recommendation.get('detail', 'Inspect Wi-Fi link evidence')}")
+            print(
+                f"    Action: {recommendation.get('action', 'Review router or placement')}"
             )
     report: Dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,

@@ -205,6 +205,40 @@ class CliGuardrailTests(unittest.TestCase):
         self.assertEqual(state["receive_window_autotuning"], "disabled")
         self.assertTrue(net_stability.windows_tcp_autotuning_needs_repair(state))
 
+    def test_windows_wlan_channel_evidence_recommends_router_side_fix(self) -> None:
+        # Given: the 2.4 GHz link shape observed on the local TP-Link adapter.
+        output = """
+There is 1 interface on the system:
+
+    Name                   : Wi-Fi 2
+    Description            : TP-Link Wireless Nano USB Adapter
+    State                  : connected
+    SSID                   : p00dy2GHz
+    Radio type             : 802.11n
+    Channel                : 5
+    Receive rate (Mbps)    : 120
+    Transmit rate (Mbps)   : 120
+    Signal                 : 68%
+"""
+
+        # When: StableNet parses the link and builds read-only recommendations.
+        interfaces = net_stability.parse_windows_wlan_interfaces(output)
+        quality = {
+            "available": True,
+            "platform": "Windows",
+            "interfaces": interfaces,
+        }
+        recommendations = net_stability.wifi_link_recommendations(quality)
+
+        # Then: channel/radio evidence is preserved and the fix stays router/placement-side.
+        self.assertEqual(interfaces[0]["radio_type"], "802.11n")
+        self.assertEqual(interfaces[0]["channel"], "5")
+        recommendation_ids = {item["id"] for item in recommendations}
+        self.assertIn("two_four_ghz_overlap_channel", recommendation_ids)
+        self.assertIn("marginal_two_four_ghz_signal", recommendation_ids)
+        for item in recommendations:
+            self.assertEqual(item["mutation"].endswith("advisory only"), True)
+
     def test_windows_power_state_when_usb_suspend_enabled_reports_usb_state(
         self,
     ) -> None:
