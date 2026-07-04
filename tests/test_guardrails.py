@@ -205,6 +205,140 @@ class CliGuardrailTests(unittest.TestCase):
         self.assertEqual(state["receive_window_autotuning"], "disabled")
         self.assertTrue(net_stability.windows_tcp_autotuning_needs_repair(state))
 
+    def test_windows_power_state_when_usb_suspend_enabled_reports_usb_state(
+        self,
+    ) -> None:
+        # Given: Windows reports an active scheme, stable Wi-Fi policy, and enabled USB selective suspend.
+        def fake_run_command(
+            args: tuple[str, ...] | list[str],
+            **_kwargs: object,
+        ) -> net_stability.CommandResult:
+            command = list(args)
+            if command[:2] == ["powercfg", "/getactivescheme"]:
+                return net_stability.CommandResult(
+                    command,
+                    0,
+                    "Power Scheme GUID: 11111111-2222-3333-4444-555555555555  (Core)",
+                    "",
+                    1.0,
+                )
+            if command[:3] == [
+                "powercfg",
+                "/query",
+                "11111111-2222-3333-4444-555555555555",
+            ] and command[3] in {"SUB_WIFI", net_stability.WINDOWS_WIFI_SUBGROUP_GUID}:
+                return net_stability.CommandResult(
+                    command,
+                    0,
+                    "Current AC Power Setting Index: 0x00000000\n"
+                    "Current DC Power Setting Index: 0x00000000\n",
+                    "",
+                    1.0,
+                )
+            if command[-2:] == [
+                net_stability.WINDOWS_USB_SUBGROUP_GUID,
+                net_stability.WINDOWS_USB_SELECTIVE_SUSPEND_GUID,
+            ]:
+                return net_stability.CommandResult(
+                    command,
+                    0,
+                    "Current AC Power Setting Index: 0x00000001\n"
+                    "Current DC Power Setting Index: 0x00000001\n",
+                    "",
+                    1.0,
+                )
+            self.fail(f"unexpected command: {command}")
+
+        # When: the Windows power state is captured.
+        with mock.patch("net_stability.run_command", side_effect=fake_run_command):
+            state = net_stability.windows_power_state()
+
+        # Then: USB selective suspend is exposed separately from the Wi-Fi policy.
+        self.assertTrue(state["available"])
+        self.assertEqual(state["ac_value"], 0)
+        self.assertEqual(state["dc_value"], 0)
+        self.assertEqual(state["usb_selective_suspend"]["ac_value"], 1)
+        self.assertEqual(state["usb_selective_suspend"]["dc_value"], 1)
+
+    def test_apply_windows_system_repairs_usb_wifi_power_paths(self) -> None:
+        # Given: a USB Wi-Fi adapter has the exact power states seen on the failing machine.
+        manifest = {
+            "state": {
+                "system": {
+                    "tcp_global": {
+                        "available": True,
+                        "receive_window_autotuning": "normal",
+                    },
+                    "power": {
+                        "available": True,
+                        "scheme_guid": "11111111-2222-3333-4444-555555555555",
+                        "ac_value": 0,
+                        "dc_value": 0,
+                        "usb_selective_suspend": {
+                            "available": True,
+                            "scheme_guid": "11111111-2222-3333-4444-555555555555",
+                            "ac_value": 1,
+                            "dc_value": 1,
+                        },
+                    },
+                    "wifi_adapters": {
+                        "available": True,
+                        "adapters": [
+                            {
+                                "Name": "Wi-Fi 2",
+                                "InterfaceDescription": "TP-Link Wireless Nano USB Adapter",
+                                "InterfaceGuid": "{aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee}",
+                                "PnPDeviceID": "USB\\VID_2357&PID_011E\\00E04C000001",
+                                "DevicePowerManagementEnabled": True,
+                                "SelectiveSuspend": None,
+                                "DeviceSleepOnDisconnect": None,
+                            }
+                        ],
+                    },
+                }
+            },
+            "applied": {"system": []},
+        }
+        ok = net_stability.CommandResult(["ok"], 0, "{}", "", 1.0)
+
+        # When: Windows system tuning is applied in battery-inclusive mode.
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch("net_stability.atomic_write_json"))
+            stack.enter_context(
+                mock.patch(
+                    "net_stability.windows_set_power_value",
+                    return_value=[ok, ok, ok],
+                )
+            )
+            usb_suspend = stack.enter_context(
+                mock.patch(
+                    "net_stability.windows_set_usb_selective_suspend",
+                    return_value=[ok, ok, ok],
+                )
+            )
+            device_power = stack.enter_context(
+                mock.patch(
+                    "net_stability.windows_set_device_power_management",
+                    return_value=ok,
+                )
+            )
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            net_stability.apply_windows_system(
+                manifest,
+                Path("manifest.json"),
+                include_battery=True,
+                restart=False,
+            )
+
+        # Then: both USB-specific repairs are recorded for restore.
+        usb_suspend.assert_called_once_with(
+            "11111111-2222-3333-4444-555555555555", 0, 0
+        )
+        device_power.assert_called_once()
+        applied_types = {item["type"] for item in manifest["applied"]["system"]}
+        self.assertIn("windows_usb_selective_suspend", applied_types)
+        self.assertIn("windows_usb_device_power", applied_types)
+
     def test_list_backups_when_manifest_is_unreadable_reports_invalid_entry(
         self,
     ) -> None:

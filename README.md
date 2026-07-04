@@ -8,7 +8,7 @@
 Net Stability is a small, reversible network reliability helper for weak Wi-Fi links and flaky `npm install` runs. It diagnoses the likely failure layer first, verifies speed with M-Lab NDT7 when requested, applies conservative evidence-backed tuning, and restores exact backups.
 
 It includes a simple desktop UI with three primary paths: **Audit evidence first** for read-only diagnostics, **Verify speed and stability** for the M-Lab speed gate plus Wi-Fi link inspection, and **Full Optimization** to apply every supported OS and npm tuning tweak in one shot.
-It also includes a cross-platform **Repair DNS** action: Windows keeps the deeper DNS policy repair for corrupted NRPT state, while Linux and macOS use platform-native DNS cache and resolver repair.
+It also includes a cross-platform **Repair DNS** action: Windows keeps the deeper DNS policy repair for corrupted NRPT state, while Linux and macOS use platform-native DNS cache and resolver repair. On Windows USB Wi-Fi adapters, system optimization now records and repairs the active power-plan USB suspend path that can leave a reconnected adapter stuck in a no-internet state.
 
 ---
 
@@ -19,7 +19,7 @@ It also includes a cross-platform **Repair DNS** action: Windows keeps the deepe
 - Runs a read-only M-Lab NDT7 application speed test through the Locate API v2 and stores reports without access tokens.
 - Inspects Wi-Fi link evidence from documented OS surfaces: Windows `netsh wlan`, Linux `nmcli`/`iw`, and macOS `networksetup`/`system_profiler`.
 - Runs a read-only pressure-point benchmark with idle baseline probes, bounded HTTPS download load, packet loss, jitter, DNS, HTTPS, throughput, and adapter counter evidence.
-- **Windows**: Restores restricted TCP receive-window auto-tuning, adjusts Wi-Fi power policy and adapter power properties, sets MTU to 1500, disables Delivery Optimization P2P sharing, sets QoS reservable bandwidth to 0%, and tunes TCP retransmission registry values.
+- **Windows**: Restores restricted TCP receive-window auto-tuning, adjusts Wi-Fi power policy, disables active-plan USB suspend for detected USB Wi-Fi adapters, repairs exact USB adapter power-management flags when Windows exposes them, sets MTU to 1500, disables Delivery Optimization P2P sharing, sets QoS reservable bandwidth to 0%, and tunes TCP retransmission registry values.
 - **Windows DNS policy**: Diagnoses NRPT corruption, DNS Client timeout events, and invalid resolver entries; repairs only invalid DNS server assignments and flushes the DNS cache, without deleting VPN or NRPT rules automatically.
 - **Linux DNS repair**: Flushes the resolver cache when supported and repairs DNS servers to the stable 1.1.1.1 / 1.0.0.1 profile when the current resolver state is missing or invalid.
 - **macOS DNS repair**: Flushes DNS and mDNS responder caches and repairs DNS servers to the stable 1.1.1.1 / 1.0.0.1 profile when needed.
@@ -189,6 +189,8 @@ System tuning requires an Administrator terminal. User-level npm tuning does not
 The tool applies these Windows-specific optimizations:
 - TCP receive-window auto-tuning set to `normal` (repairs restricted/disabled states)
 - Wi-Fi power policy set to Maximum Performance
+- Active power-plan USB selective suspend disabled when a physical USB Wi-Fi adapter is detected
+- Exact USB Wi-Fi device power-management flag disabled when Windows exposes `MSPower_DeviceEnable`
 - NDIS SelectiveSuspend and DeviceSleepOnDisconnect disabled on Wi-Fi adapters
 - MTU set to 1500 on Wi-Fi interfaces
 - Delivery Optimization P2P sharing disabled via registry
@@ -290,8 +292,8 @@ Built outputs appear in `release-artifacts/<platform>-<arch>/`:
 To publish release assets through GitHub, tag and push the release version:
 
 ```bash
-git tag v1.1.0
-git push origin v1.1.0
+git tag v1.2.0
+git push origin v1.2.0
 ```
 
 The GitHub Actions workflow in `.github/workflows/release.yml` builds Windows, Linux, and macOS artifacts from tags (or via workflow dispatch), creates a combined `checksums.txt`, and uploads `.exe`, extensionless Unix executables, `.tar.gz`, and macOS `.dmg` outputs to the release.
@@ -328,7 +330,7 @@ Net Stability is intentionally conservative:
 - Router queue management is advisory only; a PC-side utility cannot directly fix queues inside an ISP modem or router.
 - Some previously-denylisted tweaks (MTU, DNS, BBR, QoS) are now applied with **evidence-backed safe values** from the research paper. The `audit` command clearly lists which folklore tweaks are still denied and which are overridden with paper-backed justification.
 - The `reset-network` command is intentionally kept separate from `apply` because it is a destructive operation.
-- Non-evidence-backed folklore tweaks (global IPv6 disable, TCP ACK/Nagle recipes, RSS/VMQ on Wi-Fi, forced band/frequency, global USB suspend disable, firewall/antivirus disable, automatic driver installation) remain permanently denylisted.
+- Non-evidence-backed folklore tweaks (global IPv6 disable, TCP ACK/Nagle recipes, RSS/VMQ on Wi-Fi, forced band/frequency, blanket USB suspend disable without USB Wi-Fi evidence, firewall/antivirus disable, automatic driver installation) remain permanently denylisted.
 
 ---
 

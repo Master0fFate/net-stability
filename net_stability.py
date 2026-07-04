@@ -11,10 +11,11 @@ Design principles
   the maintained websockets client).
 * Back up every setting this program changes before changing it.
 * Avoid folklore tweaks: no MTU guessing, DNS replacement, Nagle hacks,
-  TCP auto-tuning disablement, global USB selective-suspend changes,
+  TCP auto-tuning disablement, blanket USB selective-suspend changes,
   throughput-hostile ECN toggles, or blanket NIC-offload disabling.
 * Keep OS changes narrow:
-    Windows: AC Wi-Fi power policy + supported per-adapter NDIS power controls.
+    Windows: AC Wi-Fi power policy, active-plan USB Wi-Fi suspend policy,
+      and supported per-adapter NDIS power controls.
     Linux: NetworkManager Wi-Fi powersave for active Wi-Fi profiles.
     macOS: diagnostics only; no undocumented system Wi-Fi knobs.
 * Make npm more tolerant of a weak link by reducing per-origin concurrency,
@@ -86,13 +87,15 @@ import windows_dns_policy
 APP_DISPLAY_NAME = "Net Stability"
 APP_DIR_WINDOWS = "NetStability"
 APP_DIR_UNIX = "netstability"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 SCHEMA_VERSION = 1
 
 # Stable Windows power-setting GUIDs. Aliases are attempted first, and these
 # GUIDs are the fallback for systems/locales where aliases are unavailable.
 WINDOWS_WIFI_SUBGROUP_GUID = "19cbb8fa-5279-450e-9fac-8a3d5fedd0c1"
 WINDOWS_WIFI_POWER_SETTING_GUID = "12bbebe6-58d6-4636-95bb-3217ef867c1a"
+WINDOWS_USB_SUBGROUP_GUID = "2a737441-1930-4402-8d77-b2bebba308a3"
+WINDOWS_USB_SELECTIVE_SUSPEND_GUID = "48e6b7a6-50f5-4782-a5d4-53bb8f07e226"
 
 DEFAULT_REGISTRY_HOST = "registry.npmjs.org"
 DEFAULT_PUBLIC_PING_TARGET = "1.1.1.1"
@@ -868,11 +871,37 @@ def windows_power_state() -> Dict[str, Any]:
         }
     scheme = match.group(0)
 
-    query = run_command(["powercfg", "/query", scheme, "SUB_WIFI"], timeout=10)
-    if not query.ok:
-        query = run_command(
-            ["powercfg", "/query", scheme, WINDOWS_WIFI_SUBGROUP_GUID], timeout=10
-        )
+    wifi_state = _windows_powercfg_setting_state(scheme, "SUB_WIFI")
+    if not wifi_state.get("available"):
+        wifi_state = _windows_powercfg_setting_state(scheme, WINDOWS_WIFI_SUBGROUP_GUID)
+    if not wifi_state.get("available"):
+        return {
+            "available": False,
+            "scheme_guid": scheme,
+            "error": wifi_state.get("error", "Could not query Wi-Fi power policy"),
+        }
+
+    usb_state = _windows_powercfg_setting_state(
+        scheme,
+        WINDOWS_USB_SUBGROUP_GUID,
+        WINDOWS_USB_SELECTIVE_SUSPEND_GUID,
+    )
+    return {
+        "available": True,
+        "scheme_guid": scheme,
+        "ac_value": wifi_state["ac_value"],
+        "dc_value": wifi_state["dc_value"],
+        "usb_selective_suspend": usb_state,
+    }
+
+
+def _windows_powercfg_setting_state(
+    scheme: str, subgroup: str, setting: Optional[str] = None
+) -> Dict[str, Any]:
+    args = ["powercfg", "/query", scheme, subgroup]
+    if setting:
+        args.append(setting)
+    query = run_command(args, timeout=10)
     if not query.ok:
         return {
             "available": False,
@@ -880,28 +909,12 @@ def windows_power_state() -> Dict[str, Any]:
             "error": query.error or query.stderr.strip() or query.stdout.strip(),
         }
 
-    ac_match = re.search(
-        r"(?i)Current\s+AC\s+Power\s+Setting\s+Index\s*:\s*0x([0-9a-f]+)", query.stdout
-    )
-    dc_match = re.search(
-        r"(?i)Current\s+DC\s+Power\s+Setting\s+Index\s*:\s*0x([0-9a-f]+)", query.stdout
-    )
-    ac_value: Optional[int] = int(ac_match.group(1), 16) if ac_match else None
-    dc_value: Optional[int] = int(dc_match.group(1), 16) if dc_match else None
-
-    # Locale-independent fallback: the Wi-Fi subgroup normally has one setting,
-    # and the final two 0x values are its current AC/DC indexes.
-    if ac_value is None or dc_value is None:
-        hex_values = re.findall(r"(?i)0x([0-9a-f]{1,8})", query.stdout)
-        if len(hex_values) >= 2:
-            ac_value = int(hex_values[-2], 16)
-            dc_value = int(hex_values[-1], 16)
-
+    ac_value, dc_value = _parse_powercfg_current_indexes(query.stdout)
     if ac_value is None or dc_value is None:
         return {
             "available": False,
             "scheme_guid": scheme,
-            "error": "Could not parse AC/DC Wi-Fi power indexes",
+            "error": "Could not parse AC/DC power indexes",
             "query_excerpt": _truncate(query.stdout, 2000),
         }
     return {
@@ -912,9 +925,32 @@ def windows_power_state() -> Dict[str, Any]:
     }
 
 
+def _parse_powercfg_current_indexes(output: str) -> Tuple[Optional[int], Optional[int]]:
+    ac_match = re.search(
+        r"(?i)Current\s+AC\s+Power\s+Setting\s+Index\s*:\s*0x([0-9a-f]+)",
+        output,
+    )
+    dc_match = re.search(
+        r"(?i)Current\s+DC\s+Power\s+Setting\s+Index\s*:\s*0x([0-9a-f]+)",
+        output,
+    )
+    ac_value: Optional[int] = int(ac_match.group(1), 16) if ac_match else None
+    dc_value: Optional[int] = int(dc_match.group(1), 16) if dc_match else None
+
+    # Locale-independent fallback: the queried setting/subgroup ends with the
+    # current AC/DC indexes on supported Windows builds.
+    if ac_value is None or dc_value is None:
+        hex_values = re.findall(r"(?i)0x([0-9a-f]{1,8})", output)
+        if len(hex_values) >= 2:
+            ac_value = int(hex_values[-2], 16)
+            dc_value = int(hex_values[-1], 16)
+    return ac_value, dc_value
+
+
 def windows_wifi_adapters_state() -> Dict[str, Any]:
     script = r"""
 $items = @()
+$devicePowerItems = @(Get-CimInstance -Namespace root\wmi -ClassName MSPower_DeviceEnable -ErrorAction SilentlyContinue)
 $adapters = @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object {
     $_.InterfaceType -eq 71 -or
     $_.NdisPhysicalMedium -eq 1 -or
@@ -923,7 +959,17 @@ $adapters = @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Obj
 })
 foreach ($a in $adapters) {
     $pm = $null
+    $devicePower = $null
     try { $pm = Get-NetAdapterPowerManagement -Name $a.Name -ErrorAction Stop } catch { }
+    $pnp = [string]$a.PnPDeviceID
+    if ($pnp) {
+        $devicePower = @(
+            $devicePowerItems |
+            Where-Object { ([string]$_.InstanceName).StartsWith($pnp, [System.StringComparison]::OrdinalIgnoreCase) } |
+            Select-Object -First 1
+        )
+        if ($devicePower.Count -gt 0) { $devicePower = $devicePower[0] } else { $devicePower = $null }
+    }
     $items += [pscustomobject]@{
         Name = [string]$a.Name
         InterfaceDescription = [string]$a.InterfaceDescription
@@ -936,6 +982,8 @@ foreach ($a in $adapters) {
         PnPDeviceID = [string]$a.PnPDeviceID
         SelectiveSuspend = $(if ($null -ne $pm) { [string]$pm.SelectiveSuspend } else { $null })
         DeviceSleepOnDisconnect = $(if ($null -ne $pm) { [string]$pm.DeviceSleepOnDisconnect } else { $null })
+        DevicePowerManagementEnabled = $(if ($null -ne $devicePower) { [bool]$devicePower.Enable } else { $null })
+        DevicePowerManagementInstance = $(if ($null -ne $devicePower) { [string]$devicePower.InstanceName } else { $null })
     }
 }
 ConvertTo-Json -InputObject @($items) -Depth 5 -Compress
@@ -1007,11 +1055,13 @@ def capture_windows_state() -> Dict[str, Any]:
 
 
 def windows_set_power_value(
-    scheme: str, ac: Optional[int], dc: Optional[int]
+    scheme: str,
+    ac: Optional[int],
+    dc: Optional[int],
+    subgroup: str = WINDOWS_WIFI_SUBGROUP_GUID,
+    setting: str = WINDOWS_WIFI_POWER_SETTING_GUID,
 ) -> List[CommandResult]:
     results: List[CommandResult] = []
-    subgroup = WINDOWS_WIFI_SUBGROUP_GUID
-    setting = WINDOWS_WIFI_POWER_SETTING_GUID
     if ac is not None:
         results.append(
             run_command(
@@ -1028,6 +1078,38 @@ def windows_set_power_value(
         )
     results.append(run_command(["powercfg", "/setactive", scheme], timeout=10))
     return results
+
+
+def windows_set_usb_selective_suspend(
+    scheme: str, ac: Optional[int], dc: Optional[int]
+) -> List[CommandResult]:
+    return windows_set_power_value(
+        scheme,
+        ac,
+        dc,
+        WINDOWS_USB_SUBGROUP_GUID,
+        WINDOWS_USB_SELECTIVE_SUSPEND_GUID,
+    )
+
+
+def _valid_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    if text in {"true", "1", "yes", "enabled"}:
+        return True
+    if text in {"false", "0", "no", "disabled"}:
+        return False
+    return None
+
+
+def _valid_power_index(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _valid_pm_value(value: Any) -> Optional[str]:
@@ -1054,6 +1136,16 @@ def windows_adapter_target_script(adapter: Mapping[str, Any]) -> str:
         )
     parts.append("if ($null -eq $target) { throw 'Network adapter not found' }; ")
     return "".join(parts)
+
+
+def windows_usb_wifi_adapters(
+    adapters: Sequence[Mapping[str, Any]],
+) -> List[Mapping[str, Any]]:
+    return [
+        adapter
+        for adapter in adapters
+        if str(adapter.get("PnPDeviceID") or "").upper().startswith("USB\\")
+    ]
 
 
 def windows_set_adapter_properties(
@@ -1085,6 +1177,36 @@ def windows_set_adapter_properties(
     return run_powershell(script, timeout=45)
 
 
+def windows_set_device_power_management(
+    adapter: Mapping[str, Any], enabled: bool
+) -> CommandResult:
+    target_script = windows_adapter_target_script(adapter)
+    desired = "$true" if enabled else "$false"
+    script = (
+        "$ErrorActionPreference='Stop';"
+        + target_script
+        + "$pnp=[string]$target.PnPDeviceID;"
+        + "if (-not $pnp -or -not $pnp.StartsWith("
+        + "'USB\\',[System.StringComparison]::OrdinalIgnoreCase"
+        + ")) { throw 'Network adapter is not USB-backed' };"
+        + "$device=@(Get-CimInstance -Namespace root\\wmi "
+        + "-ClassName MSPower_DeviceEnable -ErrorAction Stop | "
+        + "Where-Object { ([string]$_.InstanceName).StartsWith("
+        + "$pnp,[System.StringComparison]::OrdinalIgnoreCase"
+        + ") } | "
+        + "Select-Object -First 1);"
+        + "if ($device.Count -lt 1) { throw 'USB device power-management entry not found' };"
+        + "$targetDevice=$device[0];"
+        + "Set-CimInstance -InputObject $targetDevice "
+        + f"-Property @{{Enable={desired}}} -ErrorAction Stop;"
+        + "[pscustomobject]@{Name=[string]$target.Name;"
+        + "InstanceName=[string]$targetDevice.InstanceName;Enable="
+        + desired
+        + "}|ConvertTo-Json -Compress;"
+    )
+    return run_powershell(script, timeout=30)
+
+
 def apply_windows_system(
     manifest: Dict[str, Any],
     manifest_path: Path,
@@ -1093,6 +1215,11 @@ def apply_windows_system(
     restart: bool,
 ) -> None:
     state = manifest.get("state", {}).get("system", {})
+    adapters_state = state.get("wifi_adapters", {})
+    adapters = (
+        adapters_state.get("adapters", []) if isinstance(adapters_state, dict) else []
+    )
+    usb_adapters = windows_usb_wifi_adapters(adapters)
     tcp_global = state.get("tcp_global", {})
     if isinstance(tcp_global, dict) and windows_tcp_autotuning_needs_repair(tcp_global):
         original_level = (
@@ -1152,15 +1279,116 @@ def apply_windows_system(
         print(f"  - {message}")
         record_apply_issue(manifest, manifest_path, "warning", "windows", message)
 
-    adapters_state = state.get("wifi_adapters", {})
-    adapters = (
-        adapters_state.get("adapters", []) if isinstance(adapters_state, dict) else []
+    usb_power = (
+        power.get("usb_selective_suspend", {}) if isinstance(power, dict) else {}
     )
+    if usb_adapters and isinstance(usb_power, dict):
+        if usb_power.get("available"):
+            scheme = str(usb_power.get("scheme_guid") or power.get("scheme_guid") or "")
+            ac_value = _valid_power_index(usb_power.get("ac_value"))
+            dc_value = _valid_power_index(usb_power.get("dc_value"))
+            desired_ac = 0 if ac_value not in {None, 0} else None
+            desired_dc = 0 if include_battery and dc_value not in {None, 0} else None
+            if scheme and (desired_ac is not None or desired_dc is not None):
+                results = windows_set_usb_selective_suspend(
+                    scheme, desired_ac, desired_dc
+                )
+                if all(result.ok for result in results):
+                    record = {
+                        "type": "windows_usb_selective_suspend",
+                        "scheme_guid": scheme,
+                        "adapters": [
+                            {
+                                "Name": adapter.get("Name"),
+                                "InterfaceDescription": adapter.get(
+                                    "InterfaceDescription"
+                                ),
+                                "PnPDeviceID": adapter.get("PnPDeviceID"),
+                            }
+                            for adapter in usb_adapters
+                        ],
+                        "original": {"ac_value": ac_value, "dc_value": dc_value},
+                        "applied": {
+                            "ac_value": desired_ac,
+                            "dc_value": desired_dc,
+                        },
+                    }
+                    manifest.setdefault("applied", {}).setdefault("system", []).append(
+                        record
+                    )
+                    atomic_write_json(manifest_path, manifest)
+                    print(
+                        "  + Windows USB Wi-Fi suspend policy: disabled on active power plan"
+                        + (
+                            " for AC and battery"
+                            if desired_dc is not None
+                            else " for AC"
+                        )
+                    )
+                else:
+                    for result in results:
+                        if not result.ok:
+                            print_command_failure(
+                                "Windows USB Wi-Fi suspend policy", result
+                            )
+                            record_apply_issue(
+                                manifest,
+                                manifest_path,
+                                "error",
+                                "windows",
+                                "Windows USB Wi-Fi suspend policy failed: "
+                                f"{result.error or result.stderr.strip() or result.stdout.strip()}",
+                            )
+        else:
+            message = (
+                "Windows USB Wi-Fi suspend policy skipped: "
+                f"{usb_power.get('error', 'setting unavailable')}"
+            )
+            print(f"  - {message}")
+            record_apply_issue(manifest, manifest_path, "warning", "windows", message)
+
     if not adapters:
         print("  - no configurable physical Wi-Fi adapter power properties found")
         return
 
     for adapter in adapters:
+        if adapter in usb_adapters and _valid_bool(
+            adapter.get("DevicePowerManagementEnabled")
+        ):
+            result = windows_set_device_power_management(adapter, False)
+            if result.ok:
+                record = {
+                    "type": "windows_usb_device_power",
+                    "adapter": {
+                        "Name": adapter.get("Name"),
+                        "InterfaceGuid": adapter.get("InterfaceGuid"),
+                        "InterfaceDescription": adapter.get("InterfaceDescription"),
+                        "PnPDeviceID": adapter.get("PnPDeviceID"),
+                    },
+                    "original_enabled": True,
+                    "applied_enabled": False,
+                }
+                manifest.setdefault("applied", {}).setdefault("system", []).append(
+                    record
+                )
+                atomic_write_json(manifest_path, manifest)
+                description = adapter.get("InterfaceDescription") or adapter.get("Name")
+                print(
+                    f"  + disabled Windows USB device power management on {description}"
+                )
+            else:
+                print_command_failure(
+                    f"USB device power management for {adapter.get('Name')}", result
+                )
+                record_apply_issue(
+                    manifest,
+                    manifest_path,
+                    "error",
+                    "windows",
+                    f"USB device power management failed for {adapter.get('Name')}: "
+                    f"{result.error or result.stderr.strip() or result.stdout.strip()}",
+                )
+
         desired: Dict[str, str] = {}
         original: Dict[str, str] = {}
         for prop in ("SelectiveSuspend", "DeviceSleepOnDisconnect"):
@@ -1261,6 +1489,65 @@ def restore_windows_system(
             else:
                 print("  + restored Windows Wi-Fi power policy")
             results.append(result_record)
+
+    for item in applied:
+        if item.get("type") != "windows_usb_selective_suspend":
+            continue
+        original = item.get("original", {}) if isinstance(item, dict) else {}
+        applied_values = item.get("applied", {}) if isinstance(item, dict) else {}
+        scheme = str(
+            item.get("scheme_guid") or state.get("power", {}).get("scheme_guid") or ""
+        )
+        ac_value = _valid_power_index(original.get("ac_value"))
+        dc_value = (
+            _valid_power_index(original.get("dc_value"))
+            if applied_values.get("dc_value") is not None
+            else None
+        )
+        if not scheme or (ac_value is None and dc_value is None):
+            continue
+        commands = windows_set_usb_selective_suspend(scheme, ac_value, dc_value)
+        ok = all(command.ok for command in commands)
+        result_record = {"type": "windows_usb_selective_suspend", "ok": ok}
+        if ok:
+            print("  + restored Windows USB Wi-Fi suspend policy")
+        else:
+            result_record["errors"] = [
+                command.error or command.stderr.strip()
+                for command in commands
+                if not command.ok
+            ]
+            for command in commands:
+                if not command.ok:
+                    print_command_failure(
+                        "restore Windows USB Wi-Fi suspend policy", command
+                    )
+        results.append(result_record)
+
+    for item in applied:
+        if item.get("type") != "windows_usb_device_power":
+            continue
+        adapter = item.get("adapter", {})
+        original_enabled = _valid_bool(item.get("original_enabled"))
+        if original_enabled is None:
+            continue
+        command = windows_set_device_power_management(adapter, original_enabled)
+        record = {
+            "type": "windows_usb_device_power",
+            "adapter": adapter,
+            "ok": command.ok,
+        }
+        if command.ok:
+            print(
+                f"  + restored USB device power management: {adapter.get('Name') or adapter.get('InterfaceDescription')}"
+            )
+        else:
+            record["error"] = command.error or command.stderr.strip()
+            print_command_failure(
+                f"restore USB device power management {adapter.get('Name')}",
+                command,
+            )
+        results.append(record)
 
     for item in applied:
         if item.get("type") != "windows_adapter_power":
@@ -2946,8 +3233,8 @@ def optimizer_action_ledger() -> List[Dict[str, Any]]:
             "id": "apply-wifi-power-stability",
             "title": "Adapter-scoped Wi-Fi power stability profile",
             "platforms": ["Windows", "Linux"],
-            "mutation": "documented power-management settings only",
-            "evidence": "powercfg/NetAdapterPowerManagement and NetworkManager powersave fields",
+            "mutation": "documented power-management settings only, gated by detected adapter class",
+            "evidence": "powercfg, USB-backed Wi-Fi inventory, NetAdapterPowerManagement, and NetworkManager powersave fields",
             "precheck": "active physical Wi-Fi adapter/profile detected",
             "postcheck": "manifest records changed values and any skipped adapters",
             "reversible": "snapshot-backed restore",
@@ -2991,6 +3278,10 @@ def planned_changes(
             changes.append(
                 "Set the active plan's Wi-Fi policy to Maximum Performance on AC"
                 + (" and battery" if include_battery else "")
+            )
+            changes.append(
+                "Disable active power-plan USB suspend for detected USB Wi-Fi adapters"
+                + (" on AC and battery" if include_battery else " on AC")
             )
             changes.append(
                 "Disable supported NDIS SelectiveSuspend and DeviceSleepOnDisconnect on physical Wi-Fi adapters"
