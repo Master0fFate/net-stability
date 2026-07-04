@@ -87,7 +87,7 @@ import windows_dns_policy
 APP_DISPLAY_NAME = "Net Stability"
 APP_DIR_WINDOWS = "NetStability"
 APP_DIR_UNIX = "netstability"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 SCHEMA_VERSION = 1
 
 # Stable Windows power-setting GUIDs. Aliases are attempted first, and these
@@ -3065,20 +3065,119 @@ def _first_number(value: Any) -> Optional[float]:
         return None
 
 
+def _split_nmcli_terse(line: str) -> List[str]:
+    fields: List[str] = []
+    current: List[str] = []
+    escaped = False
+    for char in line.rstrip("\n"):
+        if escaped:
+            current.append(char)
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char == ":":
+            fields.append("".join(current))
+            current = []
+            continue
+        current.append(char)
+    fields.append("".join(current))
+    return fields
+
+
+def parse_linux_nmcli_wifi_terse(output: str) -> List[Dict[str, str]]:
+    interfaces: List[Dict[str, str]] = []
+    for line in output.splitlines():
+        fields = _split_nmcli_terse(line)
+        if len(fields) < 6 or fields[0] != "*":
+            continue
+        interfaces.append(
+            {
+                "name": fields[5] or fields[1] or "Wi-Fi",
+                "ssid": fields[1],
+                "channel": fields[2],
+                "receive_rate_(mbps)": fields[3],
+                "signal": fields[4],
+                "device": fields[5],
+                "source": "nmcli",
+            }
+        )
+    return interfaces
+
+
+def parse_macos_airport_profiler(output: str) -> List[Dict[str, str]]:
+    current_name = ""
+    current: Dict[str, str] = {}
+    interfaces: List[Dict[str, str]] = []
+    in_network = False
+    for raw_line in output.splitlines():
+        stripped = raw_line.strip()
+        if stripped == "Current Network Information:":
+            in_network = True
+            continue
+        if not in_network or not stripped:
+            continue
+        if stripped.endswith(":") and ":" not in stripped[:-1]:
+            if current:
+                interfaces.append(current)
+                current = {}
+            current_name = stripped[:-1]
+            continue
+        if ":" not in stripped:
+            continue
+        key, value = stripped.split(":", 1)
+        normalized = re.sub(r"\s+", "_", key.strip().lower())
+        if normalized == "phy_mode":
+            normalized = "radio_type"
+        elif normalized == "signal_/_noise":
+            normalized = "signal_dbm"
+            value = value.split("/", 1)[0]
+        elif normalized == "transmit_rate":
+            normalized = "transmit_rate_(mbps)"
+        if normalized in {
+            "radio_type",
+            "channel",
+            "signal_dbm",
+            "transmit_rate_(mbps)",
+        }:
+            current[normalized] = value.strip()
+            current.setdefault("name", current_name or "Wi-Fi")
+            current.setdefault("source", "system_profiler")
+    if current:
+        interfaces.append(current)
+    return interfaces
+
+
+def wifi_link_records(quality: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    interfaces = quality.get("interfaces")
+    if isinstance(interfaces, list):
+        return [dict(item) for item in interfaces if isinstance(item, Mapping)]
+    reports = quality.get("reports", {})
+    if not isinstance(reports, Mapping):
+        return []
+    platform_name = str(quality.get("platform") or "")
+    if platform_name == "Linux":
+        terse = reports.get("nmcli_wifi_terse")
+        if isinstance(terse, Mapping) and isinstance(terse.get("stdout"), str):
+            return parse_linux_nmcli_wifi_terse(str(terse["stdout"]))
+    if platform_name == "macOS":
+        profiler = reports.get("airport_profiler")
+        if isinstance(profiler, Mapping) and isinstance(profiler.get("stdout"), str):
+            return parse_macos_airport_profiler(str(profiler["stdout"]))
+    return []
+
+
 def wifi_link_recommendations(quality: Mapping[str, Any]) -> List[Dict[str, Any]]:
     recommendations: List[Dict[str, Any]] = []
-    if quality.get("platform") != "Windows":
-        return recommendations
-    interfaces = quality.get("interfaces", [])
-    if not isinstance(interfaces, list):
-        return recommendations
-    for item in interfaces:
+    for item in wifi_link_records(quality):
         if not isinstance(item, Mapping):
             continue
         name = str(item.get("name") or "Wi-Fi")
         radio = str(item.get("radio_type") or "").lower()
         channel = _first_number(item.get("channel"))
         signal = _first_number(item.get("signal"))
+        signal_dbm = _first_number(item.get("signal_dbm"))
         if (
             channel is not None
             and 1 <= channel <= 14
@@ -3097,7 +3196,8 @@ def wifi_link_recommendations(quality: Mapping[str, Any]) -> List[Dict[str, Any]
                     "evidence": {
                         "radio_type": item.get("radio_type"),
                         "channel": int(channel),
-                        "signal": item.get("signal"),
+                        "signal": item.get("signal") or item.get("signal_dbm"),
+                        "source": item.get("source"),
                     },
                     "detail": (
                         f"{name} is on 2.4 GHz channel {int(channel)}, which overlaps "
@@ -3110,9 +3210,18 @@ def wifi_link_recommendations(quality: Mapping[str, Any]) -> List[Dict[str, Any]
                     "mutation": "router-side advisory only",
                 }
             )
+        marginal_percent = signal is not None and signal < 70
+        marginal_dbm = signal_dbm is not None and signal_dbm <= -67
         if ("802.11n" in radio or (channel is not None and channel <= 14)) and (
-            signal is not None and signal < 70
+            marginal_percent or marginal_dbm
         ):
+            signal_fact = (
+                f"{signal:g}%"
+                if signal is not None
+                else f"{signal_dbm:g} dBm"
+                if signal_dbm is not None
+                else "marginal"
+            )
             recommendations.append(
                 {
                     "id": "marginal_two_four_ghz_signal",
@@ -3121,10 +3230,11 @@ def wifi_link_recommendations(quality: Mapping[str, Any]) -> List[Dict[str, Any]
                     "evidence": {
                         "radio_type": item.get("radio_type"),
                         "channel": item.get("channel"),
-                        "signal": item.get("signal"),
+                        "signal": item.get("signal") or item.get("signal_dbm"),
+                        "source": item.get("source"),
                     },
                     "detail": (
-                        f"{name} signal is {signal:g}%; this is usable but marginal for "
+                        f"{name} signal is {signal_fact}; this is usable but marginal for "
                         "stable 18+ Mbps downloads on 2.4 GHz under load."
                     ),
                     "action": (
@@ -3169,6 +3279,20 @@ def collect_wifi_link_quality() -> Dict[str, Any]:
                 ],
                 timeout=20,
             ).to_report(limit=40_000)
+            reports["nmcli_wifi_terse"] = run_command(
+                [
+                    "nmcli",
+                    "-t",
+                    "-f",
+                    "IN-USE,SSID,CHAN,RATE,SIGNAL,DEVICE",
+                    "device",
+                    "wifi",
+                    "list",
+                    "--rescan",
+                    "no",
+                ],
+                timeout=20,
+            ).to_report(limit=40_000)
         if shutil.which("iw"):
             iw_dev = run_command(["iw", "dev"], timeout=10)
             reports["iw_dev"] = iw_dev.to_report(limit=20_000)
@@ -3179,19 +3303,22 @@ def collect_wifi_link_quality() -> Dict[str, Any]:
                 )
                 for name in interface_names[:8]
             }
-        return {
+        quality = {
             "available": bool(reports),
             "platform": "Linux",
             "source": "nmcli and iw when available",
             "reports": reports,
             "mutation": "none",
         }
+        quality["interfaces"] = wifi_link_records(quality)
+        quality["recommendations"] = wifi_link_recommendations(quality)
+        return quality
     if system == "Darwin":
         hardware = run_command(["networksetup", "-listallhardwareports"], timeout=15)
         profiler = run_command(
             ["system_profiler", "SPAirPortDataType", "-detailLevel", "mini"], timeout=45
         )
-        return {
+        quality = {
             "available": hardware.ok or profiler.ok,
             "platform": "macOS",
             "source": "networksetup and system_profiler",
@@ -3201,6 +3328,9 @@ def collect_wifi_link_quality() -> Dict[str, Any]:
             },
             "mutation": "none",
         }
+        quality["interfaces"] = wifi_link_records(quality)
+        quality["recommendations"] = wifi_link_recommendations(quality)
+        return quality
     return {
         "available": False,
         "platform": system,
@@ -3260,6 +3390,503 @@ def bufferbloat_assessment(
         "latency_ratio": ratio,
         "gateway_loss_percent": gateway_loss,
         "recommendation": recommendation,
+    }
+
+
+def _summary_number(
+    summary: Mapping[str, Any],
+    section: str,
+    key: str,
+) -> Optional[float]:
+    metric = summary.get(section, {})
+    if not isinstance(metric, Mapping):
+        return None
+    value = metric.get(key)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _router_finding(
+    identifier: str,
+    layer: str,
+    severity: str,
+    confidence: float,
+    facts: Sequence[str],
+    detail: str,
+) -> Dict[str, Any]:
+    return {
+        "id": identifier,
+        "layer": layer,
+        "severity": severity,
+        "confidence": round(max(0.0, min(1.0, confidence)), 2),
+        "facts": list(facts),
+        "detail": detail,
+    }
+
+
+def _manual_router_optimization(record: Mapping[str, Any]) -> Dict[str, Any]:
+    result = dict(record)
+    result.setdefault("automatic", False)
+    result.setdefault("mutation", "router-admin manual only")
+    return result
+
+
+def _add_router_optimization(
+    optimizations: List[Dict[str, Any]],
+    seen: Set[str],
+    record: Mapping[str, Any],
+) -> None:
+    identifier = str(record.get("id") or "")
+    if not identifier or identifier in seen:
+        return
+    seen.add(identifier)
+    optimizations.append(_manual_router_optimization(record))
+
+
+def _router_metrics(
+    baseline: Mapping[str, Any],
+    load: Optional[Mapping[str, Any]],
+    download_report: Optional[Mapping[str, Any]],
+    min_download_mbps: float,
+    load_capacity_mbps: Optional[float],
+) -> Dict[str, Any]:
+    limitations = [
+        "Endpoint probes can identify router/AP symptoms, but cannot read router CPU, airtime, WAN negotiation, or firmware state without router-admin integration.",
+        "ICMP can be deprioritized; DNS and HTTPS probes are included to avoid single-signal conclusions.",
+    ]
+    base_gateway_median = _summary_number(baseline, "gateway_ping", "median_ms")
+    load_gateway_p95 = _summary_number(load or {}, "gateway_ping", "p95_ms")
+    load_gateway_loss = (
+        _summary_number(load or {}, "gateway_ping", "loss_percent") or 0.0
+    )
+    base_public_median = _summary_number(baseline, "public_ping", "median_ms")
+    load_public_p95 = _summary_number(load or {}, "public_ping", "p95_ms")
+    load_public_loss = _summary_number(load or {}, "public_ping", "loss_percent") or 0.0
+    load_public_jitter = (
+        _summary_number(load or {}, "public_ping", "jitter_avg_ms") or 0.0
+    )
+    dns_failure = max(
+        _summary_number(baseline, "dns", "failure_percent") or 0.0,
+        _summary_number(load or {}, "dns", "failure_percent") or 0.0,
+    )
+    registry_failure = max(
+        _summary_number(baseline, "registry_https", "failure_percent") or 0.0,
+        _summary_number(load or {}, "registry_https", "failure_percent") or 0.0,
+    )
+    throughput = None
+    if isinstance(download_report, Mapping):
+        throughput = _first_number(download_report.get("throughput_mbps"))
+    can_assess_download_target = (
+        load_capacity_mbps is None or load_capacity_mbps >= min_download_mbps
+    )
+    if not can_assess_download_target:
+        limitations.append(
+            "Download byte cap is below the requested throughput target for this load duration; throughput findings are suppressed for this run."
+        )
+    gateway_latency_inflated = (
+        base_gateway_median is not None
+        and load_gateway_p95 is not None
+        and load_gateway_p95 >= max(50.0, base_gateway_median * 6.0)
+    )
+    gateway_stable = (
+        load is not None and load_gateway_loss < 5.0 and not gateway_latency_inflated
+    )
+    public_latency_inflated = (
+        base_public_median is not None
+        and load_public_p95 is not None
+        and load_public_p95 >= max(100.0, base_public_median * 2.5)
+    )
+    return {
+        "has_load": load is not None,
+        "base_public_median": base_public_median,
+        "load_public_p95": load_public_p95,
+        "load_public_loss": load_public_loss,
+        "load_public_jitter": load_public_jitter,
+        "load_gateway_p95": load_gateway_p95,
+        "load_gateway_loss": load_gateway_loss,
+        "gateway_latency_inflated": gateway_latency_inflated,
+        "gateway_stable": gateway_stable,
+        "public_latency_inflated": public_latency_inflated,
+        "dns_failure": dns_failure,
+        "registry_failure": registry_failure,
+        "throughput": throughput,
+        "min_download_mbps": min_download_mbps,
+        "load_capacity_mbps": load_capacity_mbps,
+        "can_assess_download_target": can_assess_download_target,
+        "limitations": limitations,
+    }
+
+
+def _router_wifi_channel_optimization() -> Dict[str, Any]:
+    return {
+        "id": "router-wifi-channel-plan",
+        "layer": "router_wifi",
+        "title": "Use a clean 2.4 GHz channel plan on the router/AP",
+        "actions": [
+            "In the router/AP Wi-Fi settings, choose the least busy of channels 1, 6, or 11 for 2.4 GHz.",
+            "Use 20 MHz channel width on crowded 2.4 GHz networks; wider 2.4 GHz channels often add interference instead of throughput.",
+            "Move high-throughput clients to a 5 GHz or 6 GHz SSID when both router and client support it.",
+        ],
+        "evidence": ["router-wifi-overlap-channel"],
+        "expected_metrics": [
+            "higher sustained download throughput",
+            "lower loaded jitter",
+            "fewer Wi-Fi retries when router counters expose them",
+        ],
+        "verify_with": "Rerun router-diagnose and link-quality after the router/AP change.",
+        "risk": "low; incorrect channel choice can worsen neighboring-network contention.",
+    }
+
+
+def _router_wifi_placement_optimization() -> Dict[str, Any]:
+    return {
+        "id": "router-wifi-placement",
+        "layer": "router_wifi",
+        "title": "Improve AP/client placement before changing TCP settings",
+        "actions": [
+            "Raise or reposition the router/AP and keep it away from metal, dense walls, USB 3.0 noise, and crowded power strips.",
+            "Test a short USB extension or a different client position, then compare link signal and loaded throughput.",
+            "If the router has band steering, verify the client is not being held on weak 2.4 GHz when a stronger 5 GHz path exists.",
+        ],
+        "evidence": ["router-wifi-marginal-signal"],
+        "expected_metrics": [
+            "stronger signal/RSSI",
+            "higher link rate",
+            "more stable loaded throughput",
+        ],
+        "verify_with": "Compare link-quality and router-diagnose before and after placement changes.",
+        "risk": "low; physical placement changes are reversible.",
+    }
+
+
+def _apply_router_wifi_rules(
+    wifi_link_quality: Mapping[str, Any],
+    findings: List[Dict[str, Any]],
+    optimizations: List[Dict[str, Any]],
+    seen: Set[str],
+) -> None:
+    wifi_recommendations = wifi_link_quality.get("recommendations", [])
+    if not isinstance(wifi_recommendations, list):
+        return
+    for recommendation in wifi_recommendations:
+        if not isinstance(recommendation, Mapping):
+            continue
+        recommendation_id = recommendation.get("id")
+        detail = str(recommendation.get("detail") or "")
+        if recommendation_id == "two_four_ghz_overlap_channel":
+            findings.append(
+                _router_finding(
+                    "router-wifi-overlap-channel",
+                    "router_wifi",
+                    "medium",
+                    0.78,
+                    [detail],
+                    "The associated AP is using an overlapping 2.4 GHz channel. This can reduce usable throughput when nearby airtime is busy.",
+                )
+            )
+            _add_router_optimization(
+                optimizations, seen, _router_wifi_channel_optimization()
+            )
+        elif recommendation_id == "marginal_two_four_ghz_signal":
+            findings.append(
+                _router_finding(
+                    "router-wifi-marginal-signal",
+                    "router_wifi",
+                    "medium",
+                    0.72,
+                    [detail],
+                    "The Wi-Fi link is usable but close enough to the edge that load can expose rate shifts, retries, or AP airtime pressure.",
+                )
+            )
+            _add_router_optimization(
+                optimizations, seen, _router_wifi_placement_optimization()
+            )
+
+
+def _apply_gateway_pressure_rule(
+    metrics: Mapping[str, Any],
+    findings: List[Dict[str, Any]],
+    optimizations: List[Dict[str, Any]],
+    seen: Set[str],
+) -> None:
+    if not metrics["has_load"]:
+        return
+    if metrics["load_gateway_loss"] < 10.0 and not metrics["gateway_latency_inflated"]:
+        return
+    facts = [f"loaded_gateway_loss_percent={metrics['load_gateway_loss']:g}"]
+    if metrics["load_gateway_p95"] is not None:
+        facts.append(f"loaded_gateway_p95_ms={metrics['load_gateway_p95']:g}")
+    findings.append(
+        _router_finding(
+            "gateway-degrades-under-load",
+            "router_or_ap_lan",
+            "high",
+            0.8,
+            facts,
+            "The first hop degraded during local load. That points to Wi-Fi airtime, AP/router CPU, router LAN queueing, or adapter path stress before blaming the ISP path.",
+        )
+    )
+    _add_router_optimization(
+        optimizations,
+        seen,
+        {
+            "id": "router-ap-health-check",
+            "layer": "router_or_ap_lan",
+            "title": "Check router/AP load and local-link contention",
+            "actions": [
+                "Inspect router/AP CPU, memory, wireless client count, and error counters during the failing workload if the UI exposes them.",
+                "Compare one wired/Ethernet run or a different Wi-Fi band to separate AP/router pressure from ISP/WAN pressure.",
+                "Remove accidental per-device caps, parental controls, or guest-network limits only when the router UI shows they apply to this client.",
+            ],
+            "evidence": ["gateway-degrades-under-load"],
+            "expected_metrics": [
+                "gateway loss below 5%",
+                "gateway p95 latency stays close to idle",
+                "fewer disconnects under package-install load",
+            ],
+            "verify_with": "Rerun router-diagnose under the same load after each router/AP change.",
+            "risk": "low to moderate; router policy changes affect all clients.",
+        },
+    )
+
+
+def _apply_wan_queue_rule(
+    metrics: Mapping[str, Any],
+    findings: List[Dict[str, Any]],
+    optimizations: List[Dict[str, Any]],
+    seen: Set[str],
+) -> None:
+    if (
+        metrics["has_load"]
+        and metrics["gateway_stable"]
+        and (
+            metrics["public_latency_inflated"]
+            or metrics["load_public_loss"] >= 5.0
+            or metrics["load_public_jitter"] >= 15.0
+        )
+    ):
+        facts = [
+            f"loaded_gateway_loss_percent={metrics['load_gateway_loss']:g}",
+            f"loaded_public_loss_percent={metrics['load_public_loss']:g}",
+            f"loaded_public_jitter_ms={metrics['load_public_jitter']:g}",
+        ]
+        if (
+            metrics["base_public_median"] is not None
+            and metrics["load_public_p95"] is not None
+        ):
+            facts.extend(
+                [
+                    f"idle_public_median_ms={metrics['base_public_median']:g}",
+                    f"loaded_public_p95_ms={metrics['load_public_p95']:g}",
+                ]
+            )
+        findings.append(
+            _router_finding(
+                "wan-queue-pressure",
+                "router_queue",
+                "high",
+                0.86,
+                facts,
+                "The gateway stayed clean while the remote path degraded under download pressure. That is the classic host-visible shape of router/WAN queue pressure.",
+            )
+        )
+        _add_router_optimization(
+            optimizations,
+            seen,
+            {
+                "id": "router-sqm-aqm",
+                "layer": "router_queue",
+                "title": "Enable SQM/AQM at the WAN bottleneck",
+                "actions": [
+                    "Use SQM/AQM with FQ-CoDel or CAKE on the router interface that actually bottlenecks the ISP link.",
+                    "Set download and upload shaping slightly below measured line rate; start around 90-95% and refine with loaded-latency results.",
+                    "Do not stack random client TCP tweaks on top of router queue symptoms; verify the queue directly after each router change.",
+                ],
+                "evidence": ["wan-queue-pressure"],
+                "expected_metrics": [
+                    "lower loaded public p95 latency",
+                    "lower jitter under download and upload load",
+                    "stable package-manager downloads while other traffic is active",
+                ],
+                "verify_with": "Rerun router-diagnose; loaded public p95/jitter should fall while gateway remains clean.",
+                "risk": "moderate; rate limits set too low cap throughput, and SQM must run at the true bottleneck.",
+            },
+        )
+
+
+def _apply_router_dns_rule(
+    metrics: Mapping[str, Any],
+    findings: List[Dict[str, Any]],
+    optimizations: List[Dict[str, Any]],
+    seen: Set[str],
+) -> None:
+    if metrics["dns_failure"] <= 0.0 or metrics["registry_failure"] >= 50.0:
+        return
+    findings.append(
+        _router_finding(
+            "router-dns-forwarder-suspect",
+            "router_dns",
+            "medium",
+            0.64,
+            [
+                f"dns_failure_percent={metrics['dns_failure']:g}",
+                f"https_failure_percent={metrics['registry_failure']:g}",
+            ],
+            "DNS failed while HTTPS was not equally broken. That can be router DNS proxy/cache behavior, ISP resolver behavior, VPN policy, or host resolver state.",
+        )
+    )
+    _add_router_optimization(
+        optimizations,
+        seen,
+        {
+            "id": "router-dns-forwarder-review",
+            "layer": "router_dns",
+            "title": "Review router DNS forwarding only if failures repeat",
+            "actions": [
+                "Check whether multiple devices see DNS failures through the same router before changing DNS globally.",
+                "If failures repeat, configure router DHCP/WAN DNS to reliable recursive resolvers or bypass a flaky router DNS proxy.",
+                "Keep VPN or enterprise DNS rules intact; do not delete policy rules just to chase raw download speed.",
+            ],
+            "evidence": ["router-dns-forwarder-suspect"],
+            "expected_metrics": [
+                "DNS failure rate returns to 0%",
+                "DNS median and p95 stabilize",
+                "HTTPS probes remain successful",
+            ],
+            "verify_with": "Rerun diagnose or router-diagnose and compare DNS failure percent.",
+            "risk": "moderate; DNS changes can break split-DNS, parental controls, or VPN routing.",
+        },
+    )
+
+
+def _apply_throughput_rule(
+    metrics: Mapping[str, Any],
+    findings: List[Dict[str, Any]],
+    optimizations: List[Dict[str, Any]],
+    seen: Set[str],
+) -> None:
+    if not (
+        metrics["throughput"] is not None
+        and metrics["throughput"] < metrics["min_download_mbps"]
+        and metrics["gateway_stable"]
+        and metrics["load_public_loss"] < 5.0
+        and metrics["can_assess_download_target"]
+    ):
+        return
+    findings.append(
+        _router_finding(
+            "throughput-below-target-with-clean-first-hop",
+            "router_or_isp_throughput",
+            "medium",
+            0.58,
+            [
+                f"download_load_mbps={metrics['throughput']:g}",
+                f"min_download_mbps={metrics['min_download_mbps']:g}",
+            ],
+            "Throughput missed the target while the first hop stayed clean. This is not enough to blame the router alone, but it is enough to inspect router rate limits, WAN negotiation, and ISP plan/path evidence.",
+        )
+    )
+    _add_router_optimization(
+        optimizations,
+        seen,
+        {
+            "id": "router-throughput-policy-review",
+            "layer": "router_or_isp_throughput",
+            "title": "Inspect router throughput caps and WAN link state",
+            "actions": [
+                "Check router QoS, guest-network, parental-control, and per-device rate-limit rules for this client.",
+                "Inspect router WAN port/link speed and modem/router logs for renegotiation or error counters.",
+                "Compare with one wired client or another device before changing endpoint TCP settings.",
+            ],
+            "evidence": ["throughput-below-target-with-clean-first-hop"],
+            "expected_metrics": [
+                "download load meets target",
+                "WAN/link error counters stop increasing",
+                "wired comparison matches expected ISP plan",
+            ],
+            "verify_with": "Rerun router-diagnose and an NDT7 speed test after router policy changes.",
+            "risk": "low to moderate; router policy edits can affect other clients.",
+        },
+    )
+
+
+def _router_verdict(findings: Sequence[Mapping[str, Any]]) -> Tuple[str, float]:
+    severity_order = {"high": 3, "medium": 2, "low": 1}
+    leading = max(
+        findings, key=lambda item: severity_order.get(str(item["severity"]), 0)
+    )
+    verdict_map = {
+        "router_queue": "router_wan_queue_likely",
+        "router_wifi": "router_wifi_or_ap_likely",
+        "router_or_ap_lan": "router_or_ap_lan_likely",
+        "router_dns": "router_dns_possible",
+        "router_or_isp_throughput": "router_or_isp_throughput_possible",
+        "not_isolated": "router_fault_not_proven",
+    }
+    return (
+        verdict_map.get(str(leading["layer"]), "router_fault_not_proven"),
+        float(leading["confidence"]),
+    )
+
+
+def router_side_diagnosis(
+    baseline: Mapping[str, Any],
+    load: Optional[Mapping[str, Any]],
+    wifi_link_quality: Mapping[str, Any],
+    download_report: Optional[Mapping[str, Any]],
+    min_download_mbps: float,
+    load_capacity_mbps: Optional[float] = None,
+) -> Dict[str, Any]:
+    findings: List[Dict[str, Any]] = []
+    optimizations: List[Dict[str, Any]] = []
+    seen_optimizations: Set[str] = set()
+    metrics = _router_metrics(
+        baseline, load, download_report, min_download_mbps, load_capacity_mbps
+    )
+    _apply_router_wifi_rules(
+        wifi_link_quality, findings, optimizations, seen_optimizations
+    )
+    _apply_gateway_pressure_rule(metrics, findings, optimizations, seen_optimizations)
+    _apply_wan_queue_rule(metrics, findings, optimizations, seen_optimizations)
+    _apply_router_dns_rule(metrics, findings, optimizations, seen_optimizations)
+    _apply_throughput_rule(metrics, findings, optimizations, seen_optimizations)
+
+    if not findings:
+        findings.append(
+            _router_finding(
+                "router-fault-not-proven",
+                "not_isolated",
+                "low",
+                0.42,
+                ["no_router_threshold_crossed=true"],
+                "The current evidence does not prove a router-side fault. Keep device-side settings stable and capture the failing workload if the symptom returns.",
+            )
+        )
+
+    verdict, confidence = _router_verdict(findings)
+    return {
+        "available": True,
+        "verdict": verdict,
+        "confidence": confidence,
+        "findings": findings,
+        "optimizations": optimizations,
+        "evidence_summary": {
+            "gateway_loss_percent_under_load": metrics["load_gateway_loss"],
+            "gateway_loaded_p95_ms": metrics["load_gateway_p95"],
+            "public_loaded_p95_ms": metrics["load_public_p95"],
+            "public_loaded_jitter_ms": metrics["load_public_jitter"],
+            "dns_failure_percent": metrics["dns_failure"],
+            "registry_failure_percent": metrics["registry_failure"],
+            "download_load_mbps": metrics["throughput"],
+            "min_download_mbps": min_download_mbps,
+            "load_capacity_mbps": load_capacity_mbps,
+        },
+        "limitations": metrics["limitations"],
+        "mutation": "none; report output only",
     }
 
 
@@ -4368,6 +4995,13 @@ def capability_matrix() -> List[Dict[str, str]]:
             "mutation": "none, report output only",
         },
         {
+            "capability": "Router-side diagnostic suite",
+            "available": "yes",
+            "source": "gateway/public split, DNS/HTTPS probes, Wi-Fi link evidence, and bounded download load",
+            "privilege": "none",
+            "mutation": "none, manual router/AP recommendations only",
+        },
+        {
             "capability": "M-Lab NDT7 application speed test",
             "available": "yes",
             "source": "M-Lab Locate API v2 plus NDT7 WebSocket/TLS",
@@ -4579,6 +5213,7 @@ def repository_map() -> Dict[str, Any]:
             "speedtest",
             "verify",
             "benchmark",
+            "router-diagnose",
             "watch -- <command>",
             "audit",
             "apply",
@@ -5051,7 +5686,7 @@ def command_audit(args: argparse.Namespace) -> int:
         "optimizer_action_ledger": optimizer_action_ledger(),
         "anti_folklore_denylist": list(ANTI_FOLKLORE_DENYLIST),
         "normal_mode_boundaries": [
-            "audit, diagnose, measure, watch, and list-backups are read-only apart from explicit report files",
+            "audit, diagnose, measure, router-diagnose, watch, and list-backups are read-only apart from explicit report files",
             "apply and restore are the only normal commands that write persistent settings",
             "reset-network resets the TCP/IP and DNS stack (requires reboot)",
             "router queue control remains advisory unless a separate reviewed router plugin exists",
@@ -5513,6 +6148,173 @@ def command_benchmark(args: argparse.Namespace) -> int:
     return 0
 
 
+def print_router_diagnosis(diagnosis: Mapping[str, Any]) -> None:
+    print("Router-side diagnosis:")
+    print(
+        f"  Verdict: {diagnosis.get('verdict', 'unknown')} "
+        f"(confidence {float(diagnosis.get('confidence') or 0.0):.2f})"
+    )
+    findings = diagnosis.get("findings", [])
+    if isinstance(findings, list) and findings:
+        print("  Findings:")
+        for finding in findings:
+            if not isinstance(finding, Mapping):
+                continue
+            print(
+                "  - "
+                f"{finding.get('severity', 'unknown')} / {finding.get('layer', 'unknown')}: "
+                f"{finding.get('detail', 'No detail')}"
+            )
+            facts = finding.get("facts", [])
+            if isinstance(facts, list) and facts:
+                print(f"    Evidence: {'; '.join(str(item) for item in facts[:4])}")
+    optimizations = diagnosis.get("optimizations", [])
+    if isinstance(optimizations, list) and optimizations:
+        print("  Router-side actions to verify:")
+        for item in optimizations:
+            if not isinstance(item, Mapping):
+                continue
+            print(f"  - {item.get('title', 'Review router settings')}")
+            actions = item.get("actions", [])
+            if isinstance(actions, list):
+                for action in actions[:3]:
+                    print(f"    Action: {action}")
+            print(f"    Verify: {item.get('verify_with', 'Rerun router-diagnose.')}")
+    else:
+        print("  Router-side actions to verify: none from this run.")
+
+
+def command_router_diagnose(args: argparse.Namespace) -> int:
+    gateway = default_gateway()
+    config = BenchmarkRunConfig(
+        baseline_seconds=args.baseline_seconds,
+        load_seconds=args.load_seconds,
+        interval=args.interval,
+        public_target=args.public_target,
+        registry_host=args.registry_host,
+        download_url=args.download_url,
+        parallel_downloads=args.parallel_downloads,
+        download_mb=args.download_mb,
+    )
+    baseline_count = max(1, int(math.ceil(config.baseline_seconds / config.interval)))
+    print(f"Default gateway: {gateway or 'not detected'}")
+    print("Inspecting Wi-Fi/router-link evidence")
+    wifi_link_quality = collect_wifi_link_quality()
+    link_records = wifi_link_records(wifi_link_quality)
+    print(
+        "  Link inspector: "
+        f"{'available' if wifi_link_quality.get('available') else 'unavailable'}"
+    )
+    for item in link_records[:4]:
+        print(
+            "  - "
+            f"{item.get('name', 'Wi-Fi')}: "
+            f"radio={item.get('radio_type', 'unknown')}, "
+            f"channel={item.get('channel', 'unknown')}, "
+            f"signal={item.get('signal', item.get('signal_dbm', 'unknown'))}"
+        )
+
+    print(f"Collecting {config.baseline_seconds:g}s idle router baseline")
+    baseline_samples = collect_samples(
+        baseline_count,
+        config.interval,
+        gateway,
+        config.public_target,
+        config.registry_host,
+        "router_idle",
+    )
+    baseline_summary = summarize_samples(baseline_samples)
+    print_sample_summary(baseline_summary, "Idle router baseline:")
+
+    before_counters = adapter_counter_state()
+    print(
+        "Running router pressure load: "
+        f"{config.parallel_downloads} stream(s), {config.download_mb} MiB each, "
+        f"{config.load_seconds:g}s sample window"
+    )
+    load_samples, download_report = run_download_load(config, gateway)
+    after_counters = adapter_counter_state()
+    counter_delta = adapter_counter_delta(before_counters, after_counters)
+    load_summary = summarize_samples(load_samples)
+    print_sample_summary(load_summary, "During router pressure load:")
+    print(
+        "Download load: "
+        f"{download_report.get('throughput_mbps', 0):g} Mbps, "
+        f"{download_report.get('bytes_read', 0)} bytes read, "
+        f"{download_report.get('failures', 0)} worker failure(s)"
+    )
+
+    diagnosis = router_side_diagnosis(
+        baseline_summary,
+        load_summary,
+        wifi_link_quality,
+        download_report,
+        args.min_download_mbps,
+        (
+            config.parallel_downloads
+            * config.download_mb
+            * 1024
+            * 1024
+            * 8
+            / max(config.load_seconds * 1_000_000.0, 0.001)
+        ),
+    )
+    print_router_diagnosis(diagnosis)
+
+    report: Dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "tool": {"name": APP_DISPLAY_NAME, "version": VERSION},
+        "created_utc": utc_now_iso(),
+        "platform": platform_metadata(),
+        "gateway": gateway,
+        "router_diagnosis": diagnosis,
+        "wifi_link_quality": wifi_link_quality,
+        "benchmark": {
+            "direction": "download",
+            "baseline_seconds": config.baseline_seconds,
+            "load_seconds": config.load_seconds,
+            "interval": config.interval,
+            "download_url": config.download_url,
+            "parallel_downloads": config.parallel_downloads,
+            "download_mb_per_worker": config.download_mb,
+            "min_download_mbps": args.min_download_mbps,
+        },
+        "targets": {
+            "public_ping": config.public_target,
+            "registry": config.registry_host,
+        },
+        "baseline_samples": baseline_samples,
+        "load_samples": load_samples,
+        "baseline_summary": baseline_summary,
+        "load_summary": load_summary,
+        "download_load": download_report,
+        "adapter_counters": {
+            "before": before_counters,
+            "after": after_counters,
+            "delta": counter_delta,
+        },
+        "capability_matrix": capability_matrix(),
+        "optimizer_action_ledger": optimizer_action_ledger(),
+        "notes": [
+            "Router diagnosis is read-only apart from report output and intentional download test traffic.",
+            "Recommended router actions are manual because this endpoint cannot safely mutate an ISP modem, router, or AP without a reviewed integration.",
+            "Repeat the same test after one router/AP change at a time; do not mix router changes with new host TCP tweaks.",
+        ],
+    }
+    if args.platform_diagnostics:
+        report["platform_diagnostics"] = collect_platform_diagnostics()
+    if args.redact:
+        report = redact_report_value(report)
+    destination = (
+        Path(args.output).expanduser()
+        if args.output
+        else report_path("router-diagnose")
+    )
+    atomic_write_json(destination, report, private_parent=not bool(args.output))
+    print(f"Report saved: {destination}")
+    return 0
+
+
 def launch_monitored_command(command: Sequence[str]) -> subprocess.Popen[Any]:
     kwargs: Dict[str, Any] = {}
     if platform.system() == "Windows":
@@ -5921,6 +6723,57 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_probe_options(benchmark)
     benchmark.set_defaults(function=command_benchmark, platform_diagnostics=True)
+
+    router_diagnose = subparsers.add_parser(
+        "router-diagnose",
+        help="diagnose router/AP/WAN symptoms with read-only loaded evidence",
+    )
+    router_diagnose.add_argument(
+        "--baseline-seconds",
+        type=lambda value: bounded_positive_float(value, maximum=300.0),
+        default=8.0,
+        help="idle baseline duration before router pressure load (default: 8)",
+    )
+    router_diagnose.add_argument(
+        "--load-seconds",
+        type=lambda value: bounded_positive_float(value, maximum=300.0),
+        default=20.0,
+        help="duration of loaded router probe sampling (default: 20)",
+    )
+    router_diagnose.add_argument(
+        "--parallel-downloads",
+        type=lambda value: bounded_positive_int(value, maximum=16),
+        default=4,
+        help="parallel HTTPS download streams (default: 4)",
+    )
+    router_diagnose.add_argument(
+        "--download-mb",
+        type=lambda value: bounded_positive_int(value, maximum=256),
+        default=16,
+        help="maximum MiB downloaded per stream (default: 16)",
+    )
+    router_diagnose.add_argument(
+        "--download-url",
+        type=benchmark_download_url,
+        default=DEFAULT_DOWNLOAD_URL,
+        help="HTTPS URL used for bounded download load",
+    )
+    router_diagnose.add_argument(
+        "--min-download-mbps",
+        type=non_negative_float,
+        default=18.0,
+        help="download target used for router throughput findings (default: 18)",
+    )
+    router_diagnose.add_argument(
+        "--no-platform-diagnostics",
+        dest="platform_diagnostics",
+        action="store_false",
+        help="skip slower OS diagnostics and only save router evidence",
+    )
+    add_probe_options(router_diagnose)
+    router_diagnose.set_defaults(
+        function=command_router_diagnose, platform_diagnostics=True
+    )
 
     watch = subparsers.add_parser(
         "watch", help="monitor gateway/public/registry health while a command runs"

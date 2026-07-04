@@ -85,6 +85,30 @@ def loaded_loss_summary():
     }
 
 
+def clean_router_baseline_summary():
+    return {
+        "gateway_ping": {
+            "available": True,
+            "loss_percent": 0.0,
+            "median_ms": 1.0,
+            "p95_ms": 2.0,
+        },
+        "public_ping": {
+            "available": True,
+            "loss_percent": 0.0,
+            "median_ms": 24.0,
+            "p95_ms": 30.0,
+            "jitter_avg_ms": 1.0,
+        },
+        "dns": {"available": True, "failure_percent": 0.0, "median_ms": 25.0},
+        "registry_https": {
+            "available": True,
+            "failure_percent": 0.0,
+            "median_ms": 280.0,
+        },
+    }
+
+
 class CliGuardrailTests(unittest.TestCase):
     def test_help_when_requested_does_not_advertise_anti_folklore_actions(self) -> None:
         # Given: normal CLI help entry points.
@@ -92,6 +116,7 @@ class CliGuardrailTests(unittest.TestCase):
             ("--help",),
             ("diagnose", "--help"),
             ("benchmark", "--help"),
+            ("router-diagnose", "--help"),
             ("watch", "--help"),
             ("apply", "--help"),
         )
@@ -238,6 +263,121 @@ There is 1 interface on the system:
         self.assertIn("marginal_two_four_ghz_signal", recommendation_ids)
         for item in recommendations:
             self.assertEqual(item["mutation"].endswith("advisory only"), True)
+
+    def test_linux_wifi_channel_evidence_recommends_router_side_fix(self) -> None:
+        # Given: Linux nmcli exposes the same overlapping 2.4 GHz shape.
+        quality = {
+            "available": True,
+            "platform": "Linux",
+            "reports": {
+                "nmcli_wifi_terse": {"stdout": "*:p00dy2GHz:5:120 Mbit/s:68:wlan0\n"}
+            },
+        }
+
+        # When: StableNet normalizes link evidence across OSes.
+        records = net_stability.wifi_link_records(quality)
+        recommendations = net_stability.wifi_link_recommendations(quality)
+
+        # Then: router-side channel and placement advice is available without OS mutation.
+        self.assertEqual(records[0]["name"], "wlan0")
+        self.assertEqual(records[0]["channel"], "5")
+        recommendation_ids = {item["id"] for item in recommendations}
+        self.assertIn("two_four_ghz_overlap_channel", recommendation_ids)
+        self.assertIn("marginal_two_four_ghz_signal", recommendation_ids)
+
+    def test_macos_wifi_channel_evidence_recommends_router_side_fix(self) -> None:
+        # Given: macOS system_profiler exposes current Wi-Fi channel evidence.
+        output = """
+Wi-Fi:
+  Interfaces:
+    en0:
+      Current Network Information:
+        p00dy2GHz:
+          PHY Mode: 802.11n
+          Channel: 5
+          Signal / Noise: -52 dBm / -90 dBm
+          Transmit Rate: 120
+"""
+        quality = {
+            "available": True,
+            "platform": "macOS",
+            "reports": {"airport_profiler": {"stdout": output}},
+        }
+
+        # When: the profiler output is converted into StableNet link evidence.
+        records = net_stability.wifi_link_records(quality)
+        recommendations = net_stability.wifi_link_recommendations(quality)
+
+        # Then: channel evidence is preserved and the router/AP action remains advisory.
+        self.assertEqual(records[0]["name"], "p00dy2GHz")
+        self.assertEqual(records[0]["channel"], "5")
+        channel_recommendation = [
+            item
+            for item in recommendations
+            if item["id"] == "two_four_ghz_overlap_channel"
+        ][0]
+        self.assertEqual(
+            channel_recommendation["mutation"], "router-side advisory only"
+        )
+
+    def test_router_diagnosis_recommends_sqm_only_when_gateway_stays_clean(
+        self,
+    ) -> None:
+        # Given: the gateway remains clean while public jitter/loss rises under load.
+        wifi_link_quality = {
+            "available": True,
+            "platform": "Windows",
+            "interfaces": [],
+            "recommendations": [],
+        }
+        download_report = {"throughput_mbps": 18.5, "failures": 0}
+
+        # When: the router-side classifier reviews the loaded evidence.
+        diagnosis = net_stability.router_side_diagnosis(
+            clean_router_baseline_summary(),
+            loaded_loss_summary(),
+            wifi_link_quality,
+            download_report,
+            18.0,
+        )
+
+        # Then: the suite recommends manual SQM/AQM verification, not host folklore.
+        self.assertEqual(diagnosis["verdict"], "router_wan_queue_likely")
+        optimization_ids = {item["id"] for item in diagnosis["optimizations"]}
+        self.assertIn("router-sqm-aqm", optimization_ids)
+        for item in diagnosis["optimizations"]:
+            self.assertFalse(item["automatic"])
+            self.assertEqual(item["mutation"], "router-admin manual only")
+
+    def test_router_diagnosis_suppresses_throughput_when_load_cap_is_too_small(
+        self,
+    ) -> None:
+        # Given: a quick smoke run cannot physically transfer enough bytes to prove 18 Mbps.
+        wifi_link_quality = {
+            "available": True,
+            "platform": "Windows",
+            "interfaces": [],
+            "recommendations": [],
+        }
+        download_report = {"throughput_mbps": 3.5, "failures": 0}
+
+        # When: the classifier receives the configured capacity ceiling.
+        diagnosis = net_stability.router_side_diagnosis(
+            clean_router_baseline_summary(),
+            loaded_loss_summary(),
+            wifi_link_quality,
+            download_report,
+            18.0,
+            load_capacity_mbps=4.0,
+        )
+
+        # Then: it keeps real queue evidence but does not invent a throughput-cap finding.
+        finding_ids = {item["id"] for item in diagnosis["findings"]}
+        self.assertIn("wan-queue-pressure", finding_ids)
+        self.assertNotIn("throughput-below-target-with-clean-first-hop", finding_ids)
+        self.assertIn(
+            "throughput findings are suppressed", diagnosis["limitations"][-1]
+        )
 
     def test_windows_power_state_when_usb_suspend_enabled_reports_usb_state(
         self,

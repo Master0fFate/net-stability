@@ -227,6 +227,8 @@ class NetStabilityGui:
             self.events.put("STAGE:audit:Running")
         if "m-lab" in lowered or "ndt7" in lowered or "verification status" in lowered:
             self.events.put("STAGE:audit:Running")
+        if "router-side diagnosis" in lowered or "router pressure" in lowered:
+            self.events.put("STAGE:audit:Running")
         if "wi-fi link quality" in lowered or "link inspector" in lowered:
             self.events.put("STAGE:system:Running")
         if "backup created" in lowered or "restore point" in lowered:
@@ -303,7 +305,7 @@ def smoke_check() -> int:
         "Primary actions: Audit evidence first, Verify speed and stability, Full Optimization"
     )
     print(
-        "Advanced actions: M-Lab speed test, Inspect Wi-Fi link, Repair DNS, Measure idle baseline, Benchmark pressure points, Run full diagnostics, "
+        "Advanced actions: M-Lab speed test, Inspect Wi-Fi link, Repair DNS, Measure idle baseline, Benchmark pressure points, Diagnose router side, Run full diagnostics, "
         "Optimize connection, Optimize npm only, Reset Network Stack, Restore latest backup, Show backups"
     )
     return 0

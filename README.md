@@ -9,6 +9,7 @@ Net Stability is a small, reversible network reliability helper for weak Wi-Fi l
 
 It includes a simple desktop UI with three primary paths: **Audit evidence first** for read-only diagnostics, **Verify speed and stability** for the M-Lab speed gate plus Wi-Fi link inspection, and **Full Optimization** to apply every supported OS and npm tuning tweak in one shot.
 It also includes a cross-platform **Repair DNS** action: Windows keeps the deeper DNS policy repair for corrupted NRPT state, while Linux and macOS use platform-native DNS cache and resolver repair. On Windows USB Wi-Fi adapters, system optimization now records and repairs the active power-plan USB suspend path that can leave a reconnected adapter stuck in a no-internet state.
+For cases where device-side tuning is already clean, **Diagnose router side** separates router/AP/WAN symptoms from client-side symptoms and prints only evidence-backed router actions to verify.
 
 ---
 
@@ -19,6 +20,7 @@ It also includes a cross-platform **Repair DNS** action: Windows keeps the deepe
 - Runs a read-only M-Lab NDT7 application speed test through the Locate API v2 and stores reports without access tokens.
 - Inspects Wi-Fi link evidence from documented OS surfaces: Windows `netsh wlan`, Linux `nmcli`/`iw`, and macOS `networksetup`/`system_profiler`.
 - Runs a read-only pressure-point benchmark with idle baseline probes, bounded HTTPS download load, packet loss, jitter, DNS, HTTPS, throughput, and adapter counter evidence.
+- Runs a router-side diagnostic suite that classifies Wi-Fi channel/placement, AP/router first-hop degradation, WAN queue pressure, router DNS forwarding symptoms, and router/ISP throughput ceilings without mutating router settings.
 - **Windows**: Restores restricted TCP receive-window auto-tuning, adjusts Wi-Fi power policy, disables active-plan USB suspend for detected USB Wi-Fi adapters, repairs exact USB adapter power-management flags when Windows exposes them, sets MTU to 1500, disables Delivery Optimization P2P sharing, sets QoS reservable bandwidth to 0%, and tunes TCP retransmission registry values.
 - **Windows DNS policy**: Diagnoses NRPT corruption, DNS Client timeout events, and invalid resolver entries; repairs only invalid DNS server assignments and flushes the DNS cache, without deleting VPN or NRPT rules automatically.
 - **Linux DNS repair**: Flushes the resolver cache when supported and repairs DNS servers to the stable 1.1.1.1 / 1.0.0.1 profile when the current resolver state is missing or invalid.
@@ -68,6 +70,7 @@ python net_stability.py speedtest
 python net_stability.py link-quality
 python net_stability.py verify
 python net_stability.py benchmark
+python net_stability.py router-diagnose
 python net_stability.py apply
 python net_stability.py apply --npm-only
 python net_stability.py restore latest
@@ -87,6 +90,7 @@ python net_stability.py speedtest --skip-upload --redact
 python net_stability.py verify --min-download-mbps 15 --redact
 python net_stability.py verify --loaded --load-seconds 10 --parallel-downloads 2 --redact
 python net_stability.py benchmark --load-seconds 30 --parallel-downloads 4 --download-mb 16 --redact
+python net_stability.py router-diagnose --min-download-mbps 18 --redact
 python net_stability.py apply --dry-run
 python net_stability.py apply --system-only
 python net_stability.py restore latest --npm-only
@@ -102,7 +106,7 @@ The desktop UI is intentionally small and cross-platform:
 - Built with `tkinter`, included with most Python desktop installs.
 - One runtime dependency: `websockets`, used only for M-Lab NDT7 speed tests.
 - Three primary buttons: **Audit evidence first**, **Verify speed and stability**, and **Full Optimization**.
-- Advanced actions (M-Lab speed test, Wi-Fi link inspection, DNS repair, idle measurement, pressure-point benchmark, diagnostics, npm-only, reset network, restore, backups) stay visible but secondary.
+- Advanced actions (M-Lab speed test, Wi-Fi link inspection, DNS repair, idle measurement, pressure-point benchmark, router-side diagnosis, diagnostics, npm-only, reset network, restore, backups) stay visible but secondary.
 - An 8-stage progress panel tracks every step of the pipeline.
 - The log panel streams real command output in a dark terminal-style view.
 
@@ -127,6 +131,33 @@ The pressure-point classifier separates the likely failure layer:
 - Loaded p95 latency rises sharply without gateway loss: evaluate SQM/AQM such as FQ-CoDel or CAKE at the actual bottleneck.
 
 StableNet does not silently mutate router settings. Router queue control remains advisory unless a reviewed router integration is added later.
+
+---
+
+## Router-Side Diagnosis
+
+Use `router-diagnose` when OS/client optimization is already applied but throughput or package installs still collapse:
+
+```bash
+python net_stability.py router-diagnose --min-download-mbps 18 --redact
+```
+
+The suite is read-only apart from the JSON report and intentional download test traffic. It combines:
+
+- Idle gateway, public ICMP, DNS, and HTTPS probes.
+- Bounded HTTPS download pressure while the same probes continue.
+- Cross-platform Wi-Fi link evidence from Windows, Linux, or macOS.
+- Adapter counters on Windows when available.
+
+The router classifier only recommends actions when the evidence supports them:
+
+- Overlapping 2.4 GHz AP channel or marginal signal: verify router/AP channel plan, width, band choice, and placement.
+- Gateway degrades during load: inspect AP/router CPU, wireless airtime, client caps, guest-network policy, and local-link contention.
+- Gateway stays clean while public latency/jitter rises: evaluate SQM/AQM such as FQ-CoDel or CAKE at the WAN bottleneck.
+- DNS fails while HTTPS is not equally broken: inspect router DNS forwarding only after repeated evidence, without deleting VPN or split-DNS policy.
+- Throughput misses the target with a clean first hop: inspect router rate limits, WAN link state, modem/router logs, and compare with a wired or second-device run.
+
+Every recommendation includes expected metrics and a verification command. StableNet does not apply router settings automatically because router firmware, ISP modem modes, and household-wide policies need router-admin review.
 
 ---
 
@@ -292,8 +323,8 @@ Built outputs appear in `release-artifacts/<platform>-<arch>/`:
 To publish release assets through GitHub, tag and push the release version:
 
 ```bash
-git tag v1.2.0
-git push origin v1.2.0
+git tag v1.3.0
+git push origin v1.3.0
 ```
 
 The GitHub Actions workflow in `.github/workflows/release.yml` builds Windows, Linux, and macOS artifacts from tags (or via workflow dispatch), creates a combined `checksums.txt`, and uploads `.exe`, extensionless Unix executables, `.tar.gz`, and macOS `.dmg` outputs to the release.
