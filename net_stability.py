@@ -29,7 +29,7 @@ Backups are stored in:
 Examples
 --------
   python net_stability.py diagnose
-  python net_stability.py watch -- npm install
+  python net_stability.py guard -- npm run build
   python net_stability.py apply
   python net_stability.py restore latest
   python net_stability.py list-backups
@@ -80,6 +80,7 @@ from net_stability_benchmark import (
     jitter_metrics,
     summarize_download_results,
 )
+from net_stability_build_guard import create_build_guard_plan, launch_guarded_command
 from net_stability_ndt7 import DEFAULT_LOCATE_URL, Ndt7Config, run_ndt7_speedtest
 import windows_dns_policy
 
@@ -87,7 +88,7 @@ import windows_dns_policy
 APP_DISPLAY_NAME = "Net Stability"
 APP_DIR_WINDOWS = "NetStability"
 APP_DIR_UNIX = "netstability"
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 SCHEMA_VERSION = 1
 
 # Stable Windows power-setting GUIDs. Aliases are attempted first, and these
@@ -4912,6 +4913,16 @@ ConvertTo-Json -InputObject $items -Depth 4 -Compress
         data["windows_network_drivers"] = run_powershell(
             driver_script, timeout=30
         ).to_report()
+        wlan_failure_script = r"""
+$start=(Get-Date).AddDays(-7)
+$items=@(Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-WLAN-AutoConfig/Operational';StartTime=$start} -ErrorAction SilentlyContinue |
+Where-Object {$_.Id -in 8002,8003,11006} |
+Select-Object -First 100 TimeCreated,Id,LevelDisplayName,Message)
+ConvertTo-Json -InputObject $items -Depth 4 -Compress
+"""
+        data["windows_wlan_failures"] = run_powershell(
+            wlan_failure_script, timeout=30
+        ).to_report()
     elif system == "Linux":
         if shutil.which("nmcli"):
             commands.extend(
@@ -6327,9 +6338,25 @@ def command_watch(args: argparse.Namespace) -> int:
     if command and command[0] == "--":
         command = command[1:]
     if not command:
+        command_name = "guard" if args.stabilize else "watch"
         raise NetStabilityError(
-            "watch requires a command after --, for example: watch -- npm install"
+            f"{command_name} requires a command after --, for example: "
+            f"{command_name} -- npm run build"
         )
+
+    guard_plan = None
+    if args.stabilize:
+        guard_plan = create_build_guard_plan(
+            jobs=args.jobs, reserve_cpus=args.reserve_cpus
+        )
+        print(
+            "Build guard: "
+            f"{guard_plan.jobs}/{guard_plan.cpu_count} worker slots, "
+            f"priority={guard_plan.priority}, network bandwidth uncapped"
+        )
+        if args.dry_run:
+            print(json.dumps(guard_plan.to_report(), indent=2, sort_keys=True))
+            return 0
 
     gateway = default_gateway()
     baseline_count = max(1, int(math.ceil(args.baseline_seconds / args.interval)))
@@ -6349,7 +6376,11 @@ def command_watch(args: argparse.Namespace) -> int:
     print_sample_summary(baseline_summary, "Baseline:")
 
     try:
-        process = launch_monitored_command(command)
+        process = (
+            launch_guarded_command(command, guard_plan)
+            if guard_plan is not None
+            else launch_monitored_command(command)
+        )
     except OSError as exc:
         raise NetStabilityError(f"Could not launch command: {exc}") from exc
 
@@ -6417,6 +6448,7 @@ def command_watch(args: argparse.Namespace) -> int:
         "interpretation": signals,
         "observations": observations,
         "recommendations": recommendations,
+        "build_guard": guard_plan.to_report() if guard_plan is not None else None,
         "capability_matrix": capability_matrix(),
         "notes": [
             "ICMP can be rate-limited or blocked; HTTPS probes are included for corroboration.",
@@ -6428,6 +6460,8 @@ def command_watch(args: argparse.Namespace) -> int:
     destination = (
         Path(args.output).expanduser() if args.output else report_path("watch")
     )
+    if not args.output and guard_plan is not None:
+        destination = report_path("guard")
     atomic_write_json(destination, report, private_parent=not bool(args.output))
     print(f"Report saved: {destination}")
     return 130 if interrupted else returncode
@@ -6449,6 +6483,13 @@ def positive_float(value: str) -> float:
 
 def non_negative_float(value: str) -> float:
     number = float(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be at least 0")
+    return number
+
+
+def non_negative_int(value: str) -> int:
+    number = int(value)
     if number < 0:
         raise argparse.ArgumentTypeError("must be at least 0")
     return number
@@ -6790,7 +6831,47 @@ def build_parser() -> argparse.ArgumentParser:
         nargs=argparse.REMAINDER,
         help="command after --, e.g. -- npm install",
     )
-    watch.set_defaults(function=command_watch)
+    watch.set_defaults(
+        function=command_watch,
+        stabilize=False,
+        dry_run=False,
+        jobs=None,
+        reserve_cpus=1,
+    )
+
+    guard = subparsers.add_parser(
+        "guard",
+        help="run a build with CPU headroom while monitoring network health",
+    )
+    guard.add_argument(
+        "--baseline-seconds",
+        type=positive_float,
+        default=5.0,
+        help="idle baseline duration before launching the build (default: 5)",
+    )
+    guard.add_argument(
+        "--jobs",
+        type=positive_int,
+        help="build worker cap (default: logical CPUs minus reserved CPUs)",
+    )
+    guard.add_argument(
+        "--reserve-cpus",
+        type=non_negative_int,
+        default=1,
+        help="logical CPUs kept out of cooperative build pools (default: 1)",
+    )
+    guard.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the guard plan without launching the command",
+    )
+    add_probe_options(guard)
+    guard.add_argument(
+        "command",
+        nargs=argparse.REMAINDER,
+        help="build command after --, e.g. -- npm run build",
+    )
+    guard.set_defaults(function=command_watch, stabilize=True)
 
     apply_parser = subparsers.add_parser(
         "apply", help="back up current state, then apply reliability tuning"

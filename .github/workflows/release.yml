@@ -39,6 +39,13 @@ jobs:
         env:
           RUNNER_ARCH: ${{ runner.arch }}
         run: python scripts/build_release.py --platform ${{ matrix.platform }}
+      - name: QA packaged CLI
+        shell: bash
+        run: |
+          CLI="$(find release-artifacts/${{ matrix.platform }}-* -maxdepth 1 -type f -name 'net-stability-${{ matrix.platform }}-*' ! -name '*.tar.gz' | head -n 1)"
+          test -n "$CLI"
+          chmod +x "$CLI"
+          "$CLI" --version
       - name: Package macOS disk image
         if: runner.os == 'macOS'
         run: |

@@ -7,6 +7,8 @@
 
 Net Stability is a small, reversible network reliability helper for weak Wi-Fi links and flaky `npm install` runs. It diagnoses the likely failure layer first, verifies speed with M-Lab NDT7 when requested, applies conservative evidence-backed tuning, and restores exact backups.
 
+For CPU-heavy package builds, the cross-platform **Build Guard** keeps one logical CPU available for network/USB driver work, lowers the build process priority, and monitors the connection. It does not throttle downloads or cap network bandwidth.
+
 It includes a simple desktop UI with three primary paths: **Audit evidence first** for read-only diagnostics, **Verify speed and stability** for the M-Lab speed gate plus Wi-Fi link inspection, and **Full Optimization** to apply every supported OS and npm tuning tweak in one shot.
 It also includes a cross-platform **Repair DNS** action: Windows keeps the deeper DNS policy repair for corrupted NRPT state, while Linux and macOS use platform-native DNS cache and resolver repair. On Windows USB Wi-Fi adapters, system optimization now records and repairs the active power-plan USB suspend path that can leave a reconnected adapter stuck in a no-internet state.
 For cases where device-side tuning is already clean, **Diagnose router side** separates router/AP/WAN symptoms from client-side symptoms and prints only evidence-backed router actions to verify.
@@ -17,6 +19,7 @@ For cases where device-side tuning is already clean, **Diagnose router side** se
 
 - Creates a restore point **before** applying any change.
 - Applies a weak-link npm profile: fewer per-origin sockets, longer fetch timeouts, more retries, and `prefer-offline`.
+- Runs builds with CPU headroom through `guard`, without limiting network bandwidth.
 - Runs a read-only M-Lab NDT7 application speed test through the Locate API v2 and stores reports without access tokens.
 - Inspects Wi-Fi link evidence from documented OS surfaces: Windows `netsh wlan`, Linux `nmcli`/`iw`, and macOS `networksetup`/`system_profiler`.
 - Runs a read-only pressure-point benchmark with idle baseline probes, bounded HTTPS download load, packet loss, jitter, DNS, HTTPS, throughput, and adapter counter evidence.
@@ -76,6 +79,7 @@ python net_stability.py apply --npm-only
 python net_stability.py restore latest
 python net_stability.py list-backups
 python net_stability.py watch -- npm install
+python net_stability.py guard -- npm run build
 python net_stability.py reset-network
 python net_stability.py repair-dns
 ```
@@ -95,7 +99,18 @@ python net_stability.py apply --dry-run
 python net_stability.py apply --system-only
 python net_stability.py restore latest --npm-only
 python net_stability.py repair-dns --dry-run
+python net_stability.py guard --dry-run -- npm run build
 ```
+
+### Build Guard
+
+Use `guard` when npm lifecycle scripts or native compilation expose adapter or driver instability:
+
+```bash
+python net_stability.py guard -- npm run build
+```
+
+The guard lowers the child process priority and publishes a conservative worker count through standard build-tool environment variables used by node-gyp, Make, Ninja, CMake, Cargo, and libuv. It reserves one logical CPU by default so kernel network and USB work is less likely to be starved. It does **not** shape traffic, limit download speed, or change package-manager registries. Use `--jobs` or `--reserve-cpus` to override the CPU policy.
 
 ---
 
@@ -323,8 +338,8 @@ Built outputs appear in `release-artifacts/<platform>-<arch>/`:
 To publish release assets through GitHub, tag and push the release version:
 
 ```bash
-git tag v1.3.0
-git push origin v1.3.0
+git tag v1.4.0
+git push origin v1.4.0
 ```
 
 The GitHub Actions workflow in `.github/workflows/release.yml` builds Windows, Linux, and macOS artifacts from tags (or via workflow dispatch), creates a combined `checksums.txt`, and uploads `.exe`, extensionless Unix executables, `.tar.gz`, and macOS `.dmg` outputs to the release.
