@@ -30,7 +30,7 @@ Examples
 --------
   python net_stability.py diagnose
   python net_stability.py guard -- npm run build
-  python net_stability.py apply
+  python net_stability.py apply --dry-run
   python net_stability.py restore latest
   python net_stability.py list-backups
 
@@ -73,22 +73,36 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
-from net_stability_benchmark import (
-    DEFAULT_DOWNLOAD_URL,
-    DownloadLoadConfig,
-    download_worker,
-    jitter_metrics,
-    summarize_download_results,
-)
-from net_stability_build_guard import create_build_guard_plan, launch_guarded_command
-from net_stability_ndt7 import DEFAULT_LOCATE_URL, Ndt7Config, run_ndt7_speedtest
-import windows_dns_policy
+from importlib import import_module
+
+_benchmark = import_module("net_stability_benchmark")
+_action_policy = import_module("net_stability_action_policy")
+_build_guard = import_module("net_stability_build_guard")
+_link_diagnostics = import_module("net_stability_link_diagnostics")
+_wifi_analysis = import_module("net_stability_wifi_analysis")
+_router_diagnostics = import_module("net_stability_router_diagnostics")
+_ndt7 = import_module("net_stability_ndt7")
+windows_dns_policy = import_module("windows_dns_policy")
+DEFAULT_DOWNLOAD_URL = _benchmark.DEFAULT_DOWNLOAD_URL
+DownloadLoadConfig = _benchmark.DownloadLoadConfig
+download_worker = _benchmark.download_worker
+jitter_metrics = _benchmark.jitter_metrics
+summarize_download_results = _benchmark.summarize_download_results
+optimizer_action_ledger = _action_policy.optimizer_action_ledger
+_planned_changes = _action_policy.planned_changes
+create_build_guard_plan = _build_guard.create_build_guard_plan
+launch_guarded_command = _build_guard.launch_guarded_command
+collect_ethernet_link_quality = _link_diagnostics.collect_ethernet_link_quality
+collect_path_context = _link_diagnostics.collect_path_context
+DEFAULT_LOCATE_URL = _ndt7.DEFAULT_LOCATE_URL
+Ndt7Config = _ndt7.Ndt7Config
+run_ndt7_speedtest = _ndt7.run_ndt7_speedtest
 
 
 APP_DISPLAY_NAME = "Net Stability"
 APP_DIR_WINDOWS = "NetStability"
 APP_DIR_UNIX = "netstability"
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 SCHEMA_VERSION = 1
 
 # Stable Windows power-setting GUIDs. Aliases are attempted first, and these
@@ -202,22 +216,19 @@ EVIDENCE_POLICY: Tuple[Dict[str, str], ...] = (
 )
 
 ANTI_FOLKLORE_DENYLIST: Tuple[str, ...] = (
-    # Overridden: paper-backed MTU=1500 is applied when safe
-    # "fixed MTU values such as 1400 or 1472",
+    "unmeasured path-parameter tuning",
+    "resolver replacement without configuration or policy evidence",
     "global IPv6 disable",
-    # Overridden: paper-backed DNS replacement to 1.1.1.1
-    # "DNS replacement as a speed boost",
     "TCP ACK/Nagle registry recipes",
     "TCP receive-window autotuning disable",
     "blanket NIC offload disable",
     "RSS or VMQ tuning on Wi-Fi",
-    # Overridden: paper-backed QoS reservable bandwidth = 0%
-    # "NetworkThrottlingIndex or SystemResponsiveness gaming tweaks",
+    "NetworkThrottlingIndex or SystemResponsiveness gaming tweaks",
+    "reserved-bandwidth registry changes without measured evidence",
     "forced 5 GHz or maximum channel width",
     "global USB selective suspend disable",
     "Wi-Fi retry-limit reduction",
-    # Overridden: paper-backed BBR on Linux
-    # "blind CUBIC, BBR, ECN, L4S, or DSCP changes",
+    "kernel congestion, queue, or packet-marking changes without host policy",
     "firewall or antivirus disable",
     "automatic random driver installation",
 )
@@ -1049,10 +1060,23 @@ def windows_set_tcp_autotuning(level: str) -> CommandResult:
 def capture_windows_state() -> Dict[str, Any]:
     return {
         "tcp_global": windows_tcp_global_state(),
-        "power": windows_power_state(),
-        "wifi_adapters": windows_wifi_adapters_state(),
         "dns_policy": windows_dns_policy_health().to_report(),
     }
+
+
+def windows_dns_health_from_manifest(
+    manifest: Mapping[str, Any],
+) -> windows_dns_policy.DnsPolicyHealth:
+    state = manifest.get("state")
+    if not isinstance(state, Mapping):
+        raise NetStabilityError("Snapshot does not contain system state")
+    system_state = state.get("system")
+    if not isinstance(system_state, Mapping):
+        raise NetStabilityError("Snapshot does not contain Windows system state")
+    dns_policy_state = system_state.get("dns_policy")
+    if not isinstance(dns_policy_state, Mapping):
+        raise NetStabilityError("Snapshot does not contain Windows DNS policy state")
+    return windows_dns_policy.health_from_report(dns_policy_state)
 
 
 def windows_set_power_value(
@@ -1208,242 +1232,41 @@ def windows_set_device_power_management(
     return run_powershell(script, timeout=30)
 
 
-def apply_windows_system(
-    manifest: Dict[str, Any],
-    manifest_path: Path,
-    *,
-    include_battery: bool,
-    restart: bool,
-) -> None:
-    state = manifest.get("state", {}).get("system", {})
-    adapters_state = state.get("wifi_adapters", {})
-    adapters = (
-        adapters_state.get("adapters", []) if isinstance(adapters_state, dict) else []
-    )
-    usb_adapters = windows_usb_wifi_adapters(adapters)
-    tcp_global = state.get("tcp_global", {})
-    if isinstance(tcp_global, dict) and windows_tcp_autotuning_needs_repair(tcp_global):
-        original_level = (
-            str(tcp_global.get("receive_window_autotuning") or "").strip().lower()
-        )
-        result = windows_set_tcp_autotuning(WINDOWS_TCP_AUTOTUNING_NORMAL)
-        if result.ok:
-            record = {
-                "type": "windows_tcp_autotuning",
-                "original_level": original_level,
-                "applied": WINDOWS_TCP_AUTOTUNING_NORMAL,
-            }
-            manifest.setdefault("applied", {}).setdefault("system", []).append(record)
-            atomic_write_json(manifest_path, manifest)
-            print("  + Windows TCP receive-window auto-tuning: normal")
-        else:
-            print_command_failure("Windows TCP receive-window auto-tuning", result)
-            record_apply_issue(
-                manifest,
-                manifest_path,
-                "error",
-                "windows",
-                "Windows TCP receive-window auto-tuning repair failed: "
-                f"{result.error or result.stderr.strip() or result.stdout.strip()}",
-            )
-
-    power = state.get("power", {})
-    if power.get("available"):
-        scheme = str(power["scheme_guid"])
-        results = windows_set_power_value(scheme, 0, 0 if include_battery else None)
-        if all(result.ok for result in results):
-            record = {
-                "type": "windows_wifi_power",
-                "scheme_guid": scheme,
-                "ac_value": 0,
-                "dc_value": 0 if include_battery else None,
-            }
-            manifest.setdefault("applied", {}).setdefault("system", []).append(record)
-            atomic_write_json(manifest_path, manifest)
-            print(
-                "  + Windows Wi-Fi power policy: Maximum Performance on AC"
-                + (" and battery" if include_battery else "")
-            )
-        else:
-            for result in results:
-                if not result.ok:
-                    print_command_failure("Windows Wi-Fi power policy", result)
-                    record_apply_issue(
-                        manifest,
-                        manifest_path,
-                        "error",
-                        "windows",
-                        f"Windows Wi-Fi power policy failed: {result.error or result.stderr.strip() or result.stdout.strip()}",
-                    )
-    else:
-        message = f"Windows Wi-Fi power policy skipped: {power.get('error', 'setting unavailable')}"
-        print(f"  - {message}")
-        record_apply_issue(manifest, manifest_path, "warning", "windows", message)
-
-    usb_power = (
-        power.get("usb_selective_suspend", {}) if isinstance(power, dict) else {}
-    )
-    if usb_adapters and isinstance(usb_power, dict):
-        if usb_power.get("available"):
-            scheme = str(usb_power.get("scheme_guid") or power.get("scheme_guid") or "")
-            ac_value = _valid_power_index(usb_power.get("ac_value"))
-            dc_value = _valid_power_index(usb_power.get("dc_value"))
-            desired_ac = 0 if ac_value not in {None, 0} else None
-            desired_dc = 0 if include_battery and dc_value not in {None, 0} else None
-            if scheme and (desired_ac is not None or desired_dc is not None):
-                results = windows_set_usb_selective_suspend(
-                    scheme, desired_ac, desired_dc
-                )
-                if all(result.ok for result in results):
-                    record = {
-                        "type": "windows_usb_selective_suspend",
-                        "scheme_guid": scheme,
-                        "adapters": [
-                            {
-                                "Name": adapter.get("Name"),
-                                "InterfaceDescription": adapter.get(
-                                    "InterfaceDescription"
-                                ),
-                                "PnPDeviceID": adapter.get("PnPDeviceID"),
-                            }
-                            for adapter in usb_adapters
-                        ],
-                        "original": {"ac_value": ac_value, "dc_value": dc_value},
-                        "applied": {
-                            "ac_value": desired_ac,
-                            "dc_value": desired_dc,
-                        },
-                    }
-                    manifest.setdefault("applied", {}).setdefault("system", []).append(
-                        record
-                    )
-                    atomic_write_json(manifest_path, manifest)
-                    print(
-                        "  + Windows USB Wi-Fi suspend policy: disabled on active power plan"
-                        + (
-                            " for AC and battery"
-                            if desired_dc is not None
-                            else " for AC"
-                        )
-                    )
-                else:
-                    for result in results:
-                        if not result.ok:
-                            print_command_failure(
-                                "Windows USB Wi-Fi suspend policy", result
-                            )
-                            record_apply_issue(
-                                manifest,
-                                manifest_path,
-                                "error",
-                                "windows",
-                                "Windows USB Wi-Fi suspend policy failed: "
-                                f"{result.error or result.stderr.strip() or result.stdout.strip()}",
-                            )
-        else:
-            message = (
-                "Windows USB Wi-Fi suspend policy skipped: "
-                f"{usb_power.get('error', 'setting unavailable')}"
-            )
-            print(f"  - {message}")
-            record_apply_issue(manifest, manifest_path, "warning", "windows", message)
-
-    if not adapters:
-        print("  - no configurable physical Wi-Fi adapter power properties found")
-        return
-
-    for adapter in adapters:
-        if adapter in usb_adapters and _valid_bool(
-            adapter.get("DevicePowerManagementEnabled")
-        ):
-            result = windows_set_device_power_management(adapter, False)
-            if result.ok:
-                record = {
-                    "type": "windows_usb_device_power",
-                    "adapter": {
-                        "Name": adapter.get("Name"),
-                        "InterfaceGuid": adapter.get("InterfaceGuid"),
-                        "InterfaceDescription": adapter.get("InterfaceDescription"),
-                        "PnPDeviceID": adapter.get("PnPDeviceID"),
-                    },
-                    "original_enabled": True,
-                    "applied_enabled": False,
-                }
-                manifest.setdefault("applied", {}).setdefault("system", []).append(
-                    record
-                )
-                atomic_write_json(manifest_path, manifest)
-                description = adapter.get("InterfaceDescription") or adapter.get("Name")
-                print(
-                    f"  + disabled Windows USB device power management on {description}"
-                )
-            else:
-                print_command_failure(
-                    f"USB device power management for {adapter.get('Name')}", result
-                )
-                record_apply_issue(
-                    manifest,
-                    manifest_path,
-                    "error",
-                    "windows",
-                    f"USB device power management failed for {adapter.get('Name')}: "
-                    f"{result.error or result.stderr.strip() or result.stdout.strip()}",
-                )
-
-        desired: Dict[str, str] = {}
-        original: Dict[str, str] = {}
-        for prop in ("SelectiveSuspend", "DeviceSleepOnDisconnect"):
-            current = _valid_pm_value(adapter.get(prop))
-            if current:
-                original[prop] = current
-            if current == "Enabled":
-                desired[prop] = "Disabled"
-        if not desired:
-            continue
-        result = windows_set_adapter_properties(adapter, desired, restart)
-        if result.ok:
-            record = {
-                "type": "windows_adapter_power",
-                "adapter": {
-                    "Name": adapter.get("Name"),
-                    "InterfaceGuid": adapter.get("InterfaceGuid"),
-                    "InterfaceDescription": adapter.get("InterfaceDescription"),
-                },
-                "original": {key: original[key] for key in desired},
-                "applied": desired,
-                "restarted": restart,
-            }
-            manifest.setdefault("applied", {}).setdefault("system", []).append(record)
-            atomic_write_json(manifest_path, manifest)
-            description = adapter.get("InterfaceDescription") or adapter.get("Name")
-            suffix = (
-                "; adapter restarted"
-                if restart
-                else "; takes effect after reconnect/restart"
-            )
-            print(
-                f"  + disabled supported NDIS idle/disconnect power controls on {description}{suffix}"
-            )
-        else:
-            print_command_failure(
-                f"adapter power settings for {adapter.get('Name')}", result
-            )
-            record_apply_issue(
-                manifest,
-                manifest_path,
-                "error",
-                "windows",
-                f"Adapter power settings failed for {adapter.get('Name')}: "
-                f"{result.error or result.stderr.strip() or result.stdout.strip()}",
-            )
-
-
 def restore_windows_system(
     manifest: Dict[str, Any], restart: bool
 ) -> List[Dict[str, Any]]:
     state = manifest.get("state", {}).get("system", {})
     applied = manifest.get("applied", {}).get("system", [])
     results: List[Dict[str, Any]] = []
+
+    for item in applied:
+        if item.get("type") != "windows_dns_servers":
+            continue
+        interface_alias = str(item.get("interface_alias") or "")
+        original_servers = tuple(
+            str(server) for server in item.get("original_servers", [])
+        )
+        if not interface_alias:
+            continue
+        action = windows_dns_policy.restore_dns_servers(
+            run_windows_dns_policy_powershell,
+            interface_alias,
+            original_servers,
+        )
+        record = {
+            "type": "windows_dns_servers",
+            "interface_alias": interface_alias,
+            "ok": action.ok,
+        }
+        if action.ok:
+            print(f"  + restored DNS servers: {interface_alias}")
+        else:
+            record["error"] = action.detail
+            print(
+                f"  ! restore DNS servers {interface_alias}: {action.detail}",
+                file=sys.stderr,
+            )
+        results.append(record)
 
     for item in applied:
         if item.get("type") != "windows_tcp_autotuning":
@@ -1579,8 +1402,6 @@ WINDOWS_DELIVERY_OPTIMIZATION_PATH = (
 WINDOWS_QOS_PATH = r"HKLM:\SOFTWARE\Policies\Microsoft\Windows\Psched"
 WINDOWS_TCPIP_PARAMS_PATH = r"HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters"
 
-DEFAULT_DNS_SERVERS = ("1.1.1.1", "1.0.0.1")
-
 
 def _read_registry_dword(reg_path: str, value_name: str) -> Optional[int]:
     script = (
@@ -1601,13 +1422,25 @@ def _set_registry_dword(reg_path: str, value_name: str, value: int) -> CommandRe
     script = (
         f"$p={ps_single_quote(reg_path)};"
         f"$v={ps_single_quote(value_name)};"
-        f"$d=$p -replace '^HKLM:\\\\','';"
         "try { "
         "  if (-not (Test-Path $p)) { "
         "    $parent=Split-Path $p -Parent; $leaf=Split-Path $p -Leaf; "
         "    New-Item -Path $parent -Name $leaf -Force -ErrorAction Stop | Out-Null "
         "  }; "
         f"  Set-ItemProperty -Path $p -Name $v -Value {value} -Type DWord -ErrorAction Stop; "
+        "  $true "
+        "} catch { $false };"
+    )
+    return run_powershell(script, timeout=10)
+
+
+def _delete_registry_value(reg_path: str, value_name: str) -> CommandResult:
+    """Restore an absent registry value without deleting its parent key."""
+    script = (
+        f"$p={ps_single_quote(reg_path)};"
+        f"$v={ps_single_quote(value_name)};"
+        "try { "
+        "  if (Test-Path $p) { Remove-ItemProperty -Path $p -Name $v -ErrorAction SilentlyContinue }; "
         "  $true "
         "} catch { $false };"
     )
@@ -1719,10 +1552,6 @@ def windows_restore_ecn() -> CommandResult:
 def windows_delivery_optimization_state() -> Dict[str, Any]:
     value = _read_registry_dword(WINDOWS_DELIVERY_OPTIMIZATION_PATH, "DODownloadMode")
     return {"available": True if value is not None else False, "value": value}
-
-
-def windows_disable_delivery_optimization() -> CommandResult:
-    return _set_registry_dword(WINDOWS_DELIVERY_OPTIMIZATION_PATH, "DODownloadMode", 0)
 
 
 def windows_restore_delivery_optimization(original_value: int) -> CommandResult:
@@ -1872,8 +1701,8 @@ def macos_dns_state() -> Dict[str, Any]:
     }
 
 
-def macos_set_dns(servers: Optional[Tuple[str, ...]] = None) -> CommandResult:
-    targets = list(servers or DEFAULT_DNS_SERVERS)
+def macos_set_dns(servers: Tuple[str, ...]) -> CommandResult:
+    targets = list(servers)
     # Try Wi-Fi first, fall back to any active service
     result = run_command(
         ["networksetup", "-setdnsservers", "Wi-Fi"] + targets, timeout=10
@@ -1933,129 +1762,104 @@ def macos_sysctl_conf_path() -> Path:
     return Path("/etc/sysctl.conf")
 
 
-def macos_write_sysctl_conf(
-    sendspace: int = 131072, recvspace: int = 131072
-) -> CommandResult:
-    content = (
-        "# Net Stability - network buffer tuning\n"
-        f"net.inet.tcp.sendspace={sendspace}\n"
-        f"net.inet.tcp.recvspace={recvspace}\n"
-    )
+def macos_sysctl_conf_snapshot() -> Dict[str, Any]:
+    path = macos_sysctl_conf_path()
+    if not path.exists():
+        return {"path": str(path), "existed": False, "content": None}
     try:
-        path = macos_sysctl_conf_path()
-        path.write_text(content, encoding="utf-8")
-        return CommandResult(["write", str(path)], 0, "", "", 0.0)
+        return {
+            "path": str(path),
+            "existed": True,
+            "content": path.read_text(encoding="utf-8"),
+        }
     except OSError as exc:
-        return CommandResult(["write", str(path)], 1, "", str(exc), 0.0)
+        return {"path": str(path), "existed": True, "content": None, "error": str(exc)}
+
+
+def macos_restore_sysctl_conf(snapshot: Mapping[str, Any]) -> CommandResult:
+    path = Path(str(snapshot.get("path") or macos_sysctl_conf_path()))
+    if "existed" not in snapshot:
+        return CommandResult(
+            ["restore", str(path)],
+            1,
+            "",
+            "persistent sysctl snapshot metadata is unavailable",
+            0.0,
+        )
+    try:
+        if snapshot.get("existed") is True and isinstance(snapshot.get("content"), str):
+            path.write_text(str(snapshot["content"]), encoding="utf-8")
+            return CommandResult(["write", str(path)], 0, "", "", 0.0)
+        if snapshot.get("existed") is False:
+            path.unlink(missing_ok=True)
+            return CommandResult(["rm", str(path)], 0, "", "", 0.0)
+        return CommandResult(
+            ["restore", str(path)], 1, "", "snapshot content unavailable", 0.0
+        )
+    except OSError as exc:
+        return CommandResult(["restore", str(path)], 1, "", str(exc), 0.0)
 
 
 def macos_reset_network_config() -> List[CommandResult]:
-    results: List[CommandResult] = []
-    config_dir = Path("/Library/Preferences/SystemConfiguration")
-    if config_dir.is_dir():
-        targets = [
-            "com.apple.airport.preferences.plist",
-            "com.apple.network.identification.plist",
-            "NetworkInterfaces.plist",
-            "preferences.plist",
-        ]
-        for name in targets:
-            path = config_dir / name
-            if path.is_file():
-                backup = path.with_name(f"{name}.netstability-bak")
-                try:
-                    shutil.copy2(path, backup)
-                    path.unlink()
-                    results.append(
-                        CommandResult(["mv", str(path), str(backup)], 0, "", "", 0.0)
-                    )
-                except OSError as exc:
-                    results.append(
-                        CommandResult(
-                            ["mv", str(path), str(backup)], 1, "", str(exc), 0.0
-                        )
-                    )
-    route_result = run_command(["/usr/sbin/route", "-n", "flush"], timeout=10)
-    results.append(route_result)
-    dns_result = run_command(["dscacheutil", "-flushcache"], timeout=5)
-    results.append(dns_result)
-    mDNS_result = run_command(["killall", "-HUP", "mDNSResponder"], timeout=5)
-    results.append(mDNS_result)
-    return results
+    """Flush transient caches without deleting untracked Apple configuration."""
+    return [
+        run_command(["/usr/sbin/route", "-n", "flush"], timeout=10),
+        run_command(["dscacheutil", "-flushcache"], timeout=5),
+        run_command(["killall", "-HUP", "mDNSResponder"], timeout=5),
+    ]
 
 
 LINUX_SYSCTL_CONF_PATH = Path("/etc/sysctl.d/99-net-optimizer.conf")
 
-LINUX_SYSCTL_TUNING: Dict[str, str] = {
-    "net.core.rmem_default": "262144",
-    "net.core.wmem_default": "262144",
-    "net.core.rmem_max": "4194304",
-    "net.core.wmem_max": "4194304",
-    "net.ipv4.tcp_rmem": "4096 87380 4194304",
-    "net.ipv4.tcp_wmem": "4096 65536 4194304",
-    "net.ipv4.tcp_window_scaling": "1",
-    "net.ipv4.tcp_sack": "1",
-    "net.ipv4.tcp_timestamps": "1",
-    "net.ipv4.tcp_fastopen": "3",
-    "net.ipv4.tcp_congestion_control": "bbr",
-    "net.core.default_qdisc": "fq_codel",
-}
 
-
-def linux_current_sysctl_values(keys: Sequence[str]) -> Dict[str, Optional[str]]:
-    values: Dict[str, Optional[str]] = {}
-    for key in keys:
-        result = run_command(["sysctl", "-n", key], timeout=5)
-        if result.ok and result.stdout.strip():
-            values[key] = result.stdout.strip().splitlines()[0]
-        else:
-            values[key] = None
-    return values
-
-
-def linux_write_sysctl_conf(
-    values: Optional[Mapping[str, str]] = None,
-) -> CommandResult:
-    entries = dict(values or LINUX_SYSCTL_TUNING)
-    content = (
-        "# Net Stability - network optimization tuning\n# Applied: "
-        + utc_now_iso()
-        + "\n"
-    )
-    for key, value in entries.items():
-        content += f"{key} = {value}\n"
+def linux_sysctl_conf_snapshot() -> Dict[str, Any]:
+    """Capture exact file presence and bytes before any legacy experiment."""
+    path = LINUX_SYSCTL_CONF_PATH
+    if not path.exists():
+        return {"path": str(path), "existed": False, "content": None}
     try:
-        LINUX_SYSCTL_CONF_PATH.parent.mkdir(parents=True, exist_ok=True)
-        LINUX_SYSCTL_CONF_PATH.write_text(content, encoding="utf-8")
-        return CommandResult(["write", str(LINUX_SYSCTL_CONF_PATH)], 0, "", "", 0.0)
+        return {
+            "path": str(path),
+            "existed": True,
+            "content": path.read_text(encoding="utf-8"),
+        }
     except OSError as exc:
+        return {"path": str(path), "existed": True, "content": None, "error": str(exc)}
+
+
+def linux_restore_runtime_sysctls(original: Mapping[str, Any]) -> List[CommandResult]:
+    results: List[CommandResult] = []
+    for key, value in original.items():
+        if value is None or not re.fullmatch(r"[A-Za-z0-9_.-]+", str(key)):
+            continue
+        results.append(run_command(["sysctl", "-w", f"{key}={value}"], timeout=10))
+    return results
+
+
+def linux_restore_sysctl_conf(snapshot: Mapping[str, Any]) -> CommandResult:
+    """Restore an exact persistent sysctl snapshot without inferring file absence."""
+    path = Path(str(snapshot.get("path") or LINUX_SYSCTL_CONF_PATH))
+    if "existed" not in snapshot:
         return CommandResult(
-            ["write", str(LINUX_SYSCTL_CONF_PATH)], 1, "", str(exc), 0.0
+            ["restore", str(path)],
+            1,
+            "",
+            "persistent sysctl snapshot metadata is unavailable",
+            0.0,
         )
-
-
-def linux_apply_sysctl() -> CommandResult:
-    return run_command(["sysctl", "-p", str(LINUX_SYSCTL_CONF_PATH)], timeout=15)
-
-
-def linux_restore_sysctl_conf(original: Mapping[str, Optional[str]]) -> CommandResult:
-    entries = {k: v for k, v in original.items() if v is not None}
-    if not entries:
-        return CommandResult(["rm", str(LINUX_SYSCTL_CONF_PATH)], 0, "", "", 0.0)
-    content = (
-        "# Net Stability - restored original values\n# Restored: "
-        + utc_now_iso()
-        + "\n"
-    )
-    for key, value in entries.items():
-        content += f"{key} = {value}\n"
+    content = snapshot.get("content")
     try:
-        LINUX_SYSCTL_CONF_PATH.write_text(content, encoding="utf-8")
-        return CommandResult(["write", str(LINUX_SYSCTL_CONF_PATH)], 0, "", "", 0.0)
-    except OSError as exc:
+        if snapshot.get("existed") is True and isinstance(content, str):
+            path.write_text(content, encoding="utf-8")
+            return CommandResult(["write", str(path)], 0, "", "", 0.0)
+        if snapshot.get("existed") is False:
+            path.unlink(missing_ok=True)
+            return CommandResult(["rm", str(path)], 0, "", "", 0.0)
         return CommandResult(
-            ["write", str(LINUX_SYSCTL_CONF_PATH)], 1, "", str(exc), 0.0
+            ["restore", str(path)], 1, "", "snapshot content unavailable", 0.0
         )
+    except OSError as exc:
+        return CommandResult(["restore", str(path)], 1, "", str(exc), 0.0)
 
 
 def linux_nic_ring_buffer_state() -> Dict[str, Any]:
@@ -2079,7 +1883,29 @@ def linux_nic_ring_buffer_state() -> Dict[str, Any]:
         if ifname == "lo" or ":" in ifname:
             continue
         ring = run_command([ethtool, "-g", ifname], timeout=10)
-        interfaces.append({"name": ifname, "ring": ring.stdout if ring.ok else None})
+        rx = tx = None
+        if ring.ok:
+            current_section = False
+            for line in ring.stdout.splitlines():
+                if line.strip().lower().startswith("current hardware settings"):
+                    current_section = True
+                    continue
+                if not current_section:
+                    continue
+                match = re.match(r"\s*(rx|tx):\s*(\d+)", line, re.IGNORECASE)
+                if match:
+                    if match.group(1).lower() == "rx":
+                        rx = int(match.group(2))
+                    else:
+                        tx = int(match.group(2))
+        interfaces.append(
+            {
+                "name": ifname,
+                "ring": ring.stdout if ring.ok else None,
+                "original_rx": rx,
+                "original_tx": tx,
+            }
+        )
     return {"available": True, "ethtool": ethtool, "interfaces": interfaces}
 
 
@@ -2102,10 +1928,6 @@ def linux_irqbalance_state() -> Dict[str, Any]:
         "enabled": result.stdout.strip() if result.ok else "unknown",
         "active": is_active.stdout.strip() if is_active.ok else "unknown",
     }
-
-
-def linux_enable_irqbalance() -> CommandResult:
-    return run_command(["systemctl", "enable", "--now", "irqbalance"], timeout=30)
 
 
 def linux_disable_irqbalance() -> CommandResult:
@@ -2136,30 +1958,69 @@ def linux_dns_state() -> Dict[str, Any]:
     return {"available": False, "servers": [], "error": error}
 
 
-def linux_set_dns(servers: Optional[Tuple[str, ...]] = None) -> CommandResult:
-    targets = list(servers or DEFAULT_DNS_SERVERS)
+def linux_default_interface() -> Optional[str]:
+    result = run_command(["ip", "route", "show", "default"], timeout=5)
+    if not result.ok:
+        return None
+    match = re.search(r"\bdev\s+(\S+)", result.stdout)
+    return match.group(1) if match else None
+
+
+def linux_set_dns(servers: Tuple[str, ...]) -> CommandResult:
+    """Restore DNS only through a detected managed link, never through global state."""
+    targets = list(servers)
     resolvectl = shutil.which("resolvectl")
     if resolvectl:
-        for server in targets:
-            result = run_command([resolvectl, "dns", "global", server], timeout=10)
-            if not result.ok:
-                return run_command([resolvectl, "dns", server], timeout=10)
-        return run_command([resolvectl, "dns", "global", targets[0]], timeout=10)
+        interface = linux_default_interface()
+        if not interface:
+            return CommandResult(
+                [resolvectl, "dns"], 2, "", "default interface was not detected", 0.0
+            )
+        return run_command([resolvectl, "dns", interface, *targets], timeout=10)
     resolv = Path("/etc/resolv.conf")
+    if resolv.is_symlink():
+        return CommandResult(
+            ["write", str(resolv)],
+            2,
+            "",
+            "managed resolv.conf symlink was not changed",
+            0.0,
+        )
     try:
-        content = "\n".join(f"nameserver {s}" for s in targets) + "\n"
+        content = "\n".join(f"nameserver {server}" for server in targets) + "\n"
         resolv.write_text(content, encoding="utf-8")
         return CommandResult(["write", str(resolv)], 0, "", "", 0.0)
     except OSError as exc:
         return CommandResult(["write", str(resolv)], 1, "", str(exc), 0.0)
 
 
+def linux_clear_dns() -> CommandResult:
+    resolvectl = shutil.which("resolvectl")
+    if resolvectl:
+        interface = linux_default_interface()
+        if not interface:
+            return CommandResult(
+                [resolvectl, "revert"], 2, "", "default interface was not detected", 0.0
+            )
+        return run_command([resolvectl, "revert", interface], timeout=10)
+    return CommandResult(
+        ["clear", "/etc/resolv.conf"], 2, "", "manual DNS restore required", 0.0
+    )
+
+
 def linux_reset_network() -> List[CommandResult]:
     results: List[CommandResult] = []
     if shutil.which("systemctl"):
-        results.append(
-            run_command(["systemctl", "restart", "NetworkManager"], timeout=30)
+        network_manager = run_command(
+            ["systemctl", "restart", "NetworkManager"], timeout=30
         )
+        results.append(network_manager)
+        if not network_manager.ok:
+            for service in ("networking", "systemd-networkd"):
+                fallback = run_command(["systemctl", "restart", service], timeout=15)
+                results.append(fallback)
+                if fallback.ok:
+                    break
     if shutil.which("resolvectl"):
         results.append(run_command(["resolvectl", "flush-caches"], timeout=5))
     return results
@@ -2409,37 +2270,17 @@ def restore_linux_system(
 
 def capture_system_state() -> Dict[str, Any]:
     system = platform.system()
-    state: Dict[str, Any] = {}
     if system == "Windows":
-        state = capture_windows_state()
-        wifi_names = _wifi_adapter_names(state.get("wifi_adapters", {}))
-        state["mtu"] = windows_mtu_state(wifi_names)
-        state["ecn"] = windows_ecn_state()
-        state["delivery_optimization"] = windows_delivery_optimization_state()
-        state["qos"] = windows_qos_state()
-        state["lso"] = windows_lso_state(wifi_names)
-        state["tcp_retrans"] = windows_tcp_retrans_state()
-    elif system == "Linux":
-        state = capture_linux_state()
-        state["sysctl_current"] = linux_current_sysctl_values(
-            list(LINUX_SYSCTL_TUNING.keys())
-        )
-        state["ring_buffers"] = linux_nic_ring_buffer_state()
-        state["irqbalance"] = linux_irqbalance_state()
-        state["dns"] = linux_dns_state()
-    elif system == "Darwin":
-        state = {
-            "supported_changes": ["dns", "tcp_buffers"],
-            "note": "macOS: DNS and TCP buffer tuning available.",
-        }
-        state["dns"] = macos_dns_state()
-        state["tcp_buffers"] = macos_tcp_buffer_state()
-    else:
+        return capture_windows_state()
+    if system in {"Linux", "Darwin"}:
         return {
             "supported_changes": [],
-            "note": f"No system tuning implemented for {system}.",
+            "note": f"{system}: normal apply preserves current network policy.",
         }
-    return state
+    return {
+        "supported_changes": [],
+        "note": f"No system repair is implemented for {system}.",
+    }
 
 
 def _record_applied(
@@ -2453,15 +2294,31 @@ def apply_windows_dns_policy_repair(
     manifest: Dict[str, Any],
     manifest_path: Path,
     health: windows_dns_policy.DnsPolicyHealth,
-) -> None:
+) -> windows_dns_policy.RepairResult:
     if not health.repair_needed:
         print("  + Windows DNS policy: healthy")
-        return
+        return windows_dns_policy.RepairResult(True, False, (), ())
+
+    planned_records = []
+    for (
+        interface_alias,
+        original_servers,
+        applied_servers,
+    ) in windows_dns_policy.planned_dns_server_repairs(health):
+        record = {
+            "type": "windows_dns_servers",
+            "scope": "windows",
+            "interface_alias": interface_alias,
+            "original_servers": list(original_servers),
+            "applied_servers": list(applied_servers),
+            "status": "pending",
+        }
+        _record_applied(manifest, manifest_path, record)
+        planned_records.append(record)
 
     result = windows_dns_policy.repair_health(
         run_windows_dns_policy_powershell,
         health,
-        DEFAULT_DNS_SERVERS,
     )
     for action in result.actions:
         if action.ok:
@@ -2471,14 +2328,24 @@ def apply_windows_dns_policy_repair(
                 f"  ! Windows DNS policy {action.name}: {action.detail}",
                 file=sys.stderr,
             )
+        for record in planned_records:
+            if record["interface_alias"] == action.interface_alias and record[
+                "original_servers"
+            ] == list(action.original_servers):
+                record["status"] = "applied" if action.ok else "failed"
+                record["detail"] = action.detail
+    atomic_write_json(manifest_path, manifest)
 
-    record = {
-        "type": "windows_dns_policy_repair",
-        "scope": "windows",
-        "health": health.to_report(),
-        "repair": result.to_report(),
-    }
-    _record_applied(manifest, manifest_path, record)
+    _record_applied(
+        manifest,
+        manifest_path,
+        {
+            "type": "windows_dns_policy_repair",
+            "scope": "windows",
+            "health": health.to_report(),
+            "repair": result.to_report(),
+        },
+    )
     if result.reboot_recommended:
         record_apply_issue(
             manifest,
@@ -2495,121 +2362,7 @@ def apply_windows_dns_policy_repair(
             "windows",
             "Windows DNS policy repair did not complete cleanly.",
         )
-
-
-def apply_windows_extended_tuning(
-    manifest: Dict[str, Any],
-    manifest_path: Path,
-) -> None:
-    state = manifest.get("state", {}).get("system", {})
-    dns_policy_state = state.get("dns_policy", {})
-    if isinstance(dns_policy_state, dict):
-        apply_windows_dns_policy_repair(
-            manifest,
-            manifest_path,
-            windows_dns_policy.health_from_report(dns_policy_state),
-        )
-
-    """Apply MTU=1500 on Wi-Fi interfaces."""
-    mtu_state = state.get("mtu", {})
-    if mtu_state.get("available"):
-        wifi_interfaces = [
-            i for i in mtu_state.get("interfaces", []) if i.get("mtu", 0) != 1500
-        ]
-        for iface in wifi_interfaces:
-            name = iface.get("name", "")
-            if not name or "Loopback" in name:
-                continue
-            result = windows_set_mtu(name, 1500)
-            if result.ok:
-                print(f"  + MTU set to 1500 on {name}")
-                _record_applied(
-                    manifest,
-                    manifest_path,
-                    {
-                        "type": "mtu",
-                        "scope": "windows",
-                        "interface": name,
-                        "original_mtu": iface.get("mtu"),
-                        "applied": 1500,
-                    },
-                )
-            else:
-                print_command_failure(f"MTU set on {name}", result)
-
-    """Disable Delivery Optimization P2P."""
-    do_state = state.get("delivery_optimization", {})
-    if do_state.get("available") and do_state.get("value") != 0:
-        result = windows_disable_delivery_optimization()
-        if result.ok:
-            print("  + Delivery Optimization P2P disabled")
-            _record_applied(
-                manifest,
-                manifest_path,
-                {
-                    "type": "delivery_optimization",
-                    "scope": "windows",
-                    "original_value": do_state.get("value"),
-                    "applied": 0,
-                },
-            )
-        else:
-            print_command_failure("Delivery Optimization disable", result)
-
-    """Set QoS reservable bandwidth to 0%."""
-    qos_state = state.get("qos", {})
-    if qos_state.get("available") and qos_state.get("value") != 0:
-        result = windows_set_qos_reserve(0)
-        if result.ok:
-            print("  + QoS reservable bandwidth set to 0%")
-            _record_applied(
-                manifest,
-                manifest_path,
-                {
-                    "type": "qos",
-                    "scope": "windows",
-                    "original_value": qos_state.get("value"),
-                    "applied": 0,
-                },
-            )
-        else:
-            print_command_failure("QoS reservable bandwidth", result)
-
-    """Set TCP retransmission registry values."""
-    retrans_state = state.get("tcp_retrans", {})
-    if retrans_state.get("available"):
-        orig_data = retrans_state.get("TcpMaxDataRetransmissions")
-        orig_connect = retrans_state.get("TcpMaxConnectRetransmissions")
-        needs_data = orig_data is None or orig_data != 5
-        needs_connect = orig_connect is None or orig_connect != 3
-        if needs_data or needs_connect:
-            results = windows_set_tcp_retransmissions(5, 3)
-            ok = all(r.ok for r in results)
-            if ok:
-                print("  + TCP retransmission settings: data=5, connect=3")
-                _record_applied(
-                    manifest,
-                    manifest_path,
-                    {
-                        "type": "tcp_retrans",
-                        "scope": "windows",
-                        "original_data": orig_data,
-                        "original_connect": orig_connect,
-                        "applied_data": 5,
-                        "applied_connect": 3,
-                    },
-                )
-            else:
-                for i, r in enumerate(results):
-                    if not r.ok:
-                        label = (
-                            "TcpMaxDataRetransmissions"
-                            if i == 0
-                            else "TcpMaxConnectRetransmissions"
-                        )
-                        print_command_failure(label, r)
-
-    print("  + Windows extended tuning: complete")
+    return result
 
 
 def restore_windows_extended_tuning(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -2698,125 +2451,69 @@ def restore_windows_extended_tuning(manifest: Dict[str, Any]) -> List[Dict[str, 
                         print_command_failure(f"restore LSO on {name}", r)
 
         elif item.get("type") == "tcp_retrans":
-            orig_data = item.get("original_data")
-            orig_connect = item.get("original_connect")
-            if orig_data is not None or orig_connect is not None:
-                d = orig_data if orig_data is not None else 5
-                c = orig_connect if orig_connect is not None else 3
-                rs = windows_set_tcp_retransmissions(d, c)
-                ok = all(r.ok for r in rs)
-                results.append({"type": "tcp_retrans", "ok": ok})
-                if ok:
-                    print(f"  + restored TCP retransmissions: data={d}, connect={c}")
+            original_values = {
+                "TcpMaxDataRetransmissions": item.get("original_data"),
+                "TcpMaxConnectRetransmissions": item.get("original_connect"),
+            }
+            restore_results: List[CommandResult] = []
+            for value_name, original in original_values.items():
+                if original is None:
+                    restore_results.append(
+                        _delete_registry_value(WINDOWS_TCPIP_PARAMS_PATH, value_name)
+                    )
                 else:
-                    for i, r in enumerate(rs):
-                        if not r.ok:
-                            print_command_failure(f"restore TCP retrans ({i})", r)
+                    restore_results.append(
+                        _set_registry_dword(
+                            WINDOWS_TCPIP_PARAMS_PATH, value_name, int(original)
+                        )
+                    )
+            ok = all(result.ok for result in restore_results)
+            results.append({"type": "tcp_retrans", "ok": ok})
+            if ok:
+                print("  + restored TCP retransmission registry presence and values")
+            else:
+                for result in restore_results:
+                    if not result.ok:
+                        print_command_failure(
+                            "restore TCP retransmission state", result
+                        )
 
     return results
 
 
-def apply_linux_extended_tuning(
-    manifest: Dict[str, Any],
-    manifest_path: Path,
-) -> None:
-    state = manifest.get("state", {}).get("system", {})
-    """Write sysctl tuning file and apply."""
-    current = state.get("sysctl_current", {})
-    needs_write = False
-    for key, desired in LINUX_SYSCTL_TUNING.items():
-        existing = current.get(key)
-        if existing != desired:
-            needs_write = True
-            break
-    if needs_write:
-        r = linux_write_sysctl_conf()
-        if r.ok:
-            print("  + wrote sysctl tuning: /etc/sysctl.d/99-net-optimizer.conf")
-            _record_applied(
-                manifest,
-                manifest_path,
-                {
-                    "type": "sysctl_conf",
-                    "scope": "linux",
-                    "original": dict(current),
-                    "applied": dict(LINUX_SYSCTL_TUNING),
-                },
-            )
-            apply_r = linux_apply_sysctl()
-            if apply_r.ok:
-                print("  + applied sysctl settings")
-            else:
-                print_command_failure("sysctl -p", apply_r)
-        else:
-            print_command_failure("write sysctl conf", r)
-    else:
-        print("  - sysctl tuning already at target values")
+def _legacy_positive_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
 
-    """Set NIC ring buffers."""
-    ring_state = state.get("ring_buffers", {})
-    if ring_state.get("available"):
-        for iface in ring_state.get("interfaces", []):
-            name = iface.get("name", "")
-            if name:
-                r = linux_set_nic_ring_buffer(name, 4096, 4096)
-                if r.ok:
-                    print(f"  + ring buffer: {name} rx=4096 tx=4096")
-                    _record_applied(
-                        manifest,
-                        manifest_path,
-                        {
-                            "type": "ring_buffer",
-                            "scope": "linux",
-                            "interface": name,
-                            "applied_rx": 4096,
-                            "applied_tx": 4096,
-                        },
-                    )
-                else:
-                    print_command_failure(f"ring buffer on {name}", r)
 
-    """Enable IRQ balance."""
-    irq_state = state.get("irqbalance", {})
-    if irq_state.get("available") and irq_state.get("active") != "active":
-        r = linux_enable_irqbalance()
-        if r.ok:
-            print("  + irqbalance enabled and started")
-            _record_applied(
-                manifest,
-                manifest_path,
-                {
-                    "type": "irqbalance",
-                    "scope": "linux",
-                    "original_enabled": irq_state.get("enabled"),
-                    "original_active": irq_state.get("active"),
-                },
-            )
-        else:
-            print_command_failure("irqbalance enable", r)
-
-    """Set DNS to 1.1.1.1."""
-    dns_state = state.get("dns", {})
-    if dns_state.get("available"):
-        current_servers = dns_state.get("servers", [])
-        if "1.1.1.1" not in current_servers:
-            r = linux_set_dns()
-            if r.ok:
-                print("  + DNS set to 1.1.1.1, 1.0.0.1")
-                _record_applied(
-                    manifest,
-                    manifest_path,
-                    {
-                        "type": "dns",
-                        "scope": "linux",
-                        "original_servers": current_servers,
-                        "applied": list(DEFAULT_DNS_SERVERS),
-                    },
-                )
-            else:
-                print_command_failure("DNS set", r)
-
-    print("  + Linux extended tuning: complete")
+def _legacy_linux_ring_values(
+    manifest: Mapping[str, Any], interface: str
+) -> Tuple[Optional[int], Optional[int]]:
+    state = manifest.get("state")
+    if not isinstance(state, Mapping):
+        return None, None
+    system_state = state.get("system")
+    if not isinstance(system_state, Mapping):
+        return None, None
+    ring_buffers = system_state.get("ring_buffers")
+    if not isinstance(ring_buffers, Mapping):
+        return None, None
+    interfaces = ring_buffers.get("interfaces")
+    if not isinstance(interfaces, Sequence) or isinstance(interfaces, (str, bytes)):
+        return None, None
+    for candidate in interfaces:
+        if not isinstance(candidate, Mapping) or candidate.get("name") != interface:
+            continue
+        return (
+            _legacy_positive_int(candidate.get("original_rx")),
+            _legacy_positive_int(candidate.get("original_tx")),
+        )
+    return None, None
 
 
 def restore_linux_extended_tuning(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -2824,31 +2521,117 @@ def restore_linux_extended_tuning(manifest: Dict[str, Any]) -> List[Dict[str, An
     results: List[Dict[str, Any]] = []
     for item in applied:
         if item.get("type") == "sysctl_conf":
-            original = item.get("original", {})
-            r = linux_restore_sysctl_conf(original)
-            results.append({"type": "sysctl_conf", "ok": r.ok})
-            if r.ok:
-                print("  + restored sysctl configuration")
-                linux_apply_sysctl()
+            original_value = item.get("original")
+            original = original_value if isinstance(original_value, Mapping) else {}
+            runtime_results = linux_restore_runtime_sysctls(original)
+            runtime_ok = bool(runtime_results) and all(
+                result.ok for result in runtime_results
+            )
+            original_file = item.get("original_file")
+            has_file_snapshot = isinstance(original_file, Mapping)
+            file_result = (
+                linux_restore_sysctl_conf(original_file) if has_file_snapshot else None
+            )
+            persistent_ok = bool(file_result and file_result.ok)
+            ok = runtime_ok and persistent_ok
+            results.append(
+                {
+                    "type": "sysctl_conf",
+                    "ok": ok,
+                    "runtime_restored": runtime_ok,
+                    "persistent_restored": persistent_ok,
+                    "manual_restore_required": not persistent_ok,
+                }
+            )
+            if runtime_ok:
+                print("  + restored recorded Linux runtime sysctl values")
             else:
-                print_command_failure("restore sysctl conf", r)
+                for command in runtime_results:
+                    if not command.ok:
+                        print_command_failure("restore Linux runtime sysctl", command)
+                if not runtime_results:
+                    print(
+                        "  ! recorded Linux runtime sysctl values are unavailable; manual restoration required",
+                        file=sys.stderr,
+                    )
+            if file_result is None:
+                print(
+                    "  ! persistent Linux sysctl file was preserved because the legacy snapshot lacks file metadata; manual restoration required",
+                    file=sys.stderr,
+                )
+            elif file_result.ok:
+                print("  + restored persistent Linux sysctl file state")
+            else:
+                print_command_failure(
+                    "restore persistent Linux sysctl file", file_result
+                )
+
+        elif item.get("type") == "ring_buffer":
+            interface = str(item.get("interface") or "")
+            original_rx = _legacy_positive_int(item.get("original_rx"))
+            original_tx = _legacy_positive_int(item.get("original_tx"))
+            state_rx, state_tx = _legacy_linux_ring_values(manifest, interface)
+            original_rx = original_rx or state_rx
+            original_tx = original_tx or state_tx
+            if not interface or original_rx is None or original_tx is None:
+                results.append(
+                    {
+                        "type": "ring_buffer",
+                        "ok": False,
+                        "skipped": True,
+                        "interface": interface,
+                        "manual_restore_required": True,
+                    }
+                )
+                print(
+                    f"  ! current ring buffer settings on {interface or 'unknown interface'} were preserved because original values are unavailable; manual restoration required",
+                    file=sys.stderr,
+                )
+            else:
+                r = linux_set_nic_ring_buffer(interface, original_rx, original_tx)
+                results.append(
+                    {"type": "ring_buffer", "ok": r.ok, "interface": interface}
+                )
+                if r.ok:
+                    print(f"  + restored ring buffer on {interface}")
+                else:
+                    print_command_failure("restore ring buffer", r)
 
         elif item.get("type") == "irqbalance":
-            was_active = item.get("original_active")
-            if was_active != "active":
-                r = linux_disable_irqbalance()
-                results.append({"type": "irqbalance", "ok": r.ok})
-                if r.ok:
-                    print("  + restored irqbalance state")
-                else:
-                    print_command_failure("restore irqbalance", r)
+            was_enabled = str(item.get("original_enabled") or "").strip()
+            was_active = str(item.get("original_active") or "").strip()
+            commands: List[CommandResult] = []
+            if was_enabled == "enabled":
+                commands.append(
+                    run_command(["systemctl", "enable", "irqbalance"], timeout=20)
+                )
+            elif was_enabled == "disabled":
+                commands.append(
+                    run_command(["systemctl", "disable", "irqbalance"], timeout=20)
+                )
+            if was_active == "active":
+                commands.append(
+                    run_command(["systemctl", "start", "irqbalance"], timeout=20)
+                )
+            elif was_active == "inactive":
+                commands.append(
+                    run_command(["systemctl", "stop", "irqbalance"], timeout=20)
+                )
+            ok = bool(commands) and all(command.ok for command in commands)
+            results.append({"type": "irqbalance", "ok": ok})
+            if ok:
+                print("  + restored irqbalance enabled and active state")
+            else:
+                for command in commands:
+                    if not command.ok:
+                        print_command_failure("restore irqbalance", command)
 
         elif item.get("type") == "dns":
             original = item.get("original_servers", [])
             if original:
                 r = linux_set_dns(tuple(original))
             else:
-                r = linux_set_dns(("Empty",))
+                r = linux_clear_dns()
             results.append({"type": "dns", "ok": r.ok})
             if r.ok:
                 print("  + restored DNS servers")
@@ -2856,68 +2639,6 @@ def restore_linux_extended_tuning(manifest: Dict[str, Any]) -> List[Dict[str, An
                 print_command_failure("restore DNS", r)
 
     return results
-
-
-def apply_macos_extended_tuning(
-    manifest: Dict[str, Any],
-    manifest_path: Path,
-) -> None:
-    state = manifest.get("state", {}).get("system", {})
-    """Set DNS to 1.1.1.1."""
-    dns_state = state.get("dns", {})
-    if dns_state.get("available"):
-        servers = dns_state.get("servers", [])
-        if "1.1.1.1" not in servers:
-            r = macos_set_dns()
-            if r.ok:
-                print("  + DNS set to 1.1.1.1, 1.0.0.1")
-                _record_applied(
-                    manifest,
-                    manifest_path,
-                    {
-                        "type": "dns",
-                        "scope": "macos",
-                        "original_servers": servers,
-                        "applied": list(DEFAULT_DNS_SERVERS),
-                    },
-                )
-            else:
-                print_command_failure("macOS DNS set", r)
-
-    """Set TCP buffers."""
-    buf_state = state.get("tcp_buffers", {})
-    if buf_state.get("available"):
-        send = buf_state.get("sendspace")
-        recv = buf_state.get("recvspace")
-        if send != 131072 or recv != 131072:
-            rs = macos_set_tcp_buffers(131072, 131072)
-            ok = all(r.ok for r in rs)
-            if ok:
-                print("  + TCP buffers: send=131072 recv=131072")
-                _record_applied(
-                    manifest,
-                    manifest_path,
-                    {
-                        "type": "tcp_buffers",
-                        "scope": "macos",
-                        "original_send": send,
-                        "original_recv": recv,
-                        "applied_send": 131072,
-                        "applied_recv": 131072,
-                    },
-                )
-                conf_r = macos_write_sysctl_conf(131072, 131072)
-                if conf_r.ok:
-                    print("  + wrote persistent sysctl.conf")
-                else:
-                    print_command_failure("write sysctl.conf", conf_r)
-            else:
-                for i, r in enumerate(rs):
-                    if not r.ok:
-                        label = "sendspace" if i == 0 else "recvspace"
-                        print_command_failure(f"TCP buffer {label}", r)
-
-    print("  + macOS extended tuning: complete")
 
 
 def restore_macos_extended_tuning(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -2937,19 +2658,110 @@ def restore_macos_extended_tuning(manifest: Dict[str, Any]) -> List[Dict[str, An
                 print_command_failure("restore macOS DNS", r)
 
         elif item.get("type") == "tcp_buffers":
-            orig_send = item.get("original_send") or 131072
-            orig_recv = item.get("original_recv") or 131072
-            rs = macos_set_tcp_buffers(orig_send, orig_recv)
-            ok = all(r.ok for r in rs)
-            results.append({"type": "tcp_buffers", "ok": ok})
-            if ok:
-                print(f"  + restored TCP buffers: send={orig_send} recv={orig_recv}")
+            orig_send = _legacy_positive_int(item.get("original_send"))
+            orig_recv = _legacy_positive_int(item.get("original_recv"))
+            runtime_results = (
+                macos_set_tcp_buffers(orig_send, orig_recv)
+                if orig_send is not None and orig_recv is not None
+                else []
+            )
+            runtime_ok = bool(runtime_results) and all(
+                result.ok for result in runtime_results
+            )
+            original_file = item.get("original_file")
+            has_file_snapshot = isinstance(original_file, Mapping)
+            file_result = (
+                macos_restore_sysctl_conf(original_file) if has_file_snapshot else None
+            )
+            persistent_ok = bool(file_result and file_result.ok)
+            ok = runtime_ok and persistent_ok
+            results.append(
+                {
+                    "type": "tcp_buffers",
+                    "ok": ok,
+                    "runtime_restored": runtime_ok,
+                    "persistent_restored": persistent_ok,
+                    "manual_restore_required": not persistent_ok or not runtime_ok,
+                }
+            )
+            if runtime_ok:
+                print(
+                    f"  + restored recorded macOS runtime TCP buffers: send={orig_send} recv={orig_recv}"
+                )
+            elif runtime_results:
+                for index, command in enumerate(runtime_results):
+                    if not command.ok:
+                        print_command_failure(
+                            f"restore macOS runtime TCP buffer ({index})", command
+                        )
             else:
-                for i, r in enumerate(rs):
-                    if not r.ok:
-                        print_command_failure(f"restore TCP buffer ({i})", r)
+                print(
+                    "  ! recorded macOS runtime TCP buffer values are unavailable; current values were preserved and manual restoration is required",
+                    file=sys.stderr,
+                )
+            if file_result is None:
+                print(
+                    "  ! persistent macOS sysctl file was preserved because the legacy snapshot lacks file metadata; exact persistent rollback is unavailable",
+                    file=sys.stderr,
+                )
+            elif file_result.ok:
+                print("  + restored persistent macOS sysctl file state")
+            else:
+                print_command_failure(
+                    "restore persistent macOS sysctl file", file_result
+                )
 
     return results
+
+
+def apply_windows_safe_repairs(manifest: Dict[str, Any], manifest_path: Path) -> None:
+    """Apply only repairs with a direct, local evidence gate."""
+    state_value = manifest.get("state")
+    state = (
+        state_value.get("system")
+        if isinstance(state_value, Mapping)
+        and isinstance(state_value.get("system"), Mapping)
+        else {}
+    )
+    apply_windows_dns_policy_repair(
+        manifest,
+        manifest_path,
+        windows_dns_health_from_manifest(manifest),
+    )
+
+    tcp_global = state.get("tcp_global", {})
+    if not isinstance(tcp_global, dict) or not windows_tcp_autotuning_needs_repair(
+        tcp_global
+    ):
+        print("  - Windows TCP receive-window auto-tuning is already normal")
+        return
+
+    original_level = (
+        str(tcp_global.get("receive_window_autotuning") or "").strip().lower()
+    )
+    result = windows_set_tcp_autotuning(WINDOWS_TCP_AUTOTUNING_NORMAL)
+    if result.ok:
+        _record_applied(
+            manifest,
+            manifest_path,
+            {
+                "type": "windows_tcp_autotuning",
+                "original_level": original_level,
+                "applied": WINDOWS_TCP_AUTOTUNING_NORMAL,
+            },
+        )
+        print("  + Windows TCP receive-window auto-tuning: normal")
+        return
+
+    print_command_failure("Windows TCP receive-window auto-tuning", result)
+    record_apply_issue(
+        manifest,
+        manifest_path,
+        "error",
+        "windows",
+        "Windows TCP receive-window auto-tuning repair failed: "
+        f"{result.error or result.stderr.strip() or result.stdout.strip()}",
+    )
 
 
 def apply_system_state(
@@ -2959,23 +2771,19 @@ def apply_system_state(
     include_battery: bool,
     restart: bool,
 ) -> None:
+    """Apply the conservative system policy; legacy tuners stay quarantined."""
+    del include_battery, restart
     system = platform.system()
     if system == "Windows":
-        apply_windows_system(
-            manifest,
-            manifest_path,
-            include_battery=include_battery,
-            restart=restart,
-        )
-        print("  - applying paper-backed extended tuning...")
-        apply_windows_extended_tuning(manifest, manifest_path)
+        apply_windows_safe_repairs(manifest, manifest_path)
     elif system == "Linux":
-        apply_linux_system(manifest, manifest_path, restart=restart)
-        print("  - applying paper-backed extended tuning...")
-        apply_linux_extended_tuning(manifest, manifest_path)
+        print(
+            "  - Linux system mutation is disabled; preserve current resolver and kernel policy"
+        )
     elif system == "Darwin":
-        print("  - applying paper-backed extended tuning...")
-        apply_macos_extended_tuning(manifest, manifest_path)
+        print(
+            "  - macOS system mutation is disabled; preserve current resolver and sysctl policy"
+        )
     else:
         print(f"  - {system}: no system tuning is implemented")
 
@@ -3011,241 +2819,14 @@ def platform_metadata() -> Dict[str, Any]:
     }
 
 
-def _parse_key_value_lines(output: str) -> Dict[str, str]:
-    parsed: Dict[str, str] = {}
-    for line in output.splitlines():
-        if ":" not in line:
-            continue
-        key, value = line.split(":", 1)
-        normalized = re.sub(r"\s+", "_", key.strip().lower())
-        if normalized:
-            parsed[normalized] = value.strip()
-    return parsed
-
-
-def parse_windows_wlan_interfaces(output: str) -> List[Dict[str, str]]:
-    interfaces: List[Dict[str, str]] = []
-    current: Dict[str, str] = {}
-    useful_keys = {
-        "state",
-        "ssid",
-        "bssid",
-        "radio_type",
-        "channel",
-        "signal",
-        "receive_rate_(mbps)",
-        "transmit_rate_(mbps)",
-    }
-    for line in output.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            if current:
-                interfaces.append(current)
-                current = {}
-            continue
-        if ":" not in stripped:
-            continue
-        key, value = stripped.split(":", 1)
-        normalized = re.sub(r"\s+", "_", key.strip().lower())
-        if normalized == "name" and current:
-            interfaces.append(current)
-            current = {}
-        current[normalized] = value.strip()
-    if current:
-        interfaces.append(current)
-    return [item for item in interfaces if useful_keys.intersection(item)]
-
-
-def _first_number(value: Any) -> Optional[float]:
-    match = re.search(r"-?\d+(?:[.,]\d+)?", str(value or ""))
-    if not match:
-        return None
-    try:
-        return float(match.group(0).replace(",", "."))
-    except ValueError:
-        return None
-
-
-def _split_nmcli_terse(line: str) -> List[str]:
-    fields: List[str] = []
-    current: List[str] = []
-    escaped = False
-    for char in line.rstrip("\n"):
-        if escaped:
-            current.append(char)
-            escaped = False
-            continue
-        if char == "\\":
-            escaped = True
-            continue
-        if char == ":":
-            fields.append("".join(current))
-            current = []
-            continue
-        current.append(char)
-    fields.append("".join(current))
-    return fields
-
-
-def parse_linux_nmcli_wifi_terse(output: str) -> List[Dict[str, str]]:
-    interfaces: List[Dict[str, str]] = []
-    for line in output.splitlines():
-        fields = _split_nmcli_terse(line)
-        if len(fields) < 6 or fields[0] != "*":
-            continue
-        interfaces.append(
-            {
-                "name": fields[5] or fields[1] or "Wi-Fi",
-                "ssid": fields[1],
-                "channel": fields[2],
-                "receive_rate_(mbps)": fields[3],
-                "signal": fields[4],
-                "device": fields[5],
-                "source": "nmcli",
-            }
-        )
-    return interfaces
-
-
-def parse_macos_airport_profiler(output: str) -> List[Dict[str, str]]:
-    current_name = ""
-    current: Dict[str, str] = {}
-    interfaces: List[Dict[str, str]] = []
-    in_network = False
-    for raw_line in output.splitlines():
-        stripped = raw_line.strip()
-        if stripped == "Current Network Information:":
-            in_network = True
-            continue
-        if not in_network or not stripped:
-            continue
-        if stripped.endswith(":") and ":" not in stripped[:-1]:
-            if current:
-                interfaces.append(current)
-                current = {}
-            current_name = stripped[:-1]
-            continue
-        if ":" not in stripped:
-            continue
-        key, value = stripped.split(":", 1)
-        normalized = re.sub(r"\s+", "_", key.strip().lower())
-        if normalized == "phy_mode":
-            normalized = "radio_type"
-        elif normalized == "signal_/_noise":
-            normalized = "signal_dbm"
-            value = value.split("/", 1)[0]
-        elif normalized == "transmit_rate":
-            normalized = "transmit_rate_(mbps)"
-        if normalized in {
-            "radio_type",
-            "channel",
-            "signal_dbm",
-            "transmit_rate_(mbps)",
-        }:
-            current[normalized] = value.strip()
-            current.setdefault("name", current_name or "Wi-Fi")
-            current.setdefault("source", "system_profiler")
-    if current:
-        interfaces.append(current)
-    return interfaces
-
-
-def wifi_link_records(quality: Mapping[str, Any]) -> List[Dict[str, Any]]:
-    interfaces = quality.get("interfaces")
-    if isinstance(interfaces, list):
-        return [dict(item) for item in interfaces if isinstance(item, Mapping)]
-    reports = quality.get("reports", {})
-    if not isinstance(reports, Mapping):
-        return []
-    platform_name = str(quality.get("platform") or "")
-    if platform_name == "Linux":
-        terse = reports.get("nmcli_wifi_terse")
-        if isinstance(terse, Mapping) and isinstance(terse.get("stdout"), str):
-            return parse_linux_nmcli_wifi_terse(str(terse["stdout"]))
-    if platform_name == "macOS":
-        profiler = reports.get("airport_profiler")
-        if isinstance(profiler, Mapping) and isinstance(profiler.get("stdout"), str):
-            return parse_macos_airport_profiler(str(profiler["stdout"]))
-    return []
-
-
-def wifi_link_recommendations(quality: Mapping[str, Any]) -> List[Dict[str, Any]]:
-    recommendations: List[Dict[str, Any]] = []
-    for item in wifi_link_records(quality):
-        if not isinstance(item, Mapping):
-            continue
-        name = str(item.get("name") or "Wi-Fi")
-        radio = str(item.get("radio_type") or "").lower()
-        channel = _first_number(item.get("channel"))
-        signal = _first_number(item.get("signal"))
-        signal_dbm = _first_number(item.get("signal_dbm"))
-        if (
-            channel is not None
-            and 1 <= channel <= 14
-            and int(channel)
-            not in {
-                1,
-                6,
-                11,
-            }
-        ):
-            recommendations.append(
-                {
-                    "id": "two_four_ghz_overlap_channel",
-                    "severity": "medium",
-                    "interface": name,
-                    "evidence": {
-                        "radio_type": item.get("radio_type"),
-                        "channel": int(channel),
-                        "signal": item.get("signal") or item.get("signal_dbm"),
-                        "source": item.get("source"),
-                    },
-                    "detail": (
-                        f"{name} is on 2.4 GHz channel {int(channel)}, which overlaps "
-                        "the standard 1/6/11 channel plan and can reduce throughput under contention."
-                    ),
-                    "action": (
-                        "Change the router or access point 2.4 GHz channel to the least busy "
-                        "of 1, 6, or 11, or use a 5 GHz SSID if the adapter/router path supports it."
-                    ),
-                    "mutation": "router-side advisory only",
-                }
-            )
-        marginal_percent = signal is not None and signal < 70
-        marginal_dbm = signal_dbm is not None and signal_dbm <= -67
-        if ("802.11n" in radio or (channel is not None and channel <= 14)) and (
-            marginal_percent or marginal_dbm
-        ):
-            signal_fact = (
-                f"{signal:g}%"
-                if signal is not None
-                else f"{signal_dbm:g} dBm"
-                if signal_dbm is not None
-                else "marginal"
-            )
-            recommendations.append(
-                {
-                    "id": "marginal_two_four_ghz_signal",
-                    "severity": "medium",
-                    "interface": name,
-                    "evidence": {
-                        "radio_type": item.get("radio_type"),
-                        "channel": item.get("channel"),
-                        "signal": item.get("signal") or item.get("signal_dbm"),
-                        "source": item.get("source"),
-                    },
-                    "detail": (
-                        f"{name} signal is {signal_fact}; this is usable but marginal for "
-                        "stable 18+ Mbps downloads on 2.4 GHz under load."
-                    ),
-                    "action": (
-                        "Improve adapter placement, reduce obstruction, or test a short USB extension "
-                        "to move the nano adapter away from the PC chassis."
-                    ),
-                    "mutation": "physical-placement advisory only",
-                }
-            )
-    return recommendations
+_parse_key_value_lines = _wifi_analysis.parse_key_value_lines
+parse_windows_wlan_interfaces = _wifi_analysis.parse_windows_wlan_interfaces
+_first_number = _wifi_analysis.first_number
+_split_nmcli_terse = _wifi_analysis.split_nmcli_terse
+parse_linux_nmcli_wifi_terse = _wifi_analysis.parse_linux_nmcli_wifi_terse
+parse_macos_airport_profiler = _wifi_analysis.parse_macos_airport_profiler
+wifi_link_records = _wifi_analysis.wifi_link_records
+wifi_link_recommendations = _wifi_analysis.wifi_link_recommendations
 
 
 def collect_wifi_link_quality() -> Dict[str, Any]:
@@ -3260,6 +2841,9 @@ def collect_wifi_link_quality() -> Dict[str, Any]:
             if result.ok
             else [],
             "raw": result.to_report(limit=40_000),
+            "ethernet": collect_ethernet_link_quality(
+                system, run_command, run_powershell
+            ),
             "mutation": "none",
         }
         quality["recommendations"] = wifi_link_recommendations(quality)
@@ -3307,8 +2891,11 @@ def collect_wifi_link_quality() -> Dict[str, Any]:
         quality = {
             "available": bool(reports),
             "platform": "Linux",
-            "source": "nmcli and iw when available",
+            "source": "nmcli, iw, ip, and ethtool when available",
             "reports": reports,
+            "ethernet": collect_ethernet_link_quality(
+                system, run_command, run_powershell
+            ),
             "mutation": "none",
         }
         quality["interfaces"] = wifi_link_records(quality)
@@ -3322,11 +2909,14 @@ def collect_wifi_link_quality() -> Dict[str, Any]:
         quality = {
             "available": hardware.ok or profiler.ok,
             "platform": "macOS",
-            "source": "networksetup and system_profiler",
+            "source": "networksetup, system_profiler, and Ethernet media checks",
             "reports": {
                 "hardware_ports": hardware.to_report(limit=20_000),
                 "airport_profiler": profiler.to_report(limit=40_000),
             },
+            "ethernet": collect_ethernet_link_quality(
+                system, run_command, run_powershell
+            ),
             "mutation": "none",
         }
         quality["interfaces"] = wifi_link_records(quality)
@@ -3341,690 +2931,34 @@ def collect_wifi_link_quality() -> Dict[str, Any]:
     }
 
 
-def bufferbloat_assessment(
-    baseline: Mapping[str, Any],
-    load: Optional[Mapping[str, Any]],
-) -> Dict[str, Any]:
-    if load is None:
-        return {
-            "available": False,
-            "severity": "unknown",
-            "evidence": [],
-            "recommendation": "Run benchmark or verify --loaded to measure loaded latency.",
-        }
-    base_public = baseline.get("public_ping", {})
-    load_public = load.get("public_ping", {})
-    gateway = load.get("gateway_ping", {})
-    base_median = base_public.get("median_ms")
-    load_p95 = load_public.get("p95_ms")
-    if base_median is None or load_p95 is None or not load_public.get("available"):
-        return {
-            "available": False,
-            "severity": "unknown",
-            "evidence": ["public latency summary unavailable"],
-            "recommendation": "Repeat with an ICMP-reachable public target or compare with HTTPS timings.",
-        }
-
-    base_value = float(base_median)
-    load_value = float(load_p95)
-    gateway_loss = float(gateway.get("loss_percent") or 0.0)
-    ratio = round(load_value / max(base_value, 1.0), 2)
-    delta = round(load_value - base_value, 3)
-    if gateway_loss >= 10.0:
-        severity = "local_link_or_router"
-        recommendation = "Gateway degraded under load; inspect Wi-Fi signal, adapter placement, USB path, AP load, and router CPU before router SQM."
-    elif load_value >= max(200.0, base_value * 4.0):
-        severity = "high"
-        recommendation = "Evaluate SQM/FQ-CoDel/CAKE at the WAN bottleneck; keep PC-side TCP folklore disabled."
-    elif load_value >= max(100.0, base_value * 2.0):
-        severity = "medium"
-        recommendation = "Loaded latency rose materially; repeat with separate download/upload load before changing router policy."
-    else:
-        severity = "low"
-        recommendation = "No strong bufferbloat signal in this short run."
-    return {
-        "available": True,
-        "severity": severity,
-        "idle_public_median_ms": base_value,
-        "load_public_p95_ms": load_value,
-        "latency_delta_ms": delta,
-        "latency_ratio": ratio,
-        "gateway_loss_percent": gateway_loss,
-        "recommendation": recommendation,
-    }
-
-
-def _summary_number(
-    summary: Mapping[str, Any],
-    section: str,
-    key: str,
-) -> Optional[float]:
-    metric = summary.get(section, {})
-    if not isinstance(metric, Mapping):
-        return None
-    value = metric.get(key)
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _router_finding(
-    identifier: str,
-    layer: str,
-    severity: str,
-    confidence: float,
-    facts: Sequence[str],
-    detail: str,
-) -> Dict[str, Any]:
-    return {
-        "id": identifier,
-        "layer": layer,
-        "severity": severity,
-        "confidence": round(max(0.0, min(1.0, confidence)), 2),
-        "facts": list(facts),
-        "detail": detail,
-    }
-
-
-def _manual_router_optimization(record: Mapping[str, Any]) -> Dict[str, Any]:
-    result = dict(record)
-    result.setdefault("automatic", False)
-    result.setdefault("mutation", "router-admin manual only")
-    return result
-
-
-def _add_router_optimization(
-    optimizations: List[Dict[str, Any]],
-    seen: Set[str],
-    record: Mapping[str, Any],
-) -> None:
-    identifier = str(record.get("id") or "")
-    if not identifier or identifier in seen:
-        return
-    seen.add(identifier)
-    optimizations.append(_manual_router_optimization(record))
-
-
-def _router_metrics(
-    baseline: Mapping[str, Any],
-    load: Optional[Mapping[str, Any]],
-    download_report: Optional[Mapping[str, Any]],
-    min_download_mbps: float,
-    load_capacity_mbps: Optional[float],
-) -> Dict[str, Any]:
-    limitations = [
-        "Endpoint probes can identify router/AP symptoms, but cannot read router CPU, airtime, WAN negotiation, or firmware state without router-admin integration.",
-        "ICMP can be deprioritized; DNS and HTTPS probes are included to avoid single-signal conclusions.",
-    ]
-    base_gateway_median = _summary_number(baseline, "gateway_ping", "median_ms")
-    load_gateway_p95 = _summary_number(load or {}, "gateway_ping", "p95_ms")
-    load_gateway_loss = (
-        _summary_number(load or {}, "gateway_ping", "loss_percent") or 0.0
-    )
-    base_public_median = _summary_number(baseline, "public_ping", "median_ms")
-    load_public_p95 = _summary_number(load or {}, "public_ping", "p95_ms")
-    load_public_loss = _summary_number(load or {}, "public_ping", "loss_percent") or 0.0
-    load_public_jitter = (
-        _summary_number(load or {}, "public_ping", "jitter_avg_ms") or 0.0
-    )
-    dns_failure = max(
-        _summary_number(baseline, "dns", "failure_percent") or 0.0,
-        _summary_number(load or {}, "dns", "failure_percent") or 0.0,
-    )
-    registry_failure = max(
-        _summary_number(baseline, "registry_https", "failure_percent") or 0.0,
-        _summary_number(load or {}, "registry_https", "failure_percent") or 0.0,
-    )
-    throughput = None
-    if isinstance(download_report, Mapping):
-        throughput = _first_number(download_report.get("throughput_mbps"))
-    can_assess_download_target = (
-        load_capacity_mbps is None or load_capacity_mbps >= min_download_mbps
-    )
-    if not can_assess_download_target:
-        limitations.append(
-            "Download byte cap is below the requested throughput target for this load duration; throughput findings are suppressed for this run."
-        )
-    gateway_latency_inflated = (
-        base_gateway_median is not None
-        and load_gateway_p95 is not None
-        and load_gateway_p95 >= max(50.0, base_gateway_median * 6.0)
-    )
-    gateway_stable = (
-        load is not None and load_gateway_loss < 5.0 and not gateway_latency_inflated
-    )
-    public_latency_inflated = (
-        base_public_median is not None
-        and load_public_p95 is not None
-        and load_public_p95 >= max(100.0, base_public_median * 2.5)
-    )
-    return {
-        "has_load": load is not None,
-        "base_public_median": base_public_median,
-        "load_public_p95": load_public_p95,
-        "load_public_loss": load_public_loss,
-        "load_public_jitter": load_public_jitter,
-        "load_gateway_p95": load_gateway_p95,
-        "load_gateway_loss": load_gateway_loss,
-        "gateway_latency_inflated": gateway_latency_inflated,
-        "gateway_stable": gateway_stable,
-        "public_latency_inflated": public_latency_inflated,
-        "dns_failure": dns_failure,
-        "registry_failure": registry_failure,
-        "throughput": throughput,
-        "min_download_mbps": min_download_mbps,
-        "load_capacity_mbps": load_capacity_mbps,
-        "can_assess_download_target": can_assess_download_target,
-        "limitations": limitations,
-    }
-
-
-def _router_wifi_channel_optimization() -> Dict[str, Any]:
-    return {
-        "id": "router-wifi-channel-plan",
-        "layer": "router_wifi",
-        "title": "Use a clean 2.4 GHz channel plan on the router/AP",
-        "actions": [
-            "In the router/AP Wi-Fi settings, choose the least busy of channels 1, 6, or 11 for 2.4 GHz.",
-            "Use 20 MHz channel width on crowded 2.4 GHz networks; wider 2.4 GHz channels often add interference instead of throughput.",
-            "Move high-throughput clients to a 5 GHz or 6 GHz SSID when both router and client support it.",
-        ],
-        "evidence": ["router-wifi-overlap-channel"],
-        "expected_metrics": [
-            "higher sustained download throughput",
-            "lower loaded jitter",
-            "fewer Wi-Fi retries when router counters expose them",
-        ],
-        "verify_with": "Rerun router-diagnose and link-quality after the router/AP change.",
-        "risk": "low; incorrect channel choice can worsen neighboring-network contention.",
-    }
-
-
-def _router_wifi_placement_optimization() -> Dict[str, Any]:
-    return {
-        "id": "router-wifi-placement",
-        "layer": "router_wifi",
-        "title": "Improve AP/client placement before changing TCP settings",
-        "actions": [
-            "Raise or reposition the router/AP and keep it away from metal, dense walls, USB 3.0 noise, and crowded power strips.",
-            "Test a short USB extension or a different client position, then compare link signal and loaded throughput.",
-            "If the router has band steering, verify the client is not being held on weak 2.4 GHz when a stronger 5 GHz path exists.",
-        ],
-        "evidence": ["router-wifi-marginal-signal"],
-        "expected_metrics": [
-            "stronger signal/RSSI",
-            "higher link rate",
-            "more stable loaded throughput",
-        ],
-        "verify_with": "Compare link-quality and router-diagnose before and after placement changes.",
-        "risk": "low; physical placement changes are reversible.",
-    }
-
-
-def _apply_router_wifi_rules(
-    wifi_link_quality: Mapping[str, Any],
-    findings: List[Dict[str, Any]],
-    optimizations: List[Dict[str, Any]],
-    seen: Set[str],
-) -> None:
-    wifi_recommendations = wifi_link_quality.get("recommendations", [])
-    if not isinstance(wifi_recommendations, list):
-        return
-    for recommendation in wifi_recommendations:
-        if not isinstance(recommendation, Mapping):
-            continue
-        recommendation_id = recommendation.get("id")
-        detail = str(recommendation.get("detail") or "")
-        if recommendation_id == "two_four_ghz_overlap_channel":
-            findings.append(
-                _router_finding(
-                    "router-wifi-overlap-channel",
-                    "router_wifi",
-                    "medium",
-                    0.78,
-                    [detail],
-                    "The associated AP is using an overlapping 2.4 GHz channel. This can reduce usable throughput when nearby airtime is busy.",
-                )
-            )
-            _add_router_optimization(
-                optimizations, seen, _router_wifi_channel_optimization()
-            )
-        elif recommendation_id == "marginal_two_four_ghz_signal":
-            findings.append(
-                _router_finding(
-                    "router-wifi-marginal-signal",
-                    "router_wifi",
-                    "medium",
-                    0.72,
-                    [detail],
-                    "The Wi-Fi link is usable but close enough to the edge that load can expose rate shifts, retries, or AP airtime pressure.",
-                )
-            )
-            _add_router_optimization(
-                optimizations, seen, _router_wifi_placement_optimization()
-            )
-
-
-def _apply_gateway_pressure_rule(
-    metrics: Mapping[str, Any],
-    findings: List[Dict[str, Any]],
-    optimizations: List[Dict[str, Any]],
-    seen: Set[str],
-) -> None:
-    if not metrics["has_load"]:
-        return
-    if metrics["load_gateway_loss"] < 10.0 and not metrics["gateway_latency_inflated"]:
-        return
-    facts = [f"loaded_gateway_loss_percent={metrics['load_gateway_loss']:g}"]
-    if metrics["load_gateway_p95"] is not None:
-        facts.append(f"loaded_gateway_p95_ms={metrics['load_gateway_p95']:g}")
-    findings.append(
-        _router_finding(
-            "gateway-degrades-under-load",
-            "router_or_ap_lan",
-            "high",
-            0.8,
-            facts,
-            "The first hop degraded during local load. That points to Wi-Fi airtime, AP/router CPU, router LAN queueing, or adapter path stress before blaming the ISP path.",
-        )
-    )
-    _add_router_optimization(
-        optimizations,
-        seen,
-        {
-            "id": "router-ap-health-check",
-            "layer": "router_or_ap_lan",
-            "title": "Check router/AP load and local-link contention",
-            "actions": [
-                "Inspect router/AP CPU, memory, wireless client count, and error counters during the failing workload if the UI exposes them.",
-                "Compare one wired/Ethernet run or a different Wi-Fi band to separate AP/router pressure from ISP/WAN pressure.",
-                "Remove accidental per-device caps, parental controls, or guest-network limits only when the router UI shows they apply to this client.",
-            ],
-            "evidence": ["gateway-degrades-under-load"],
-            "expected_metrics": [
-                "gateway loss below 5%",
-                "gateway p95 latency stays close to idle",
-                "fewer disconnects under package-install load",
-            ],
-            "verify_with": "Rerun router-diagnose under the same load after each router/AP change.",
-            "risk": "low to moderate; router policy changes affect all clients.",
-        },
-    )
-
-
-def _apply_wan_queue_rule(
-    metrics: Mapping[str, Any],
-    findings: List[Dict[str, Any]],
-    optimizations: List[Dict[str, Any]],
-    seen: Set[str],
-) -> None:
-    if (
-        metrics["has_load"]
-        and metrics["gateway_stable"]
-        and (
-            metrics["public_latency_inflated"]
-            or metrics["load_public_loss"] >= 5.0
-            or metrics["load_public_jitter"] >= 15.0
-        )
-    ):
-        facts = [
-            f"loaded_gateway_loss_percent={metrics['load_gateway_loss']:g}",
-            f"loaded_public_loss_percent={metrics['load_public_loss']:g}",
-            f"loaded_public_jitter_ms={metrics['load_public_jitter']:g}",
-        ]
-        if (
-            metrics["base_public_median"] is not None
-            and metrics["load_public_p95"] is not None
-        ):
-            facts.extend(
-                [
-                    f"idle_public_median_ms={metrics['base_public_median']:g}",
-                    f"loaded_public_p95_ms={metrics['load_public_p95']:g}",
-                ]
-            )
-        findings.append(
-            _router_finding(
-                "wan-queue-pressure",
-                "router_queue",
-                "high",
-                0.86,
-                facts,
-                "The gateway stayed clean while the remote path degraded under download pressure. That is the classic host-visible shape of router/WAN queue pressure.",
-            )
-        )
-        _add_router_optimization(
-            optimizations,
-            seen,
-            {
-                "id": "router-sqm-aqm",
-                "layer": "router_queue",
-                "title": "Enable SQM/AQM at the WAN bottleneck",
-                "actions": [
-                    "Use SQM/AQM with FQ-CoDel or CAKE on the router interface that actually bottlenecks the ISP link.",
-                    "Set download and upload shaping slightly below measured line rate; start around 90-95% and refine with loaded-latency results.",
-                    "Do not stack random client TCP tweaks on top of router queue symptoms; verify the queue directly after each router change.",
-                ],
-                "evidence": ["wan-queue-pressure"],
-                "expected_metrics": [
-                    "lower loaded public p95 latency",
-                    "lower jitter under download and upload load",
-                    "stable package-manager downloads while other traffic is active",
-                ],
-                "verify_with": "Rerun router-diagnose; loaded public p95/jitter should fall while gateway remains clean.",
-                "risk": "moderate; rate limits set too low cap throughput, and SQM must run at the true bottleneck.",
-            },
-        )
-
-
-def _apply_router_dns_rule(
-    metrics: Mapping[str, Any],
-    findings: List[Dict[str, Any]],
-    optimizations: List[Dict[str, Any]],
-    seen: Set[str],
-) -> None:
-    if metrics["dns_failure"] <= 0.0 or metrics["registry_failure"] >= 50.0:
-        return
-    findings.append(
-        _router_finding(
-            "router-dns-forwarder-suspect",
-            "router_dns",
-            "medium",
-            0.64,
-            [
-                f"dns_failure_percent={metrics['dns_failure']:g}",
-                f"https_failure_percent={metrics['registry_failure']:g}",
-            ],
-            "DNS failed while HTTPS was not equally broken. That can be router DNS proxy/cache behavior, ISP resolver behavior, VPN policy, or host resolver state.",
-        )
-    )
-    _add_router_optimization(
-        optimizations,
-        seen,
-        {
-            "id": "router-dns-forwarder-review",
-            "layer": "router_dns",
-            "title": "Review router DNS forwarding only if failures repeat",
-            "actions": [
-                "Check whether multiple devices see DNS failures through the same router before changing DNS globally.",
-                "If failures repeat, configure router DHCP/WAN DNS to reliable recursive resolvers or bypass a flaky router DNS proxy.",
-                "Keep VPN or enterprise DNS rules intact; do not delete policy rules just to chase raw download speed.",
-            ],
-            "evidence": ["router-dns-forwarder-suspect"],
-            "expected_metrics": [
-                "DNS failure rate returns to 0%",
-                "DNS median and p95 stabilize",
-                "HTTPS probes remain successful",
-            ],
-            "verify_with": "Rerun diagnose or router-diagnose and compare DNS failure percent.",
-            "risk": "moderate; DNS changes can break split-DNS, parental controls, or VPN routing.",
-        },
-    )
-
-
-def _apply_throughput_rule(
-    metrics: Mapping[str, Any],
-    findings: List[Dict[str, Any]],
-    optimizations: List[Dict[str, Any]],
-    seen: Set[str],
-) -> None:
-    if not (
-        metrics["throughput"] is not None
-        and metrics["throughput"] < metrics["min_download_mbps"]
-        and metrics["gateway_stable"]
-        and metrics["load_public_loss"] < 5.0
-        and metrics["can_assess_download_target"]
-    ):
-        return
-    findings.append(
-        _router_finding(
-            "throughput-below-target-with-clean-first-hop",
-            "router_or_isp_throughput",
-            "medium",
-            0.58,
-            [
-                f"download_load_mbps={metrics['throughput']:g}",
-                f"min_download_mbps={metrics['min_download_mbps']:g}",
-            ],
-            "Throughput missed the target while the first hop stayed clean. This is not enough to blame the router alone, but it is enough to inspect router rate limits, WAN negotiation, and ISP plan/path evidence.",
-        )
-    )
-    _add_router_optimization(
-        optimizations,
-        seen,
-        {
-            "id": "router-throughput-policy-review",
-            "layer": "router_or_isp_throughput",
-            "title": "Inspect router throughput caps and WAN link state",
-            "actions": [
-                "Check router QoS, guest-network, parental-control, and per-device rate-limit rules for this client.",
-                "Inspect router WAN port/link speed and modem/router logs for renegotiation or error counters.",
-                "Compare with one wired client or another device before changing endpoint TCP settings.",
-            ],
-            "evidence": ["throughput-below-target-with-clean-first-hop"],
-            "expected_metrics": [
-                "download load meets target",
-                "WAN/link error counters stop increasing",
-                "wired comparison matches expected ISP plan",
-            ],
-            "verify_with": "Rerun router-diagnose and an NDT7 speed test after router policy changes.",
-            "risk": "low to moderate; router policy edits can affect other clients.",
-        },
-    )
-
-
-def _router_verdict(findings: Sequence[Mapping[str, Any]]) -> Tuple[str, float]:
-    severity_order = {"high": 3, "medium": 2, "low": 1}
-    leading = max(
-        findings, key=lambda item: severity_order.get(str(item["severity"]), 0)
-    )
-    verdict_map = {
-        "router_queue": "router_wan_queue_likely",
-        "router_wifi": "router_wifi_or_ap_likely",
-        "router_or_ap_lan": "router_or_ap_lan_likely",
-        "router_dns": "router_dns_possible",
-        "router_or_isp_throughput": "router_or_isp_throughput_possible",
-        "not_isolated": "router_fault_not_proven",
-    }
-    return (
-        verdict_map.get(str(leading["layer"]), "router_fault_not_proven"),
-        float(leading["confidence"]),
-    )
-
-
-def router_side_diagnosis(
-    baseline: Mapping[str, Any],
-    load: Optional[Mapping[str, Any]],
-    wifi_link_quality: Mapping[str, Any],
-    download_report: Optional[Mapping[str, Any]],
-    min_download_mbps: float,
-    load_capacity_mbps: Optional[float] = None,
-) -> Dict[str, Any]:
-    findings: List[Dict[str, Any]] = []
-    optimizations: List[Dict[str, Any]] = []
-    seen_optimizations: Set[str] = set()
-    metrics = _router_metrics(
-        baseline, load, download_report, min_download_mbps, load_capacity_mbps
-    )
-    _apply_router_wifi_rules(
-        wifi_link_quality, findings, optimizations, seen_optimizations
-    )
-    _apply_gateway_pressure_rule(metrics, findings, optimizations, seen_optimizations)
-    _apply_wan_queue_rule(metrics, findings, optimizations, seen_optimizations)
-    _apply_router_dns_rule(metrics, findings, optimizations, seen_optimizations)
-    _apply_throughput_rule(metrics, findings, optimizations, seen_optimizations)
-
-    if not findings:
-        findings.append(
-            _router_finding(
-                "router-fault-not-proven",
-                "not_isolated",
-                "low",
-                0.42,
-                ["no_router_threshold_crossed=true"],
-                "The current evidence does not prove a router-side fault. Keep device-side settings stable and capture the failing workload if the symptom returns.",
-            )
-        )
-
-    verdict, confidence = _router_verdict(findings)
-    return {
-        "available": True,
-        "verdict": verdict,
-        "confidence": confidence,
-        "findings": findings,
-        "optimizations": optimizations,
-        "evidence_summary": {
-            "gateway_loss_percent_under_load": metrics["load_gateway_loss"],
-            "gateway_loaded_p95_ms": metrics["load_gateway_p95"],
-            "public_loaded_p95_ms": metrics["load_public_p95"],
-            "public_loaded_jitter_ms": metrics["load_public_jitter"],
-            "dns_failure_percent": metrics["dns_failure"],
-            "registry_failure_percent": metrics["registry_failure"],
-            "download_load_mbps": metrics["throughput"],
-            "min_download_mbps": min_download_mbps,
-            "load_capacity_mbps": load_capacity_mbps,
-        },
-        "limitations": metrics["limitations"],
-        "mutation": "none; report output only",
-    }
-
-
-def optimizer_action_ledger() -> List[Dict[str, Any]]:
-    return [
-        {
-            "id": "measure-idle",
-            "title": "Idle DNS, HTTPS, gateway, and public latency probes",
-            "platforms": ["Windows", "Linux", "macOS"],
-            "mutation": "none",
-            "evidence": "local ping plus DNS and HTTPS probes",
-            "precheck": "network command availability",
-            "postcheck": "JSON report with loss, latency, jitter, DNS, and HTTPS summaries",
-            "reversible": "not applicable",
-        },
-        {
-            "id": "measure-ndt7",
-            "title": "M-Lab NDT7 application goodput test",
-            "platforms": ["Windows", "Linux", "macOS"],
-            "mutation": "none",
-            "evidence": "M-Lab Locate API v2 and NDT7 WebSocket/TLS protocol",
-            "precheck": "Locate API returns usable WSS download/upload URLs",
-            "postcheck": "download/upload Mbps and server metadata saved without access tokens",
-            "reversible": "not applicable",
-        },
-        {
-            "id": "inspect-wifi-link",
-            "title": "Wi-Fi link quality inventory",
-            "platforms": ["Windows", "Linux", "macOS"],
-            "mutation": "none",
-            "evidence": "documented OS diagnostic commands",
-            "precheck": "netsh, nmcli/iw, or networksetup/system_profiler availability",
-            "postcheck": "signal/link-rate/channel evidence stored in the report when exposed by the OS",
-            "reversible": "not applicable",
-        },
-        {
-            "id": "apply-npm-weak-link-profile",
-            "title": "npm weak-link retry and concurrency profile",
-            "platforms": ["Windows", "Linux", "macOS"],
-            "mutation": "user npm configuration only",
-            "evidence": "npm user config semantics",
-            "precheck": "npm executable and non-root user context",
-            "postcheck": "snapshot-backed manifest and npm config readback",
-            "reversible": "restore command restores exact previous user config",
-        },
-        {
-            "id": "apply-windows-dns-policy-repair",
-            "title": "Windows DNS policy and invalid resolver repair",
-            "platforms": ["Windows"],
-            "mutation": "DNS cache flush plus invalid DNS server replacement only",
-            "evidence": "Get-DnsClientNrptPolicy, DNS Client events, DNS server inventory",
-            "precheck": "NRPT health, event counts, and invalid resolver entries",
-            "postcheck": "repair result and follow-up health evidence in manifest",
-            "reversible": "snapshot-backed DNS server restore; NRPT rules are never deleted automatically",
-        },
-        {
-            "id": "apply-wifi-power-stability",
-            "title": "Adapter-scoped Wi-Fi power stability profile",
-            "platforms": ["Windows", "Linux"],
-            "mutation": "documented power-management settings only, gated by detected adapter class",
-            "evidence": "powercfg, USB-backed Wi-Fi inventory, NetAdapterPowerManagement, and NetworkManager powersave fields",
-            "precheck": "active physical Wi-Fi adapter/profile detected",
-            "postcheck": "manifest records changed values and any skipped adapters",
-            "reversible": "snapshot-backed restore",
-        },
-        {
-            "id": "apply-transport-safe-values",
-            "title": "Evidence-backed transport and DNS safe values",
-            "platforms": ["Windows", "Linux", "macOS"],
-            "mutation": "documented MTU, DNS, QoS, retransmission, sysctl, or buffer settings by platform",
-            "evidence": "project evidence policy and platform command support",
-            "precheck": "platform, privilege, and current state checks",
-            "postcheck": "manifest records applied, skipped, and failed operations",
-            "reversible": "snapshot-backed restore where the platform exposes previous state",
-        },
-        {
-            "id": "deny-folklore",
-            "title": "Deny unsafe or unproven optimizer folklore",
-            "platforms": ["Windows", "Linux", "macOS"],
-            "mutation": "none",
-            "evidence": "explicit denylist and regression tests",
-            "precheck": "planned action text and audit denylist",
-            "postcheck": "guardrail tests reject advertised unsafe actions",
-            "reversible": "not applicable",
-        },
-    ]
+bufferbloat_assessment = _router_diagnostics.bufferbloat_assessment
+_summary_number = _router_diagnostics._summary_number
+_router_finding = _router_diagnostics._router_finding
+_manual_router_optimization = _router_diagnostics._manual_router_optimization
+_add_router_optimization = _router_diagnostics._add_router_optimization
+_router_metrics = _router_diagnostics._router_metrics
+_router_wifi_channel_optimization = (
+    _router_diagnostics._router_wifi_channel_optimization
+)
+_router_wifi_placement_optimization = (
+    _router_diagnostics._router_wifi_placement_optimization
+)
+_apply_router_wifi_rules = _router_diagnostics._apply_router_wifi_rules
+_apply_gateway_pressure_rule = _router_diagnostics._apply_gateway_pressure_rule
+_apply_wan_queue_rule = _router_diagnostics._apply_wan_queue_rule
+_apply_router_dns_rule = _router_diagnostics._apply_router_dns_rule
+_apply_throughput_rule = _router_diagnostics._apply_throughput_rule
+_router_verdict = _router_diagnostics._router_verdict
+router_side_diagnosis = _router_diagnostics.router_side_diagnosis
 
 
 def planned_changes(
     do_system: bool, do_npm: bool, include_battery: bool, maxsockets: int
 ) -> List[str]:
-    changes: List[str] = []
-    system = platform.system()
-    if do_system:
-        if system == "Windows":
-            changes.append(
-                "Check and repair Windows DNS policy corruption, DNS Client timeouts, and invalid resolver entries"
-            )
-            changes.append(
-                "Restore Windows TCP receive-window auto-tuning to normal when restricted or disabled"
-            )
-            changes.append(
-                "Set the active plan's Wi-Fi policy to Maximum Performance on AC"
-                + (" and battery" if include_battery else "")
-            )
-            changes.append(
-                "Disable active power-plan USB suspend for detected USB Wi-Fi adapters"
-                + (" on AC and battery" if include_battery else " on AC")
-            )
-            changes.append(
-                "Disable supported NDIS SelectiveSuspend and DeviceSleepOnDisconnect on physical Wi-Fi adapters"
-            )
-            changes.append("Set MTU to 1500 on Wi-Fi interfaces")
-            changes.append("Disable Windows Delivery Optimization (P2P update sharing)")
-            changes.append("Set QoS reservable bandwidth to 0%")
-            changes.append("Set TCP retransmission registry values (data=5, connect=3)")
-        elif system == "Linux":
-            changes.append(
-                "Set active NetworkManager Wi-Fi profiles to powersave=2 (disabled)"
-            )
-            changes.append(
-                "Write sysctl TCP/IP tuning (buffers, SACK, window scaling, timestamps, fastopen)"
-            )
-            changes.append("Enable BBR congestion control and fq_codel qdisc")
-            changes.append("Set NIC ring buffers to 4096 (rx/tx)")
-            changes.append("Enable and start irqbalance daemon")
-            changes.append("Set DNS to 1.1.1.1 / 1.0.0.1")
-        elif system == "Darwin":
-            changes.append("Set DNS to 1.1.1.1 / 1.0.0.1")
-            changes.append("Set TCP buffer sizes (send=131072, recv=131072)")
-        else:
-            changes.append(f"No system setting for {system}")
-    if do_npm:
-        changes.append(
-            f"Apply weak-link npm profile (maxsockets={maxsockets}, retries, longer timeout, prefer-offline)"
-        )
-    return changes
+    """Compatibility wrapper for the platform-neutral action policy module."""
+    return _planned_changes(
+        platform.system(), do_system, do_npm, include_battery, maxsockets
+    )
 
 
 def validate_apply_context(do_system: bool, do_npm: bool) -> None:
@@ -4068,14 +3002,37 @@ def create_snapshot(do_system: bool, do_npm: bool) -> Tuple[Path, Path, Dict[str
     return directory, manifest_path, manifest
 
 
+RESET_NETWORK_COPY: Mapping[str, Tuple[str, str, str]] = {
+    "Windows": (
+        "Windows network stack reset",
+        "WARNING: Resets TCP/IP and Winsock, then flushes the DNS cache. A reboot is recommended.",
+        "Reset the Windows network stack?",
+    ),
+    "Darwin": (
+        "macOS transient network cache refresh",
+        "Flushes route and DNS caches without replacing network services or DNS settings.",
+        "Flush macOS route and DNS caches?",
+    ),
+    "Linux": (
+        "Linux network service refresh",
+        "Restarts the detected network service and flushes resolver caches; active connections may disconnect.",
+        "Restart detected Linux network services and flush caches?",
+    ),
+}
+
+
 def command_reset_network(args: argparse.Namespace) -> int:
     system = platform.system()
-    print(f"Network stack reset for {system}")
-    print("  WARNING: This resets TCP/IP, Winsock, and DNS settings to OS defaults.")
-    print("  A system reboot is recommended after this operation.")
+    operation_copy = RESET_NETWORK_COPY.get(system)
+    if operation_copy is None:
+        print(f"Network reset is not implemented for {system}.")
+        return 1
+    title, warning, prompt = operation_copy
+    print(title)
+    print(f"  {warning}")
     print()
 
-    if not confirm("Reset the network stack?", args.yes):
+    if not confirm(prompt, args.yes):
         print("Cancelled.")
         return 1
 
@@ -4105,42 +3062,45 @@ def command_reset_network(args: argparse.Namespace) -> int:
         if os.geteuid() != 0:
             print("  - Some reset steps require root. Run with sudo for full effect.")
         results = macos_reset_network_config()
-        for i, r in enumerate(results):
-            label = [
-                "mv config plists",
-                "route -n flush",
-                "dscacheutil -flushcache",
-                "killall mDNSResponder",
-            ][i]
-            if r.ok:
+        for result in results:
+            label = " ".join(result.args)
+            if result.ok:
                 print(f"  + {label}")
             else:
-                print_command_failure(label, r)
-        print("  + macOS network config reset. Reboot is recommended.")
-        return 0
+                print_command_failure(label, result)
+        all_ok = bool(results) and all(result.ok for result in results)
+        if all_ok:
+            print("  + macOS transient network caches flushed. Reboot is optional.")
+        else:
+            print(
+                "  ! macOS cache refresh completed with failed steps.", file=sys.stderr
+            )
+        return 0 if all_ok else 2
 
     elif system == "Linux":
         if os.geteuid() != 0:
             print("  - Some reset steps require root. Run with sudo for full effect.")
         results = linux_reset_network()
-        for i, r in enumerate(results):
-            label = (
-                ["systemctl restart NetworkManager", "resolvectl flush-caches"][i]
-                if i < len(results)
-                else "reset"
-            )
-            if r.ok:
+        for result in results:
+            label = " ".join(result.args)
+            if result.ok:
                 print(f"  + {label}")
             else:
-                print_command_failure(label, r)
-        # Also try to restart networking
-        for svc in ["networking", "systemd-networkd"]:
-            r = run_command(["systemctl", "restart", svc], timeout=15)
-            if r.ok:
-                print(f"  + restarted {svc}")
-                break
-        print("  + Linux network stack reset.")
-        return 0
+                print_command_failure(label, result)
+        all_ok = bool(results) and all(result.ok for result in results)
+        if all_ok:
+            print("  + Linux network service and resolver cache refresh completed.")
+        elif results:
+            print(
+                "  ! Linux network refresh completed with failed steps.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "  ! No supported Linux network reset command was available.",
+                file=sys.stderr,
+            )
+        return 0 if all_ok else 2
 
     else:
         print(f"  - Network reset not implemented for {system}")
@@ -4149,12 +3109,6 @@ def command_reset_network(args: argparse.Namespace) -> int:
 
 def _format_dns_servers(servers: Sequence[str]) -> str:
     return ", ".join(servers) if servers else "none"
-
-
-def _dns_needs_target_servers(servers: Sequence[str]) -> bool:
-    return any(server in {"0.0.0.0", ""} for server in servers) or any(
-        server not in servers for server in DEFAULT_DNS_SERVERS
-    )
 
 
 def command_repair_windows_dns(args: argparse.Namespace) -> int:
@@ -4182,20 +3136,21 @@ def command_repair_windows_dns(args: argparse.Namespace) -> int:
         print("Cancelled.")
         return 1
 
-    result = windows_dns_policy.repair_health(
-        run_windows_dns_policy_powershell,
-        health,
-        DEFAULT_DNS_SERVERS,
-    )
-    for action in result.actions:
-        if action.ok:
-            print(f"  + {action.name}")
-        else:
-            print(f"  ! {action.name}: {action.detail}", file=sys.stderr)
+    snapshot_dir, manifest_path, manifest = create_snapshot(True, False)
+    manifest["status"] = "applying_dns_repair"
+    atomic_write_json(manifest_path, manifest)
+    print(f"  + Restore point created: {snapshot_dir.name}")
+
+    snapshot_health = windows_dns_health_from_manifest(manifest)
+    result = apply_windows_dns_policy_repair(manifest, manifest_path, snapshot_health)
     for note in result.notes:
         print(f"  - {note}")
     if result.reboot_recommended:
         print("  - Reboot is recommended if NRPT corruption remains.")
+    manifest["status"] = "applied" if result.ok else "partial"
+    manifest["completed_utc"] = utc_now_iso()
+    atomic_write_json(manifest_path, manifest)
+    print(f"  - Restore with: net-stability restore {snapshot_dir.name}")
     return 0 if result.ok else 2
 
 
@@ -4204,15 +3159,10 @@ def command_repair_linux_dns(args: argparse.Namespace) -> int:
     servers = tuple(str(server) for server in state.get("servers", []))
     print("Linux DNS repair:")
     print(f"  Current servers: {_format_dns_servers(servers)}")
-    print(f"  Target servers: {_format_dns_servers(DEFAULT_DNS_SERVERS)}")
+    print("  Policy: preserve configured DNS servers; flush cache only.")
 
-    needs_target = _dns_needs_target_servers(servers)
     if args.dry_run:
-        print("  - Would flush the Linux resolver cache.")
-        if needs_target:
-            print("  - Would set DNS servers to 1.1.1.1, 1.0.0.1.")
-        else:
-            print("  - DNS servers already match the stable profile.")
+        print("  - Would flush the Linux resolver cache without changing DNS servers.")
         return 0
     if os.geteuid() != 0:
         raise NetStabilityError("Linux DNS repair requires root; run with sudo")
@@ -4221,14 +3171,12 @@ def command_repair_linux_dns(args: argparse.Namespace) -> int:
         return 1
 
     results = linux_flush_dns_cache()
-    if needs_target:
-        results.append(linux_set_dns(DEFAULT_DNS_SERVERS))
     if not results:
         print("  - No Linux DNS cache flush command was available.")
         return 0
     for result in results:
         if result.ok:
-            print(f"  + {' '.join(result.command)}")
+            print(f"  + {' '.join(result.args)}")
         else:
             print_command_failure("Linux DNS repair", result)
     return 0 if all(result.ok for result in results) else 2
@@ -4239,15 +3187,12 @@ def command_repair_macos_dns(args: argparse.Namespace) -> int:
     servers = tuple(str(server) for server in state.get("servers", []))
     print("macOS DNS repair:")
     print(f"  Current servers: {_format_dns_servers(servers)}")
-    print(f"  Target servers: {_format_dns_servers(DEFAULT_DNS_SERVERS)}")
+    print("  Policy: preserve configured DNS servers; flush caches only.")
 
-    needs_target = _dns_needs_target_servers(servers)
     if args.dry_run:
-        print("  - Would flush the macOS DNS and mDNS responder caches.")
-        if needs_target:
-            print("  - Would set DNS servers to 1.1.1.1, 1.0.0.1.")
-        else:
-            print("  - DNS servers already match the stable profile.")
+        print(
+            "  - Would flush the macOS DNS and mDNS responder caches without changing DNS servers."
+        )
         return 0
     if os.geteuid() != 0:
         raise NetStabilityError("macOS DNS repair requires root; run with sudo")
@@ -4259,11 +3204,9 @@ def command_repair_macos_dns(args: argparse.Namespace) -> int:
         run_command(["dscacheutil", "-flushcache"], timeout=5),
         run_command(["killall", "-HUP", "mDNSResponder"], timeout=5),
     ]
-    if needs_target:
-        results.append(macos_set_dns(DEFAULT_DNS_SERVERS))
     for result in results:
         if result.ok:
-            print(f"  + {' '.join(result.command)}")
+            print(f"  + {' '.join(result.args)}")
         else:
             print_command_failure("macOS DNS repair", result)
     return 0 if all(result.ok for result in results) else 2
@@ -4290,12 +3233,8 @@ def command_apply(args: argparse.Namespace) -> int:
         do_system, do_npm, args.include_battery, args.npm_maxsockets
     ):
         print(f"  - {change}")
-    if do_system and not args.no_restart and platform.system() in {"Windows", "Linux"}:
-        print(
-            "  - The Wi-Fi adapter/connection may disconnect briefly while settings are activated"
-        )
     print(
-        "Paper-backed MTU, DNS, BBR, and TCP auto-tuning repairs ARE applied when supported."
+        "Only the evidence-gated repairs listed above may be applied; unsafe folklore tuning is not advertised."
     )
 
     if args.dry_run:
@@ -4977,243 +3916,22 @@ ConvertTo-Json -InputObject $items -Depth 4 -Compress
 
     for label, command, timeout in commands:
         data[label] = run_command(command, timeout=timeout).to_report()
-    data["wifi_link_quality"] = collect_wifi_link_quality()
+    data["path_context"] = collect_path_context(
+        system, run_command, run_powershell, shutil.which
+    )
+    link_quality = collect_wifi_link_quality()
+    data["ethernet_link_quality"] = link_quality.get("ethernet", {})
+    data["wifi_link_quality"] = link_quality
     return data
 
 
 def capability_matrix() -> List[Dict[str, str]]:
-    system = platform.system()
-    matrix: List[Dict[str, str]] = [
-        {
-            "capability": "Idle gateway and remote latency probes",
-            "available": "yes",
-            "source": "ping command with HTTPS/DNS corroboration",
-            "privilege": "none",
-            "mutation": "none",
-        },
-        {
-            "capability": "Application command watch",
-            "available": "yes",
-            "source": "subprocess without shell",
-            "privilege": "none",
-            "mutation": "none",
-        },
-        {
-            "capability": "Comprehensive download-loaded benchmark",
-            "available": "yes",
-            "source": "stdlib HTTPS load plus gateway/public/DNS/HTTPS probes",
-            "privilege": "none",
-            "mutation": "none, report output only",
-        },
-        {
-            "capability": "Router-side diagnostic suite",
-            "available": "yes",
-            "source": "gateway/public split, DNS/HTTPS probes, Wi-Fi link evidence, and bounded download load",
-            "privilege": "none",
-            "mutation": "none, manual router/AP recommendations only",
-        },
-        {
-            "capability": "M-Lab NDT7 application speed test",
-            "available": "yes",
-            "source": "M-Lab Locate API v2 plus NDT7 WebSocket/TLS",
-            "privilege": "none",
-            "mutation": "none, report output only",
-        },
-        {
-            "capability": "Cross-platform Wi-Fi link quality inspection",
-            "available": "conditional",
-            "source": "netsh wlan, nmcli/iw, or networksetup/system_profiler",
-            "privilege": "none",
-            "mutation": "none",
-        },
-        {
-            "capability": "npm weak-link profile",
-            "available": "yes" if npm_executable() else "no",
-            "source": "npm config user location",
-            "privilege": "user",
-            "mutation": "application-scoped, snapshot-backed",
-        },
-        {
-            "capability": "Router SQM/AQM control",
-            "available": "no",
-            "source": "endpoint-only tool boundary",
-            "privilege": "router administrator",
-            "mutation": "advice only",
-        },
-    ]
-    if system == "Windows":
-        matrix.extend(
-            [
-                {
-                    "capability": "Wi-Fi adapter inventory",
-                    "available": "yes",
-                    "source": "PowerShell NetAdapter structured JSON",
-                    "privilege": "none",
-                    "mutation": "none",
-                },
-                {
-                    "capability": "Adapter-scoped power stability profile",
-                    "available": "conditional",
-                    "source": "Get/Set-NetAdapterPowerManagement and powercfg",
-                    "privilege": "administrator to write",
-                    "mutation": "snapshot-backed, opt-in apply path",
-                },
-                {
-                    "capability": "MTU optimization (1500)",
-                    "available": "conditional",
-                    "source": "netsh interface ipv4 set subinterface",
-                    "privilege": "administrator",
-                    "mutation": "snapshot-backed",
-                },
-                {
-                    "capability": "Delivery Optimization disable",
-                    "available": "conditional",
-                    "source": "registry DODownloadMode",
-                    "privilege": "administrator",
-                    "mutation": "snapshot-backed",
-                },
-                {
-                    "capability": "QoS reservable bandwidth 0%",
-                    "available": "conditional",
-                    "source": "registry NonBestEffortLimit",
-                    "privilege": "administrator",
-                    "mutation": "snapshot-backed",
-                },
-                {
-                    "capability": "TCP retransmission tuning",
-                    "available": "conditional",
-                    "source": "registry TcpMaxData/ConnectRetransmissions",
-                    "privilege": "administrator",
-                    "mutation": "snapshot-backed",
-                },
-                {
-                    "capability": "Windows DNS policy health and repair",
-                    "available": "conditional",
-                    "source": "Get-DnsClientNrptPolicy, DNS Client events, DNS server inventory",
-                    "privilege": "administrator to write DNS server repair",
-                    "mutation": "snapshot-backed DNS cache flush and invalid resolver repair",
-                },
-                {
-                    "capability": "Network stack reset",
-                    "available": "conditional",
-                    "source": "netsh int ip reset, winsock reset, ipconfig /flushdns",
-                    "privilege": "administrator",
-                    "mutation": "requires reboot",
-                },
-                {
-                    "capability": "Windows WLAN report",
-                    "available": "conditional",
-                    "source": "netsh wlan report",
-                    "privilege": "user",
-                    "mutation": "none",
-                },
-            ]
-        )
-    elif system == "Linux":
-        matrix.extend(
-            [
-                {
-                    "capability": "NetworkManager Wi-Fi profile inventory",
-                    "available": "yes" if shutil.which("nmcli") else "no",
-                    "source": "nmcli structured fields",
-                    "privilege": "none",
-                    "mutation": "none",
-                },
-                {
-                    "capability": "NetworkManager Wi-Fi powersave profile",
-                    "available": "conditional",
-                    "source": "nmcli 802-11-wireless.powersave",
-                    "privilege": "polkit/root to write",
-                    "mutation": "snapshot-backed, opt-in apply path",
-                },
-                {
-                    "capability": "sysctl TCP/IP tuning (buffers, BBR, fq_codel)",
-                    "available": "conditional",
-                    "source": "sysctl / /etc/sysctl.d/",
-                    "privilege": "root",
-                    "mutation": "snapshot-backed",
-                },
-                {
-                    "capability": "NIC ring buffer tuning",
-                    "available": "conditional",
-                    "source": "ethtool -G",
-                    "privilege": "root",
-                    "mutation": "snapshot-backed",
-                },
-                {
-                    "capability": "IRQ balance daemon",
-                    "available": "conditional",
-                    "source": "systemctl irqbalance",
-                    "privilege": "root",
-                    "mutation": "snapshot-backed",
-                },
-                {
-                    "capability": "DNS optimization",
-                    "available": "conditional",
-                    "source": "resolvectl / /etc/resolv.conf",
-                    "privilege": "root",
-                    "mutation": "snapshot-backed",
-                },
-                {
-                    "capability": "nl80211 deep station counters",
-                    "available": "planned",
-                    "source": "kernel nl80211",
-                    "privilege": "none or platform-dependent",
-                    "mutation": "none",
-                },
-            ]
-        )
-    elif system == "Darwin":
-        matrix.extend(
-            [
-                {
-                    "capability": "Working-condition responsiveness",
-                    "available": "conditional",
-                    "source": "networkQuality when present",
-                    "privilege": "none",
-                    "mutation": "none",
-                },
-                {
-                    "capability": "DNS optimization",
-                    "available": "conditional",
-                    "source": "networksetup -setdnsservers",
-                    "privilege": "root",
-                    "mutation": "snapshot-backed",
-                },
-                {
-                    "capability": "TCP buffer tuning",
-                    "available": "conditional",
-                    "source": "sysctl / /etc/sysctl.conf",
-                    "privilege": "root",
-                    "mutation": "snapshot-backed",
-                },
-                {
-                    "capability": "Network config reset",
-                    "available": "conditional",
-                    "source": "SystemConfiguration plist + route flush + mDNSResponder restart",
-                    "privilege": "root",
-                    "mutation": "requires reboot",
-                },
-                {
-                    "capability": "Wi-Fi system mutation",
-                    "available": "no",
-                    "source": "no documented public control used by this tool",
-                    "privilege": "n/a",
-                    "mutation": "none",
-                },
-            ]
-        )
-    else:
-        matrix.append(
-            {
-                "capability": f"{system} system tuning",
-                "available": "no",
-                "source": "unsupported platform",
-                "privilege": "n/a",
-                "mutation": "none",
-            }
-        )
-    return matrix
+    """Compatibility wrapper for the extracted capability policy."""
+    return _action_policy.capability_matrix(
+        platform.system(),
+        npm_executable() is not None,
+        lambda command: shutil.which(command) is not None,
+    )
 
 
 def repository_map() -> Dict[str, Any]:
@@ -5698,8 +4416,8 @@ def command_audit(args: argparse.Namespace) -> int:
         "anti_folklore_denylist": list(ANTI_FOLKLORE_DENYLIST),
         "normal_mode_boundaries": [
             "audit, diagnose, measure, router-diagnose, watch, and list-backups are read-only apart from explicit report files",
-            "apply and restore are the only normal commands that write persistent settings",
-            "reset-network resets the TCP/IP and DNS stack (requires reboot)",
+            "persistent changes require an explicit apply, repair-dns, reset-network, or restore command",
+            "reset-network is an explicit troubleshooting action and may require reboot",
             "router queue control remains advisory unless a separate reviewed router plugin exists",
             "macOS Wi-Fi mutation is not implemented through undocumented controls",
         ],
@@ -5721,11 +4439,7 @@ def command_audit(args: argparse.Namespace) -> int:
     for item in ANTI_FOLKLORE_DENYLIST:
         if not item.lstrip().startswith("#"):
             print(f"      - {item}")
-    print("    Overridden (paper-backed, evidence-guided):")
-    print("      - Fixed MTU=1500 on Wi-Fi interfaces")
-    print("      - DNS replacement to 1.1.1.1 / 1.0.0.1")
-    print("      - BBR congestion control + fq_codel on Linux")
-    print("      - QoS reservable bandwidth set to 0%")
+    print("    Automatic tuning stays limited to measured, reversible repairs.")
     print("  Capability matrix:")
     for row in report["capability_matrix"]:
         print(f"    - {row['capability']}: {row['available']} ({row['mutation']})")

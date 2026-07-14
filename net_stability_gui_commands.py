@@ -4,9 +4,7 @@ from dataclasses import dataclass
 from typing import Final, Literal
 
 
-StageName = Literal[
-    "check", "audit", "backup", "npm", "system", "tuning", "reset", "done"
-]
+StageName = Literal["check", "audit", "system", "backup", "done"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,61 +17,33 @@ class CommandSpec:
 
 COMMANDS: Final[tuple[CommandSpec, ...]] = (
     CommandSpec(
-        "Audit evidence first",
-        ("audit", "--redact"),
-        "Create a read-only evidence, capability, and safety-policy report.",
+        "Run diagnostics",
+        ("diagnose", "--samples", "5", "--redact"),
+        "Measure the local link, path, DNS, and application health without changing settings.",
         primary=True,
     ),
     CommandSpec(
-        "Verify speed and stability",
+        "Review recommended changes",
+        ("apply", "--dry-run", "--system-only", "--no-restart"),
+        "Show the small set of evidence-gated repairs available on this platform. Nothing is changed.",
+    ),
+    CommandSpec(
+        "View restore points",
+        ("list-backups",),
+        "List saved restore points. Restoring one remains an explicit CLI action.",
+    ),
+    CommandSpec(
+        "Run speed check",
         ("verify", "--redact"),
-        "Run the read-only M-Lab speed gate, Wi-Fi link inspection, and baseline probes.",
-        primary=True,
+        "Measure loaded latency and M-Lab goodput without changing settings.",
     ),
     CommandSpec(
-        "Full Optimization",
-        ("apply", "--yes"),
-        "Back up and apply supported DNS policy, TCP/IP, Wi-Fi power, and npm reliability fixes.",
-        primary=True,
-    ),
-    CommandSpec(
-        "M-Lab speed test",
-        ("speedtest", "--redact"),
-        "Measure application download and upload goodput through M-Lab NDT7.",
-    ),
-    CommandSpec(
-        "Inspect Wi-Fi link",
+        "Inspect link",
         ("link-quality", "--redact"),
-        "Show signal, link-rate, channel, and adapter evidence exposed by the OS.",
+        "Inspect Ethernet carrier and errors plus Wi-Fi signal, channel, and rates.",
     ),
     CommandSpec(
-        "Repair DNS",
-        ("repair-dns", "--yes"),
-        "Repair platform DNS state: Windows policy health, Linux resolver cache, or macOS DNS cache.",
-    ),
-    CommandSpec(
-        "Measure idle baseline",
-        ("measure", "idle", "--samples", "5", "--redact"),
-        "Collect baseline gateway, remote, DNS, and HTTPS measurements.",
-    ),
-    CommandSpec(
-        "Benchmark pressure points",
-        (
-            "benchmark",
-            "--baseline-seconds",
-            "5",
-            "--load-seconds",
-            "15",
-            "--parallel-downloads",
-            "3",
-            "--download-mb",
-            "16",
-            "--redact",
-        ),
-        "Run a read-only loaded benchmark for download loss, jitter, DNS, HTTPS, and adapter counters.",
-    ),
-    CommandSpec(
-        "Diagnose router side",
+        "Diagnose router path",
         (
             "router-diagnose",
             "--baseline-seconds",
@@ -86,49 +56,21 @@ COMMANDS: Final[tuple[CommandSpec, ...]] = (
             "8",
             "--redact",
         ),
-        "Separate router/AP/WAN symptoms from client-side tuning with loaded evidence.",
+        "Separate local Wi-Fi, router queue, and WAN symptoms with loaded evidence.",
     ),
     CommandSpec(
-        "Run full diagnostics",
-        ("diagnose", "--samples", "5", "--redact"),
-        "Measure network health and save a redacted JSON report.",
-    ),
-    CommandSpec(
-        "Optimize connection",
-        ("apply", "--system-only", "--yes"),
-        "Apply system-level OS reliability and tuning settings (requires admin).",
-    ),
-    CommandSpec(
-        "Optimize npm only",
-        ("apply", "--npm-only", "--yes"),
-        "Use only user-level npm settings. Does not require administrator rights.",
-    ),
-    CommandSpec(
-        "Reset Network Stack",
-        ("reset-network", "--yes"),
-        "Reset TCP/IP, Winsock, and DNS to OS defaults (requires reboot).",
-    ),
-    CommandSpec(
-        "Restore latest backup",
-        ("restore", "latest", "--yes"),
-        "Undo the most recent Net Stability change set.",
-    ),
-    CommandSpec(
-        "Show backups",
-        ("list-backups",),
-        "List restore points created by this tool.",
+        "Review DNS repair",
+        ("repair-dns", "--dry-run"),
+        "Inspect the platform DNS repair plan. Nothing is changed from the GUI.",
     ),
 )
 
 STAGE_LABELS: Final[dict[StageName, str]] = {
-    "check": "Check the connection and platform",
-    "audit": "Map evidence, speed, and safe capabilities",
-    "backup": "Create a restore point",
-    "npm": "Tune npm for weak links",
-    "system": "Inspect or apply OS Wi-Fi and adapter settings",
-    "tuning": "Apply TCP/IP, DNS, and buffer tuning",
-    "reset": "Reset network stack",
-    "done": "Show the result and restore path",
+    "check": "Check connection and platform",
+    "audit": "Collect and classify evidence",
+    "system": "Inspect link and OS context",
+    "backup": "Confirm restore context",
+    "done": "Finish with findings and limits",
 }
 
 STAGE_ORDER: Final[tuple[StageName, ...]] = (
@@ -136,8 +78,5 @@ STAGE_ORDER: Final[tuple[StageName, ...]] = (
     "audit",
     "system",
     "backup",
-    "npm",
-    "tuning",
-    "reset",
     "done",
 )

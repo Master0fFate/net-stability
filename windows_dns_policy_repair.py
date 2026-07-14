@@ -1,54 +1,80 @@
 from __future__ import annotations
 
+from importlib import import_module
 from typing import List, Sequence
 
-from windows_dns_policy_models import (
-    PowerShellResult,
-    PowerShellRunner,
-    DnsPolicyHealth,
-    RepairAction,
-    RepairResult,
-)
+_models = import_module("windows_dns_policy_models")
+PowerShellResult = _models.PowerShellResult
+PowerShellRunner = _models.PowerShellRunner
+DnsPolicyHealth = _models.DnsPolicyHealth
+RepairAction = _models.RepairAction
+RepairResult = _models.RepairResult
+
+
+def planned_dns_server_repairs(
+    health: DnsPolicyHealth,
+) -> tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...]:
+    return tuple(
+        (entry.interface_alias, entry.servers, entry.valid_servers)
+        for entry in health.dns_servers
+        if entry.can_remove_invalid_server
+    )
+
 
 def repair_health(
     runner: PowerShellRunner,
     health: DnsPolicyHealth,
-    clean_servers: Sequence[str],
 ) -> RepairResult:
     actions: List[RepairAction] = []
     notes: List[str] = []
     if not health.repair_needed:
-        return RepairResult(True, False, (), ("Windows DNS policy health does not need repair.",))
+        return RepairResult(
+            True, False, (), ("Windows DNS policy health does not need repair.",)
+        )
 
     flush = runner("Clear-DnsClientCache -ErrorAction SilentlyContinue; $true", 10.0)
     actions.append(_action_from_result("flush_dns_cache", flush))
 
-    for entry in health.dns_servers:
-        if not entry.has_invalid_server:
-            continue
-        applied = tuple(clean_servers)
+    for (
+        interface_alias,
+        original_servers,
+        applied_servers,
+    ) in planned_dns_server_repairs(health):
         script = (
             "$ErrorActionPreference='Stop';"
-            f"Set-DnsClientServerAddress -InterfaceAlias {_ps_quote(entry.interface_alias)} "
-            f"-ServerAddresses @({_ps_array(applied)}) -ErrorAction Stop;"
+            f"Set-DnsClientServerAddress -InterfaceAlias {_ps_quote(interface_alias)} "
+            f"-ServerAddresses @({_ps_array(applied_servers)}) -ErrorAction Stop;"
             "$true"
         )
         result = runner(script, 15.0)
         actions.append(
             _action_from_result(
-                "set_clean_dns_servers",
+                "remove_invalid_dns_sentinel",
                 result,
-                interface_alias=entry.interface_alias,
-                original_servers=entry.servers,
-                applied_servers=applied,
+                interface_alias=interface_alias,
+                original_servers=original_servers,
+                applied_servers=applied_servers,
             )
+        )
+
+    invalid_only = [
+        entry.interface_alias
+        for entry in health.dns_servers
+        if entry.has_invalid_server and not entry.valid_servers
+    ]
+    if invalid_only:
+        notes.append(
+            "Invalid-only DNS configuration was not replaced automatically; review: "
+            + ", ".join(invalid_only)
         )
 
     if "dns_policy_corruption" in health.findings:
         notes.append(
             "NRPT policy corruption was detected; VPN or enterprise DNS rules were not deleted automatically."
         )
-        notes.append("If corruption remains after this repair, reboot or run the network stack reset.")
+        notes.append(
+            "If corruption remains after this repair, reboot or run the network stack reset."
+        )
 
     return RepairResult(
         all(action.ok for action in actions),

@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+from dataclasses import dataclass
 
 try:
     import tomllib
@@ -27,6 +28,15 @@ ICON_ICO = ASSET_DIR / "net_stability.ico"
 ICON_ICNS = ASSET_DIR / "net_stability.icns"
 VERSION_INFO = ASSET_DIR / "net_stability_version_info.txt"
 OUTPUT_ROOT = PROJECT_ROOT / "release-artifacts"
+
+
+@dataclass(frozen=True, slots=True)
+class BuildSettings:
+    icon: Path
+    system: str
+    version: str
+    author: str
+    out_dir: Path
 
 
 def run(command: list[str]) -> None:
@@ -214,12 +224,9 @@ def _build_onefile(
     entry: Path,
     name: str,
     *,
-    icon: Path,
     windowed: bool,
-    system: str,
-    version: str,
-    author: str,
-    out_dir: Path,
+    settings: BuildSettings,
+    companion_cli: Path | None = None,
 ) -> Path:
     cmd = [
         sys.executable,
@@ -231,24 +238,50 @@ def _build_onefile(
         "--name",
         name,
         "--distpath",
-        str(out_dir),
+        str(settings.out_dir),
         "--specpath",
-        str(out_dir / "specs"),
+        str(settings.out_dir / "specs"),
         "--workpath",
-        str(out_dir / "build"),
+        str(settings.out_dir / "build"),
         "--icon",
-        str(icon),
+        str(settings.icon),
         "--collect-submodules",
         "websockets",
-        str(entry),
     ]
     if windowed:
         cmd.append("--windowed")
-    if system == "windows":
-        cmd += ["--version-file", str(write_version_file(version, author))]
+    if entry.name == "net_stability.py":
+        for module_name in (
+            "net_stability_benchmark",
+            "net_stability_action_policy",
+            "net_stability_build_guard",
+            "net_stability_link_diagnostics",
+            "net_stability_wifi_analysis",
+            "net_stability_router_diagnostics",
+            "net_stability_router_rules",
+            "net_stability_ndt7",
+            "windows_dns_policy",
+            "windows_dns_policy_models",
+            "windows_dns_policy_repair",
+            "windows_dns_policy_shell",
+        ):
+            cmd += ["--hidden-import", module_name]
+    if entry.name == "net_stability_gui.py":
+        cmd += ["--hidden-import", "net_stability_gui_commands"]
+    if companion_cli is not None:
+        cmd += ["--add-binary", f"{companion_cli}{os.pathsep}."]
+    if settings.system == "windows":
+        cmd += [
+            "--version-file",
+            str(write_version_file(settings.version, settings.author)),
+        ]
+    cmd.append(str(entry))
 
     run(cmd)
-    return out_dir / f"{name}.exe" if system == "windows" else out_dir / name
+    if settings.system == "macos" and windowed:
+        return settings.out_dir / f"{name}.app"
+    suffix = ".exe" if settings.system == "windows" else ""
+    return settings.out_dir / f"{name}{suffix}"
 
 
 def package_bundle(
@@ -260,7 +293,10 @@ def package_bundle(
         if artifact.resolve() == destination.resolve():
             all_files.append(destination)
             continue
-        shutil.copy2(artifact, destination)
+        if artifact.is_dir():
+            shutil.copytree(artifact, destination)
+        else:
+            shutil.copy2(artifact, destination)
         all_files.append(destination)
 
     if system in {"linux", "macos", "windows"}:
@@ -276,6 +312,19 @@ def package_bundle(
     write_checksums(all_files, checksum)
     all_files.append(checksum)
     return all_files
+
+
+def validate_macos_artifacts(cli_output: Path, gui_output: Path) -> None:
+    if not cli_output.is_file():
+        raise RuntimeError(f"missing macOS CLI executable: {cli_output}")
+    if gui_output.suffix != ".app" or not gui_output.is_dir():
+        raise RuntimeError(f"missing macOS application bundle: {gui_output}")
+    app_executable = gui_output / "Contents" / "MacOS" / gui_output.stem
+    if not app_executable.is_file():
+        raise RuntimeError(f"macOS app executable is missing: {app_executable}")
+    info_plist = gui_output / "Contents" / "Info.plist"
+    if not info_plist.is_file():
+        raise RuntimeError(f"macOS app metadata is missing: {info_plist}")
 
 
 def build_release(system_override: str | None, version: str, author: str) -> list[Path]:
@@ -301,30 +350,24 @@ def build_release(system_override: str | None, version: str, author: str) -> lis
     if system == "macos" and icon_icns.exists():
         icon = icon_icns
 
-    outputs = [
-        _build_onefile(
-            PROJECT_ROOT / "net_stability.py",
-            f"net-stability-{system}-{arch}",
-            icon=icon,
-            windowed=False,
-            system=system,
-            version=version,
-            author=author,
-            out_dir=output_dir,
-        ),
-        _build_onefile(
-            PROJECT_ROOT / "net_stability_gui.py",
-            f"net-stability-gui-{system}-{arch}",
-            icon=icon,
-            windowed=(system == "windows"),
-            system=system,
-            version=version,
-            author=author,
-            out_dir=output_dir,
-        ),
-    ]
+    settings = BuildSettings(icon, system, version, author, output_dir)
+    cli_output = _build_onefile(
+        PROJECT_ROOT / "net_stability.py",
+        f"net-stability-{system}-{arch}",
+        windowed=False,
+        settings=settings,
+    )
+    gui_output = _build_onefile(
+        PROJECT_ROOT / "net_stability_gui.py",
+        f"net-stability-gui-{system}-{arch}",
+        windowed=(system in {"windows", "macos"}),
+        settings=settings,
+        companion_cli=cli_output,
+    )
+    if system == "macos":
+        validate_macos_artifacts(cli_output, gui_output)
 
-    return package_bundle(outputs, output_dir, version, system, arch)
+    return package_bundle([cli_output, gui_output], output_dir, version, system, arch)
 
 
 def parse_args() -> argparse.Namespace:
