@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from importlib import import_module
 
-_models = import_module("windows_dns_policy_models")
-_repair = import_module("windows_dns_policy_repair")
-_shell = import_module("windows_dns_policy_shell")
+_models = import_module("modules.windows_dns_policy_models")
+_repair = import_module("modules.windows_dns_policy_repair")
+_shell = import_module("modules.windows_dns_policy_shell")
 DnsPolicyHealth = _models.DnsPolicyHealth
 DnsServerEntry = _models.DnsServerEntry
 PowerShellResult = _models.PowerShellResult

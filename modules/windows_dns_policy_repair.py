@@ -3,7 +3,7 @@ from __future__ import annotations
 from importlib import import_module
 from typing import List, Sequence
 
-_models = import_module("windows_dns_policy_models")
+_models = import_module("modules.windows_dns_policy_models")
 PowerShellResult = _models.PowerShellResult
 PowerShellRunner = _models.PowerShellRunner
 DnsPolicyHealth = _models.DnsPolicyHealth

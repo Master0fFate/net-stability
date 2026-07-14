@@ -4,7 +4,7 @@ import json
 from importlib import import_module
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
-_models = import_module("windows_dns_policy_models")
+_models = import_module("modules.windows_dns_policy_models")
 DNS_POLICY_EVENT_IDS = _models.DNS_POLICY_EVENT_IDS
 DnsPolicyHealth = _models.DnsPolicyHealth
 DnsServerEntry = _models.DnsServerEntry

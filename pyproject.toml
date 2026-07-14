@@ -32,24 +32,11 @@ Homepage = "https://github.com/Master0fFate/net-stability"
 Issues = "https://github.com/Master0fFate/net-stability/issues"
 
 [project.scripts]
-net-stability = "net_stability:main"
-net-stability-gui = "net_stability_gui:main"
+net-stability = "modules.net_stability:main"
+net-stability-gui = "modules.net_stability_gui:main"
 
 [tool.setuptools]
-py-modules = [
-    "net_stability",
-    "net_stability_action_policy",
-    "net_stability_benchmark",
-    "net_stability_build_guard",
-    "net_stability_ndt7",
-    "net_stability_gui",
-    "net_stability_gui_commands",
-    "net_stability_link_diagnostics",
-    "net_stability_wifi_analysis",
-    "net_stability_router_diagnostics",
-    "net_stability_router_rules",
-    "windows_dns_policy",
-    "windows_dns_policy_models",
-    "windows_dns_policy_repair",
-    "windows_dns_policy_shell",
-]
+py-modules = ["net_stability", "net_stability_gui"]
+
+[tool.setuptools.packages.find]
+include = ["modules*"]

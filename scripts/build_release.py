@@ -252,22 +252,28 @@ def _build_onefile(
         cmd.append("--windowed")
     if entry.name == "net_stability.py":
         for module_name in (
-            "net_stability_benchmark",
-            "net_stability_action_policy",
-            "net_stability_build_guard",
-            "net_stability_link_diagnostics",
-            "net_stability_wifi_analysis",
-            "net_stability_router_diagnostics",
-            "net_stability_router_rules",
-            "net_stability_ndt7",
-            "windows_dns_policy",
-            "windows_dns_policy_models",
-            "windows_dns_policy_repair",
-            "windows_dns_policy_shell",
+            "modules.net_stability",
+            "modules.net_stability_benchmark",
+            "modules.net_stability_action_policy",
+            "modules.net_stability_build_guard",
+            "modules.net_stability_link_diagnostics",
+            "modules.net_stability_wifi_analysis",
+            "modules.net_stability_router_diagnostics",
+            "modules.net_stability_router_rules",
+            "modules.net_stability_ndt7",
+            "modules.windows_dns_policy",
+            "modules.windows_dns_policy_models",
+            "modules.windows_dns_policy_repair",
+            "modules.windows_dns_policy_shell",
         ):
             cmd += ["--hidden-import", module_name]
     if entry.name == "net_stability_gui.py":
-        cmd += ["--hidden-import", "net_stability_gui_commands"]
+        cmd += [
+            "--hidden-import",
+            "modules.net_stability_gui",
+            "--hidden-import",
+            "modules.net_stability_gui_commands",
+        ]
     if companion_cli is not None:
         cmd += ["--add-binary", f"{companion_cli}{os.pathsep}."]
     if settings.system == "windows":

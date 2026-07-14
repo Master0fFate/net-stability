@@ -15,9 +15,9 @@ from unittest import mock
 ROOT: Final = Path(__file__).resolve().parents[1]
 
 sys.path.insert(0, str(ROOT))
-import net_stability  # noqa: E402
-import net_stability_gui_commands  # noqa: E402
-import windows_dns_policy  # noqa: E402
+from modules import net_stability  # noqa: E402
+from modules import net_stability_gui_commands  # noqa: E402
+from modules import windows_dns_policy  # noqa: E402
 
 
 class WindowsDnsPolicyTests(unittest.TestCase):

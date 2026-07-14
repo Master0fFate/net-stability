@@ -5,8 +5,8 @@ from __future__ import annotations
 from importlib import import_module
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
-_router_rules = import_module("net_stability_router_rules")
-_wifi_analysis = import_module("net_stability_wifi_analysis")
+_router_rules = import_module("modules.net_stability_router_rules")
+_wifi_analysis = import_module("modules.net_stability_wifi_analysis")
 first_number = _wifi_analysis.first_number
 _router_finding = _router_rules.router_finding
 _manual_router_optimization = _router_rules.manual_router_optimization

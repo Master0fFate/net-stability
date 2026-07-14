@@ -18,13 +18,13 @@ TOKEN_SENTINEL: Final = "token_like_guardrail_1234567890abcdef1234567890"
 MAC_SENTINEL: Final = "00:11:22:aa:bb:cc"
 
 sys.path.insert(0, str(ROOT))
-import net_stability  # noqa: E402
-import net_stability_gui  # noqa: E402
-import net_stability_link_diagnostics  # noqa: E402
-import net_stability_ndt7  # noqa: E402
-import net_stability_router_diagnostics  # noqa: E402
-import net_stability_router_rules  # noqa: E402
-import net_stability_wifi_analysis  # noqa: E402
+from modules import net_stability  # noqa: E402
+from modules import net_stability_gui  # noqa: E402
+from modules import net_stability_link_diagnostics  # noqa: E402
+from modules import net_stability_ndt7  # noqa: E402
+from modules import net_stability_router_diagnostics  # noqa: E402
+from modules import net_stability_router_rules  # noqa: E402
+from modules import net_stability_wifi_analysis  # noqa: E402
 
 UNSAFE_ACTION_PATTERNS: Final = (
     re.compile(r"\b(?:set|force|guess|write|apply|change|tune)\s+(?:the\s+)?mtu\b"),

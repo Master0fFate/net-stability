@@ -57,7 +57,7 @@ jobs:
               env.pop("PYTHONPATH", None)
               subprocess.run([str(python), "-m", "pip", "install", str(wheel)], check=True, cwd=target, env=env)
               subprocess.run(
-                  [str(python), "-c", "import net_stability, net_stability_action_policy, windows_dns_policy"],
+                  [str(python), "-c", "import net_stability, net_stability_gui; import modules.net_stability_action_policy, modules.windows_dns_policy"],
                   check=True,
                   cwd=target,
                   env=env,
@@ -81,7 +81,7 @@ jobs:
           from pathlib import Path
           project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
           expected = project["project"]["version"]
-          source = Path("net_stability.py").read_text(encoding="utf-8")
+          source = Path("modules/net_stability.py").read_text(encoding="utf-8")
           match = re.search(r'^VERSION = "([^"]+)"$', source, re.MULTILINE)
           assert match and match.group(1) == expected, (match and match.group(1), expected)
           print(f"version: {expected}")

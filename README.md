@@ -143,11 +143,15 @@ python scripts/build_release.py
 
 The script stages platform/architecture-specific archives and executable bundles under `release-artifacts/`. The macOS target is Apple Silicon (`arm64`): its DMG contains a real `Net Stability` `.app` bundle plus a separate CLI executable. No Intel macOS artifact is currently staged. Native GitHub Actions runners are required for trustworthy outputs. Signing, notarization, and Windows code signing require external certificates/secrets and are not claimed by local staging. Release publication is intentionally a separate reviewed operation.
 
+## Source layout
+
+The repository root contains only the stable CLI and GUI compatibility launchers. Application code, diagnostics, policies, platform integrations, and GUI implementation live in the `modules/` package. Keeping the launchers at the root preserves existing commands and packaged entry points while preventing implementation modules from accumulating beside project configuration files.
+
 ## Development checks
 
 ```bash
 python -m unittest discover -s tests -v
-python -m py_compile net_stability.py net_stability_gui.py net_stability_gui_commands.py net_stability_link_diagnostics.py
+python -m compileall -q net_stability.py net_stability_gui.py modules scripts
 python net_stability.py --version
 python net_stability_gui.py --smoke
 ```
