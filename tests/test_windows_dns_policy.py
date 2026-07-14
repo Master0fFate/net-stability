@@ -389,6 +389,7 @@ class WindowsDnsPolicyTests(unittest.TestCase):
                     "resolve_snapshot",
                     return_value=(snapshot_dir, manifest),
                 ),
+                mock.patch.object(net_stability.platform, "system", return_value="Windows"),
                 mock.patch.object(net_stability, "is_windows_admin", return_value=True),
                 mock.patch.object(
                     net_stability,
