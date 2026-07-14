@@ -19,12 +19,16 @@ MAC_SENTINEL: Final = "00:11:22:aa:bb:cc"
 
 sys.path.insert(0, str(ROOT))
 import net_stability  # noqa: E402
+import net_stability_gui  # noqa: E402
+import net_stability_link_diagnostics  # noqa: E402
 import net_stability_ndt7  # noqa: E402
+import net_stability_router_diagnostics  # noqa: E402
+import net_stability_router_rules  # noqa: E402
+import net_stability_wifi_analysis  # noqa: E402
 
 UNSAFE_ACTION_PATTERNS: Final = (
-    # MTU and DNS are now paper-backed overrides (removed from denylist test)
-    # re.compile(r"\b(?:set|force|guess|write|apply|change|tune)\s+(?:the\s+)?mtu\b"),
-    # re.compile(r"\b(?:replace|switch|set|change)\s+(?:the\s+)?dns\b"),
+    re.compile(r"\b(?:set|force|guess|write|apply|change|tune)\s+(?:the\s+)?mtu\b"),
+    re.compile(r"\b(?:replace|switch|set|change|overwrite)\s+(?:the\s+)?dns\b"),
     re.compile(r"\bdisable\s+(?:global\s+)?ipv6\b"),
     re.compile(r"\b(?:tcp\s*ack|tcpackfrequency|nagle|tcpnodelay)\b"),
     re.compile(
@@ -110,6 +114,33 @@ def clean_router_baseline_summary():
 
 
 class CliGuardrailTests(unittest.TestCase):
+    def test_release_workflow_preserves_tag_and_macos_bundle_invariants(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertEqual(workflow.count("target: macos-arm64"), 1)
+        self.assertIn("os: macos-14", workflow)
+        self.assertIn("expected_arch: ARM64", workflow)
+        self.assertIn("ref: ${{ github.event_name == 'workflow_dispatch'", workflow)
+        self.assertIn(
+            'git show-ref --verify --quiet "refs/tags/${RELEASE_TAG}"', workflow
+        )
+        self.assertIn('if [ "${HEAD_COMMIT}" != "${TAG_COMMIT}" ]', workflow)
+        self.assertIn("net-stability-gui-macos-*.app", workflow)
+        self.assertIn("hdiutil attach", workflow)
+        self.assertIn("! -path '*.app/*'", workflow)
+        self.assertIn("name: net-stability-${{ matrix.target }}", workflow)
+
+    def test_release_builder_requires_a_real_macos_app_bundle(self) -> None:
+        source = (ROOT / "scripts" / "build_release.py").read_text(encoding="utf-8")
+
+        self.assertIn('return settings.out_dir / f"{name}.app"', source)
+        self.assertIn('gui_output.suffix != ".app"', source)
+        self.assertIn('gui_output / "Contents" / "Info.plist"', source)
+        self.assertIn('gui_output / "Contents" / "MacOS"', source)
+        self.assertIn('windowed=(system in {"windows", "macos"})', source)
+
     def test_help_when_requested_does_not_advertise_anti_folklore_actions(self) -> None:
         # Given: normal CLI help entry points.
         help_commands = (
@@ -129,6 +160,36 @@ class CliGuardrailTests(unittest.TestCase):
                 # Then: help succeeds and does not advertise unsafe tuning recipes.
                 self.assertEqual(result.returncode, 0, result.stderr)
                 assert_no_unsafe_actions(self, result.stdout + result.stderr)
+
+    def test_audit_output_does_not_publish_obsolete_tuning_claims(self) -> None:
+        # Given: the public audit command runs without platform-specific diagnostics.
+        forbidden_claims = (
+            "fixed mtu=1500",
+            "dns replacement to 1.1.1.1",
+            "bbr congestion control",
+            "fq_codel on linux",
+            "qos reservable bandwidth set to 0%",
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output_path = Path(temporary) / "audit.json"
+
+            # When: the real CLI renders and writes its audit surface.
+            result = run_cli(
+                "audit",
+                "--no-platform-diagnostics",
+                "--output",
+                str(output_path),
+            )
+
+            # Then: neither the console nor report repeats obsolete recipes.
+            self.assertEqual(result.returncode, 0, result.stderr)
+            rendered = (result.stdout + result.stderr).lower()
+            report = output_path.read_text(encoding="utf-8").lower()
+            for claim in forbidden_claims:
+                with self.subTest(claim=claim):
+                    self.assertNotIn(claim, rendered)
+                    self.assertNotIn(claim, report)
 
     def test_apply_dry_run_when_planning_changes_does_not_expose_unsafe_actions(
         self,
@@ -210,6 +271,377 @@ class CliGuardrailTests(unittest.TestCase):
         )
         assert_no_unsafe_actions(self, planned_lines)
 
+    def test_linux_reset_reports_actual_failed_command_and_nonzero_status(self) -> None:
+        # Given: the Linux reset command fails for the command that was attempted.
+        failed = net_stability.CommandResult(
+            ["systemctl", "restart", "systemd-networkd"],
+            5,
+            "",
+            "unit failed",
+            1.0,
+        )
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        # When: the explicit reset action runs.
+        with (
+            mock.patch("net_stability.platform.system", return_value="Linux"),
+            mock.patch("net_stability.os.geteuid", return_value=0, create=True),
+            mock.patch("net_stability.linux_reset_network", return_value=[failed]),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            return_code = net_stability.command_reset_network(mock.Mock(yes=True))
+
+        # Then: failure is returned and the label comes from the actual command.
+        self.assertEqual(return_code, 2)
+        self.assertIn("systemctl restart systemd-networkd", stderr.getvalue())
+        self.assertNotIn("Network stack reset.", stdout.getvalue())
+
+    def test_macos_reset_reports_failed_command_and_nonzero_status(self) -> None:
+        # Given: one macOS cache command fails.
+        failed = net_stability.CommandResult(
+            ["killall", "-HUP", "mDNSResponder"],
+            1,
+            "",
+            "no process found",
+            1.0,
+        )
+        stderr = io.StringIO()
+
+        # When: the explicit reset action runs.
+        with (
+            mock.patch("net_stability.platform.system", return_value="Darwin"),
+            mock.patch("net_stability.os.geteuid", return_value=0, create=True),
+            mock.patch(
+                "net_stability.macos_reset_network_config", return_value=[failed]
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(stderr),
+        ):
+            return_code = net_stability.command_reset_network(mock.Mock(yes=True))
+
+        # Then: the failed command is named and the result is nonzero.
+        self.assertEqual(return_code, 2)
+        self.assertIn("killall -HUP mDNSResponder", stderr.getvalue())
+
+    def test_apply_copy_describes_actual_platform_operations(self) -> None:
+        scenarios = (
+            (
+                "Windows",
+                "Repair Windows DNS policy only when health checks find invalid resolver state",
+            ),
+            (
+                "Linux",
+                "No automatic Linux system mutation; preserve resolver and kernel policy",
+            ),
+            (
+                "Darwin",
+                "No automatic macOS system mutation; preserve resolver and sysctl policy",
+            ),
+        )
+
+        for platform_name, expected in scenarios:
+            with self.subTest(platform=platform_name):
+                stdout = io.StringIO()
+                with (
+                    mock.patch(
+                        "net_stability.platform.system", return_value=platform_name
+                    ),
+                    contextlib.redirect_stdout(stdout),
+                ):
+                    return_code = net_stability.main(
+                        ("apply", "--dry-run", "--system-only")
+                    )
+
+                output = stdout.getvalue()
+                self.assertEqual(return_code, 0)
+                self.assertIn(expected, output)
+                self.assertNotIn("disconnect", output.lower())
+                self.assertNotIn("restart", output.lower())
+
+    def test_reset_copy_describes_actual_platform_operations(self) -> None:
+        success = net_stability.CommandResult(["refresh"], 0, "", "", 1.0)
+        scenarios = (
+            (
+                "Windows",
+                "Windows network stack reset",
+                "Resets TCP/IP and Winsock",
+                "net_stability.windows_reset_network_stack",
+                [success, success, success],
+            ),
+            (
+                "Linux",
+                "Linux network service refresh",
+                "Restarts the detected network service",
+                "net_stability.linux_reset_network",
+                [success],
+            ),
+            (
+                "Darwin",
+                "macOS transient network cache refresh",
+                "Flushes route and DNS caches",
+                "net_stability.macos_reset_network_config",
+                [success],
+            ),
+        )
+
+        for platform_name, title, detail, operation, results in scenarios:
+            with self.subTest(platform=platform_name):
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(
+                        mock.patch(
+                            "net_stability.platform.system", return_value=platform_name
+                        )
+                    )
+                    stack.enter_context(mock.patch(operation, return_value=results))
+                    if platform_name == "Windows":
+                        stack.enter_context(
+                            mock.patch(
+                                "net_stability.is_windows_admin", return_value=True
+                            )
+                        )
+                    else:
+                        stack.enter_context(
+                            mock.patch(
+                                "net_stability.os.geteuid", return_value=0, create=True
+                            )
+                        )
+                    stack.enter_context(contextlib.redirect_stdout(stdout))
+                    stack.enter_context(contextlib.redirect_stderr(stderr))
+                    return_code = net_stability.command_reset_network(
+                        mock.Mock(yes=True)
+                    )
+
+                output = stdout.getvalue() + stderr.getvalue()
+                self.assertEqual(return_code, 0)
+                self.assertIn(title, output)
+                self.assertIn(detail, output)
+                self.assertNotIn("OS defaults", output)
+                if platform_name != "Windows":
+                    self.assertNotIn("Winsock", output)
+
+    def test_linux_legacy_sysctl_without_file_metadata_preserves_file(self) -> None:
+        manifest = {
+            "applied": {
+                "system": [
+                    {
+                        "type": "sysctl_conf",
+                        "original": {"net.ipv4.tcp_rmem": "4096 87380 6291456"},
+                    }
+                ]
+            }
+        }
+        commands: list[list[str]] = []
+
+        def fake_run(args, timeout):
+            del timeout
+            commands.append(args)
+            return net_stability.CommandResult(args, 0, "", "", 1.0)
+
+        stderr = io.StringIO()
+        with (
+            mock.patch("net_stability.run_command", side_effect=fake_run),
+            mock.patch("net_stability.linux_restore_sysctl_conf") as restore_file,
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(stderr),
+        ):
+            results = net_stability.restore_linux_extended_tuning(manifest)
+
+        restore_file.assert_not_called()
+        self.assertEqual(
+            commands,
+            [["sysctl", "-w", "net.ipv4.tcp_rmem=4096 87380 6291456"]],
+        )
+        self.assertEqual(
+            results,
+            [
+                {
+                    "type": "sysctl_conf",
+                    "ok": False,
+                    "runtime_restored": True,
+                    "persistent_restored": False,
+                    "manual_restore_required": True,
+                }
+            ],
+        )
+        self.assertIn("file was preserved", stderr.getvalue())
+
+    def test_linux_legacy_sysctl_explicit_absent_file_removes_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "legacy-sysctl.conf"
+            path.write_text("legacy", encoding="utf-8")
+            manifest = {
+                "applied": {
+                    "system": [
+                        {
+                            "type": "sysctl_conf",
+                            "original": {"net.core.rmem_max": "212992"},
+                            "original_file": {
+                                "path": str(path),
+                                "existed": False,
+                                "content": None,
+                            },
+                        }
+                    ]
+                }
+            }
+            success = net_stability.CommandResult(["sysctl"], 0, "", "", 1.0)
+
+            with (
+                mock.patch("net_stability.run_command", return_value=success),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                results = net_stability.restore_linux_extended_tuning(manifest)
+
+            self.assertFalse(path.exists())
+        self.assertTrue(results[0]["ok"])
+        self.assertTrue(results[0]["runtime_restored"])
+        self.assertTrue(results[0]["persistent_restored"])
+
+    def test_macos_legacy_tcp_buffers_without_file_metadata_preserves_file(
+        self,
+    ) -> None:
+        manifest = {
+            "applied": {
+                "system": [
+                    {
+                        "type": "tcp_buffers",
+                        "original_send": 65536,
+                        "original_recv": 131072,
+                    }
+                ]
+            }
+        }
+        success = net_stability.CommandResult(["sysctl"], 0, "", "", 1.0)
+        stderr = io.StringIO()
+
+        with (
+            mock.patch(
+                "net_stability.macos_set_tcp_buffers",
+                return_value=[success, success],
+            ) as restore_runtime,
+            mock.patch("net_stability.macos_restore_sysctl_conf") as restore_file,
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(stderr),
+        ):
+            results = net_stability.restore_macos_extended_tuning(manifest)
+
+        restore_runtime.assert_called_once_with(65536, 131072)
+        restore_file.assert_not_called()
+        self.assertEqual(
+            results,
+            [
+                {
+                    "type": "tcp_buffers",
+                    "ok": False,
+                    "runtime_restored": True,
+                    "persistent_restored": False,
+                    "manual_restore_required": True,
+                }
+            ],
+        )
+        self.assertIn("exact persistent rollback is unavailable", stderr.getvalue())
+
+    def test_macos_legacy_tcp_buffers_explicit_absent_file_removes_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "sysctl.conf"
+            path.write_text("legacy", encoding="utf-8")
+            manifest = {
+                "applied": {
+                    "system": [
+                        {
+                            "type": "tcp_buffers",
+                            "original_send": 65536,
+                            "original_recv": 131072,
+                            "original_file": {
+                                "path": str(path),
+                                "existed": False,
+                                "content": None,
+                            },
+                        }
+                    ]
+                }
+            }
+            success = net_stability.CommandResult(["sysctl"], 0, "", "", 1.0)
+
+            with (
+                mock.patch(
+                    "net_stability.macos_set_tcp_buffers",
+                    return_value=[success, success],
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                results = net_stability.restore_macos_extended_tuning(manifest)
+
+            self.assertFalse(path.exists())
+        self.assertTrue(results[0]["ok"])
+        self.assertTrue(results[0]["runtime_restored"])
+        self.assertTrue(results[0]["persistent_restored"])
+
+    def test_linux_legacy_ring_buffer_recovers_originals_from_state(self) -> None:
+        manifest = {
+            "state": {
+                "system": {
+                    "ring_buffers": {
+                        "interfaces": [
+                            {
+                                "name": "eth0",
+                                "original_rx": 512,
+                                "original_tx": 256,
+                            }
+                        ]
+                    }
+                }
+            },
+            "applied": {"system": [{"type": "ring_buffer", "interface": "eth0"}]},
+        }
+        success = net_stability.CommandResult(["ethtool"], 0, "", "", 1.0)
+
+        with (
+            mock.patch(
+                "net_stability.linux_set_nic_ring_buffer", return_value=success
+            ) as restore_ring,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            results = net_stability.restore_linux_extended_tuning(manifest)
+
+        restore_ring.assert_called_once_with("eth0", 512, 256)
+        self.assertEqual(
+            results, [{"type": "ring_buffer", "ok": True, "interface": "eth0"}]
+        )
+
+    def test_linux_legacy_ring_buffer_without_originals_preserves_current(self) -> None:
+        manifest = {
+            "state": {"system": {"ring_buffers": {"interfaces": []}}},
+            "applied": {"system": [{"type": "ring_buffer", "interface": "eth0"}]},
+        }
+        stderr = io.StringIO()
+
+        with (
+            mock.patch("net_stability.linux_set_nic_ring_buffer") as restore_ring,
+            contextlib.redirect_stderr(stderr),
+        ):
+            results = net_stability.restore_linux_extended_tuning(manifest)
+
+        restore_ring.assert_not_called()
+        self.assertEqual(
+            results,
+            [
+                {
+                    "type": "ring_buffer",
+                    "ok": False,
+                    "skipped": True,
+                    "interface": "eth0",
+                    "manual_restore_required": True,
+                }
+            ],
+        )
+        self.assertIn("current ring buffer settings", stderr.getvalue())
+        self.assertIn("manual restoration required", stderr.getvalue())
+
     def test_windows_tcp_state_when_autotuning_disabled_marks_repair_needed(
         self,
     ) -> None:
@@ -229,6 +661,125 @@ class CliGuardrailTests(unittest.TestCase):
         self.assertTrue(state["available"])
         self.assertEqual(state["receive_window_autotuning"], "disabled")
         self.assertTrue(net_stability.windows_tcp_autotuning_needs_repair(state))
+
+    def test_extracted_analysis_modules_preserve_compatibility_exports(self) -> None:
+        # Given: callers may still import established helpers from net_stability.
+        compatibility_pairs = (
+            (
+                net_stability.parse_windows_wlan_interfaces,
+                net_stability_wifi_analysis.parse_windows_wlan_interfaces,
+            ),
+            (
+                net_stability.wifi_link_recommendations,
+                net_stability_wifi_analysis.wifi_link_recommendations,
+            ),
+            (
+                net_stability.bufferbloat_assessment,
+                net_stability_router_diagnostics.bufferbloat_assessment,
+            ),
+            (
+                net_stability.router_side_diagnosis,
+                net_stability_router_diagnostics.router_side_diagnosis,
+            ),
+            (
+                net_stability._apply_wan_queue_rule,
+                net_stability_router_rules.apply_wan_queue_rule,
+            ),
+        )
+
+        # Then: the compatibility layer delegates to the extracted implementations.
+        for legacy_export, extracted_export in compatibility_pairs:
+            with self.subTest(export=legacy_export.__name__):
+                self.assertIs(legacy_export, extracted_export)
+
+    def test_gui_done_event_restores_controls_and_preserves_result(self) -> None:
+        # Given: a completed task event reaches the GUI queue.
+        gui = net_stability_gui.NetStabilityGui.__new__(
+            net_stability_gui.NetStabilityGui
+        )
+        gui.events = net_stability_gui.queue.Queue()
+        gui.events.put("DONE:0:Run diagnostics")
+        gui.running = True
+        gui.process = mock.Mock()
+        gui.cancel_requested = False
+        gui.activity = mock.Mock()
+        gui.cancel_button = mock.Mock()
+        gui.status_var = mock.Mock()
+        gui.root = mock.Mock()
+        gui.stage_vars = {
+            name: mock.Mock(**{"get.return_value": "Running"})
+            for name in net_stability_gui.STAGE_ORDER
+        }
+        gui._set_controls_state = mock.Mock()
+
+        # When: the structured completion event is drained.
+        gui._drain_events()
+
+        # Then: activity stops, controls return, and success remains visible.
+        self.assertFalse(gui.running)
+        self.assertIsNone(gui.process)
+        gui.activity.stop.assert_called_once_with()
+        gui.status_var.set.assert_called_once_with("Run diagnostics complete")
+        gui._set_controls_state.assert_called_once_with(net_stability_gui.tk.NORMAL)
+
+    def test_packaged_gui_routes_commands_to_sibling_cli(self) -> None:
+        # Given: PyInstaller runs the GUI from the release bundle.
+        spec = net_stability_gui.COMMANDS[0]
+        executable = str(ROOT / "net-stability-gui-windows-x86_64.exe")
+
+        # When: the GUI resolves the command target in frozen mode.
+        with (
+            mock.patch.object(net_stability_gui.sys, "frozen", True, create=True),
+            mock.patch.object(net_stability_gui.sys, "executable", executable),
+        ):
+            command = net_stability_gui.command_for(spec)
+
+        # Then: it launches the console CLI sibling rather than recursing into itself.
+        self.assertEqual(command[0], str(ROOT / "net-stability-windows-x86_64.exe"))
+        self.assertEqual(command[1:], spec.args)
+
+    def test_packaged_gui_prefers_embedded_cli(self) -> None:
+        # Given: the one-file GUI has extracted its bundled CLI companion.
+        spec = net_stability_gui.COMMANDS[0]
+        executable = str(ROOT / "net-stability-gui-windows-x86_64.exe")
+        with tempfile.TemporaryDirectory() as temporary:
+            embedded = Path(temporary) / "net-stability-windows-x86_64.exe"
+            embedded.touch()
+
+            # When: the frozen GUI resolves its command target.
+            with (
+                mock.patch.object(net_stability_gui.sys, "frozen", True, create=True),
+                mock.patch.object(net_stability_gui.sys, "executable", executable),
+                mock.patch.object(
+                    net_stability_gui.sys, "_MEIPASS", temporary, create=True
+                ),
+            ):
+                command = net_stability_gui.command_for(spec)
+
+        # Then: the self-contained bundle target wins over an external sibling.
+        self.assertEqual(command[0], str(embedded))
+        self.assertEqual(command[1:], spec.args)
+
+    def test_capability_matrix_reports_only_current_bounded_mutations(self) -> None:
+        # Given: capability reporting is part of the public diagnostic contract.
+        forbidden_capabilities = {
+            "MTU optimization (1500)",
+            "QoS reservable bandwidth 0%",
+            "TCP retransmission tuning",
+            "sysctl TCP/IP tuning (buffers, BBR, fq_codel)",
+            "DNS optimization",
+            "TCP buffer tuning",
+        }
+
+        for system in ("Windows", "Linux", "Darwin"):
+            with self.subTest(system=system):
+                with mock.patch("net_stability.platform.system", return_value=system):
+                    matrix = net_stability.capability_matrix()
+
+                labels = {item["capability"] for item in matrix}
+                self.assertTrue(labels.isdisjoint(forbidden_capabilities))
+                for item in matrix:
+                    assert_no_unsafe_actions(self, item["mutation"])
 
     def test_windows_wlan_channel_evidence_recommends_router_side_fix(self) -> None:
         # Given: the 2.4 GHz link shape observed on the local TP-Link adapter.
@@ -434,84 +985,72 @@ Wi-Fi:
         self.assertEqual(state["usb_selective_suspend"]["ac_value"], 1)
         self.assertEqual(state["usb_selective_suspend"]["dc_value"], 1)
 
-    def test_apply_windows_system_repairs_usb_wifi_power_paths(self) -> None:
-        # Given: a USB Wi-Fi adapter has the exact power states seen on the failing machine.
-        manifest = {
-            "state": {
-                "system": {
-                    "tcp_global": {
-                        "available": True,
-                        "receive_window_autotuning": "normal",
-                    },
-                    "power": {
-                        "available": True,
-                        "scheme_guid": "11111111-2222-3333-4444-555555555555",
-                        "ac_value": 0,
-                        "dc_value": 0,
-                        "usb_selective_suspend": {
-                            "available": True,
-                            "scheme_guid": "11111111-2222-3333-4444-555555555555",
-                            "ac_value": 1,
-                            "dc_value": 1,
-                        },
-                    },
-                    "wifi_adapters": {
-                        "available": True,
-                        "adapters": [
-                            {
-                                "Name": "Wi-Fi 2",
-                                "InterfaceDescription": "TP-Link Wireless Nano USB Adapter",
-                                "InterfaceGuid": "{aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee}",
-                                "PnPDeviceID": "USB\\VID_2357&PID_011E\\00E04C000001",
-                                "DevicePowerManagementEnabled": True,
-                                "SelectiveSuspend": None,
-                                "DeviceSleepOnDisconnect": None,
-                            }
-                        ],
-                    },
-                }
-            },
-            "applied": {"system": []},
-        }
-        ok = net_stability.CommandResult(["ok"], 0, "{}", "", 1.0)
+    def test_apply_windows_system_does_not_mutate_usb_wifi_power_paths(self) -> None:
+        # Given: a captured USB Wi-Fi state that must remain untouched by normal apply.
+        manifest = {"state": {"system": {}}, "applied": {"system": []}}
 
-        # When: Windows system tuning is applied in battery-inclusive mode.
+        # When: the conservative Windows system path is selected.
         with contextlib.ExitStack() as stack:
-            stack.enter_context(mock.patch("net_stability.atomic_write_json"))
             stack.enter_context(
-                mock.patch(
-                    "net_stability.windows_set_power_value",
-                    return_value=[ok, ok, ok],
-                )
+                mock.patch("net_stability.platform.system", return_value="Windows")
+            )
+            safe_repairs = stack.enter_context(
+                mock.patch("net_stability.apply_windows_safe_repairs")
             )
             usb_suspend = stack.enter_context(
-                mock.patch(
-                    "net_stability.windows_set_usb_selective_suspend",
-                    return_value=[ok, ok, ok],
-                )
+                mock.patch("net_stability.windows_set_usb_selective_suspend")
             )
             device_power = stack.enter_context(
-                mock.patch(
-                    "net_stability.windows_set_device_power_management",
-                    return_value=ok,
+                mock.patch("net_stability.windows_set_device_power_management")
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                net_stability.apply_system_state(
+                    manifest,
+                    Path("manifest.json"),
+                    include_battery=True,
+                    restart=False,
                 )
-            )
-            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
-            net_stability.apply_windows_system(
-                manifest,
-                Path("manifest.json"),
-                include_battery=True,
-                restart=False,
-            )
 
-        # Then: both USB-specific repairs are recorded for restore.
-        usb_suspend.assert_called_once_with(
-            "11111111-2222-3333-4444-555555555555", 0, 0
+        # Then: only evidence-gated repairs are delegated; blanket USB changes are not.
+        safe_repairs.assert_called_once_with(manifest, Path("manifest.json"))
+        usb_suspend.assert_not_called()
+        device_power.assert_not_called()
+
+    def test_ethernet_parser_preserves_physical_link_and_error_counters(self) -> None:
+        # Given: ethtool exposes negotiated link state and explicit error counters.
+        link = net_stability_link_diagnostics.parse_ethtool_link(
+            "Speed: 1000Mb/s\nDuplex: full\nAuto-negotiation: on\nLink detected: yes\n"
         )
-        device_power.assert_called_once()
-        applied_types = {item["type"] for item in manifest["applied"]["system"]}
-        self.assertIn("windows_usb_selective_suspend", applied_types)
-        self.assertIn("windows_usb_device_power", applied_types)
+        counters = net_stability_link_diagnostics.parse_ethtool_stats(
+            "rx_crc_errors: 4\ntx_errors: 0\nrx_packets: 900\n"
+        )
+
+        # Then: evidence is retained without turning speed into an optimization command.
+        self.assertEqual(link["speed"], "1000Mb/s")
+        self.assertEqual(link["duplex"], "full")
+        self.assertEqual(link["carrier"], "yes")
+        self.assertEqual(counters, {"rx_crc_errors": 4, "tx_errors": 0})
+
+    def test_windows_ethernet_inventory_is_read_only_and_structured(self) -> None:
+        # Given: PowerShell exposes a physical adapter with negotiated link fields.
+        result = net_stability.CommandResult(
+            ["powershell"],
+            0,
+            '{"Name":"Ethernet","Status":"Up","LinkSpeed":"1 Gbps",'
+            '"FullDuplex":true,"AutoNegotiationEnabled":true}',
+            "",
+            1.0,
+        )
+
+        # When: the cross-platform Ethernet collector normalizes the report.
+        quality = net_stability_link_diagnostics.collect_windows_ethernet(
+            lambda _script, timeout: result
+        )
+
+        # Then: adapter ownership and mutation contract remain explicit.
+        self.assertTrue(quality["available"])
+        self.assertEqual(quality["interfaces"][0]["LinkSpeed"], "1 Gbps")
+        self.assertEqual(quality["mutation"], "none")
 
     def test_list_backups_when_manifest_is_unreadable_reports_invalid_entry(
         self,

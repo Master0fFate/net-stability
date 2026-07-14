@@ -1,16 +1,15 @@
 from __future__ import annotations
 
 import json
+from importlib import import_module
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
-from windows_dns_policy_models import (
-    DNS_POLICY_EVENT_IDS,
-    INVALID_DNS_SERVER,
-    DnsPolicyHealth,
-    DnsServerEntry,
-    PowerShellResult,
-    PowerShellRunner,
-)
+_models = import_module("windows_dns_policy_models")
+DNS_POLICY_EVENT_IDS = _models.DNS_POLICY_EVENT_IDS
+DnsPolicyHealth = _models.DnsPolicyHealth
+DnsServerEntry = _models.DnsServerEntry
+PowerShellResult = _models.PowerShellResult
+PowerShellRunner = _models.PowerShellRunner
 
 
 def collect_health(runner: PowerShellRunner) -> DnsPolicyHealth:
@@ -37,7 +36,9 @@ def health_from_report(report: Mapping[str, Any]) -> DnsPolicyHealth:
         if isinstance(item, Mapping)
     )
     rules = tuple(
-        item for item in _sequence(report.get("nrpt_rules")) if isinstance(item, Mapping)
+        item
+        for item in _sequence(report.get("nrpt_rules"))
+        if isinstance(item, Mapping)
     )
     findings = tuple(str(item) for item in _sequence(report.get("findings")))
     actions = tuple(str(item) for item in _sequence(report.get("recommended_actions")))
@@ -76,7 +77,11 @@ def _query_nrpt_rules(runner: PowerShellRunner) -> Tuple[Mapping[str, Any], ...]
         "Select-Object Namespace,NameServers,DisplayName,Comment);"
         "ConvertTo-Json -InputObject $items -Depth 8 -Compress"
     )
-    return tuple(item for item in _json_sequence(runner(script, 20.0)) if isinstance(item, Mapping))
+    return tuple(
+        item
+        for item in _json_sequence(runner(script, 20.0))
+        if isinstance(item, Mapping)
+    )
 
 
 def _query_dns_events(runner: PowerShellRunner) -> Mapping[int, int]:
@@ -139,8 +144,12 @@ def _build_health(
     actions: List[str] = []
     if findings:
         actions.append("flush_dns_cache")
-    if "invalid_dns_server" in findings:
-        actions.append("set_clean_dns_servers")
+    if any(entry.can_remove_invalid_server for entry in dns_servers):
+        actions.append("remove_invalid_dns_sentinel_preserving_configured_servers")
+    if any(
+        entry.has_invalid_server and not entry.valid_servers for entry in dns_servers
+    ):
+        actions.append("review_invalid_only_dns_configuration")
     if "dns_policy_corruption" in findings:
         actions.append("reboot_or_reset_network_if_nrpt_persists")
 
@@ -169,7 +178,11 @@ def _json_mapping(result: PowerShellResult) -> Mapping[str, Any]:
     parsed = _json_value(result)
     if isinstance(parsed, Mapping):
         return parsed
-    return {"Ok": False, "Error": "PowerShell returned a non-object JSON value", "Items": []}
+    return {
+        "Ok": False,
+        "Error": "PowerShell returned a non-object JSON value",
+        "Items": [],
+    }
 
 
 def _json_sequence(result: PowerShellResult) -> Tuple[Any, ...]:
@@ -183,7 +196,11 @@ def _json_sequence(result: PowerShellResult) -> Tuple[Any, ...]:
 
 def _json_value(result: PowerShellResult) -> Any:
     if not result.ok:
-        return {"Ok": False, "Error": result.error or result.stderr.strip(), "Items": []}
+        return {
+            "Ok": False,
+            "Error": result.error or result.stderr.strip(),
+            "Items": [],
+        }
     text = result.stdout.strip()
     if not text:
         return []

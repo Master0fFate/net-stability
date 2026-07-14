@@ -32,7 +32,9 @@ def create_build_guard_plan(
     cpu_count = max(1, os.cpu_count() or 1)
     reserved = min(max(0, reserve_cpus), max(0, cpu_count - 1))
     available_jobs = max(1, cpu_count - reserved)
-    selected_jobs = available_jobs if jobs is None else min(max(1, jobs), available_jobs)
+    selected_jobs = (
+        available_jobs if jobs is None else min(max(1, jobs), available_jobs)
+    )
     values = {
         "CARGO_BUILD_JOBS": str(selected_jobs),
         "CMAKE_BUILD_PARALLEL_LEVEL": str(selected_jobs),

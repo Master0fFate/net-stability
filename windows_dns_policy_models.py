@@ -20,8 +20,7 @@ class PowerShellResult(Protocol):
     error: Optional[str]
 
     @property
-    def ok(self) -> bool:
-        ...
+    def ok(self) -> bool: ...
 
 
 PowerShellRunner = Callable[[str, float], PowerShellResult]
@@ -34,15 +33,25 @@ class DnsServerEntry:
     servers: Tuple[str, ...]
 
     @property
+    def valid_servers(self) -> Tuple[str, ...]:
+        return tuple(server for server in self.servers if server != INVALID_DNS_SERVER)
+
+    @property
     def has_invalid_server(self) -> bool:
         return INVALID_DNS_SERVER in self.servers
+
+    @property
+    def can_remove_invalid_server(self) -> bool:
+        return self.has_invalid_server and bool(self.valid_servers)
 
     def to_report(self) -> Dict[str, Any]:
         return {
             "interface_alias": self.interface_alias,
             "address_family": self.address_family,
             "servers": list(self.servers),
+            "valid_servers": list(self.valid_servers),
             "has_invalid_server": self.has_invalid_server,
+            "can_remove_invalid_server": self.can_remove_invalid_server,
         }
 
 
@@ -69,7 +78,9 @@ class DnsPolicyHealth:
             "nrpt_error": self.nrpt_error,
             "findings": list(self.findings),
             "recommended_actions": list(self.recommended_actions),
-            "event_counts": {str(key): value for key, value in self.event_counts.items()},
+            "event_counts": {
+                str(key): value for key, value in self.event_counts.items()
+            },
             "dns_servers": [entry.to_report() for entry in self.dns_servers],
             "nrpt_rules": list(self.nrpt_rules),
             "limitations": list(self.limitations),

@@ -5,380 +5,156 @@
 ![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-4c51bf)
 ![License](https://img.shields.io/badge/license-Unlicense-brightgreen)
 
-Net Stability is a small, reversible network reliability helper for weak Wi-Fi links and flaky `npm install` runs. It diagnoses the likely failure layer first, verifies speed with M-Lab NDT7 when requested, applies conservative evidence-backed tuning, and restores exact backups.
+Net Stability is a diagnostic-first desktop and CLI tool for investigating unreliable Ethernet, Wi-Fi, DNS, router, WAN, and package-download paths. It measures before it recommends, keeps router changes advisory, and avoids blanket “optimize everything” operations.
 
-For CPU-heavy package builds, the cross-platform **Build Guard** keeps one logical CPU available for network/USB driver work, lowers the build process priority, and monitors the connection. It does not throttle downloads or cap network bandwidth.
+It supports Windows, Linux, and macOS, including macOS on Apple Silicon when the Python/runtime and native tools are available. **iOS and iPadOS are not supported:** this project is a desktop Python application that relies on OS command-line diagnostics and Tkinter.
 
-It includes a simple desktop UI with three primary paths: **Audit evidence first** for read-only diagnostics, **Verify speed and stability** for the M-Lab speed gate plus Wi-Fi link inspection, and **Full Optimization** to apply every supported OS and npm tuning tweak in one shot.
-It also includes a cross-platform **Repair DNS** action: Windows keeps the deeper DNS policy repair for corrupted NRPT state, while Linux and macOS use platform-native DNS cache and resolver repair. On Windows USB Wi-Fi adapters, system optimization now records and repairs the active power-plan USB suspend path that can leave a reconnected adapter stuck in a no-internet state.
-For cases where device-side tuning is already clean, **Diagnose router side** separates router/AP/WAN symptoms from client-side symptoms and prints only evidence-backed router actions to verify.
+## Operating model
 
----
+- **Run diagnostics** is the primary GUI action and is read-only apart from report files and requested test traffic.
+- **Review recommended changes** shows the exact evidence-gated actions available for the current platform. The GUI does not expose a blanket apply button.
+- Restore manifests are captured before an explicit mutation and record the original state needed for rollback where the OS exposes it.
+- Router, AP, ISP, VPN, and physical-placement recommendations remain advisory; the tool does not change router settings.
+- Reports support identifier and token redaction before sharing.
 
-## What It Does
+The normal system policy is intentionally narrow:
 
-- Creates a restore point **before** applying any change.
-- Applies a weak-link npm profile: fewer per-origin sockets, longer fetch timeouts, more retries, and `prefer-offline`.
-- Runs builds with CPU headroom through `guard`, without limiting network bandwidth.
-- Runs a read-only M-Lab NDT7 application speed test through the Locate API v2 and stores reports without access tokens.
-- Inspects Wi-Fi link evidence from documented OS surfaces: Windows `netsh wlan`, Linux `nmcli`/`iw`, and macOS `networksetup`/`system_profiler`.
-- Runs a read-only pressure-point benchmark with idle baseline probes, bounded HTTPS download load, packet loss, jitter, DNS, HTTPS, throughput, and adapter counter evidence.
-- Runs a router-side diagnostic suite that classifies Wi-Fi channel/placement, AP/router first-hop degradation, WAN queue pressure, router DNS forwarding symptoms, and router/ISP throughput ceilings without mutating router settings.
-- **Windows**: Restores restricted TCP receive-window auto-tuning, adjusts Wi-Fi power policy, disables active-plan USB suspend for detected USB Wi-Fi adapters, repairs exact USB adapter power-management flags when Windows exposes them, sets MTU to 1500, disables Delivery Optimization P2P sharing, sets QoS reservable bandwidth to 0%, and tunes TCP retransmission registry values.
-- **Windows DNS policy**: Diagnoses NRPT corruption, DNS Client timeout events, and invalid resolver entries; repairs only invalid DNS server assignments and flushes the DNS cache, without deleting VPN or NRPT rules automatically.
-- **Linux DNS repair**: Flushes the resolver cache when supported and repairs DNS servers to the stable 1.1.1.1 / 1.0.0.1 profile when the current resolver state is missing or invalid.
-- **macOS DNS repair**: Flushes DNS and mDNS responder caches and repairs DNS servers to the stable 1.1.1.1 / 1.0.0.1 profile when needed.
-- **Linux**: Disables NetworkManager Wi-Fi powersave, writes sysctl TCP/IP tuning (buffers, SACK, window scaling, timestamps, fastopen), enables BBR congestion control with fq_codel qdisc, increases NIC ring buffers, enables the irqbalance daemon, and sets DNS to 1.1.1.1.
-- **macOS**: Sets DNS to 1.1.1.1 / 1.0.0.1, tunes TCP buffer sizes (131072 send/recv), and writes persistent sysctl.conf.
-- **All platforms**: `reset-network` command resets the TCP/IP stack, Winsock (Windows), and DNS cache to OS defaults.
-- Saves diagnostic JSON reports with control-layer observations, recommendations, capability matrices, optimizer action ledgers, and optional identifier/token redaction.
-- Generates a read-only evidence audit that lists supported capabilities, denylisted folklore tweaks, and overridden paper-backed optimizations.
+- Windows may repair abnormal TCP receive-window auto-tuning and invalid DNS policy state after health checks identify a repairable condition.
+- Linux and macOS normal apply performs no automatic system mutation; configured DNS, kernel buffers, congestion control, ring sizes, IRQ policy, and persistent sysctl files are preserved. Cache repair remains a separate explicit command.
+- npm weak-link settings are a separate, explicit opt-in user configuration profile with snapshot-backed restore.
+- Fixed MTU, QoS, retransmission registry defaults, blanket USB selective suspend changes, BBR/fq_codel, fixed TCP buffers, public-DNS replacement, and undocumented Wi-Fi or driver tweaks are not default optimization actions.
 
----
+## What it measures
 
-## Quick Start
+- Ethernet carrier, speed, duplex, autonegotiation, media state, and exposed error/drop counters.
+- Wi-Fi signal/noise/SNR when exposed, band/channel/width/PHY, receive/transmit rates, and platform link reports.
+- Gateway and public latency, loss, jitter, DNS and HTTPS health, loaded latency, and bounded goodput.
+- IPv4/IPv6 path evidence, default route, PMTU symptoms, VPN/proxy context, and interface ownership when exposed by the operating system.
+- Router-side symptoms such as local-link degradation, WAN queue pressure, DNS forwarding failures, or throughput ceilings, with confidence-calibrated manual recommendations.
 
-Clone the repository, then run the desktop UI:
+## Quick start
+
+Run the GUI directly:
 
 ```bash
 python net_stability_gui.py
 ```
 
-Two primary buttons at the top:
+The compact GUI provides one primary action and a small Tools section:
 
-- **Audit evidence first** -- read-only diagnostics and capability report.
-- **Verify speed and stability** -- read-only M-Lab speed gate, Wi-Fi link inspection, and baseline probes.
-- **Full Optimization** -- backs up current state, then applies every supported OS tuning and npm profile in one operation.
-- **Repair DNS** -- platform-specific DNS repair for Windows, Linux, and macOS.
+- **Run diagnostics** — read-only evidence collection.
+- **Review recommended changes** — dry-run, no settings changed.
+- **View restore points** — inspect snapshots and use the CLI for an explicit restore.
+- **Verify speed and stability** — loaded latency and optional M-Lab NDT7 goodput.
+- **Inspect Ethernet and Wi-Fi link** — platform link inventory.
+- **Diagnose router side** — bounded loaded-path classification.
+- **Review DNS repair** — read-only GUI preview of the platform repair plan. Any repair must be run explicitly from the CLI.
 
-For Windows system tuning, open the terminal as Administrator before launching the GUI:
+Use `python net_stability_gui.py --smoke` to verify the GUI entry point without opening a window.
 
-```powershell
-python net_stability_gui.py
-```
+## Command line
 
-If you do not have admin access, use **Optimize npm only** in the advanced section.
-
----
-
-## Command Line
-
-The GUI wraps the same CLI, so everything can also be run from a terminal.
+The GUI calls the same CLI:
 
 ```bash
-python net_stability.py diagnose
-python net_stability.py audit
-python net_stability.py measure idle
-python net_stability.py speedtest
-python net_stability.py link-quality
-python net_stability.py verify
-python net_stability.py benchmark
-python net_stability.py router-diagnose
-python net_stability.py apply
-python net_stability.py apply --npm-only
-python net_stability.py restore latest
-python net_stability.py list-backups
-python net_stability.py watch -- npm install
-python net_stability.py guard -- npm run build
-python net_stability.py reset-network
-python net_stability.py repair-dns
-```
-
-Useful options:
-
-```bash
-python net_stability.py diagnose --samples 20 --redact
+python net_stability.py diagnose --redact
 python net_stability.py audit --redact
-python net_stability.py measure idle --samples 20 --redact
-python net_stability.py speedtest --skip-upload --redact
-python net_stability.py verify --min-download-mbps 15 --redact
-python net_stability.py verify --loaded --load-seconds 10 --parallel-downloads 2 --redact
-python net_stability.py benchmark --load-seconds 30 --parallel-downloads 4 --download-mb 16 --redact
-python net_stability.py router-diagnose --min-download-mbps 18 --redact
-python net_stability.py apply --dry-run
-python net_stability.py apply --system-only
-python net_stability.py restore latest --npm-only
+python net_stability.py link-quality --redact
+python net_stability.py verify --redact
+python net_stability.py benchmark --redact
+python net_stability.py router-diagnose --redact
+python net_stability.py apply --dry-run --system-only --no-restart
+python net_stability.py apply --npm-only
 python net_stability.py repair-dns --dry-run
-python net_stability.py guard --dry-run -- npm run build
+python net_stability.py list-backups
+python net_stability.py restore latest
 ```
 
-### Build Guard
+A normal `apply` remains available for CLI compatibility, but review its dry-run first. Use `--npm-only` for the explicit user-level npm profile. Windows system repair requires an Administrator terminal; Linux authorization may require a separate system-only invocation. npm changes are refused under `sudo` so root's configuration is not changed accidentally.
 
-Use `guard` when npm lifecycle scripts or native compilation expose adapter or driver instability:
+## Verification and loaded-path diagnosis
+
+Use `verify` after changing hardware placement, adapter choice, router settings, or cabling:
+
+```bash
+python net_stability.py verify --min-download-mbps 15 --redact
+```
+
+Use `link-quality` for local Ethernet and Wi-Fi evidence, and `router-diagnose` when idle behavior looks healthy but downloads or package installs fail under load. The benchmark uses bounded HTTPS traffic and concurrent probes; it does not claim that one short run proves an ISP limit. Recommendations identify the evidence, confidence, expected metric, and manual verification step.
+
+M-Lab NDT7 uses the Locate API v2 and WebSocket/TLS measurements when requested. Saved reports strip access-token query strings.
+
+## Build Guard
+
+`guard` is a qualified mitigation for builds that compete with network or USB driver work:
 
 ```bash
 python net_stability.py guard -- npm run build
 ```
 
-The guard lowers the child process priority and publishes a conservative worker count through standard build-tool environment variables used by node-gyp, Make, Ninja, CMake, Cargo, and libuv. It reserves one logical CPU by default so kernel network and USB work is less likely to be starved. It does **not** shape traffic, limit download speed, or change package-manager registries. Use `--jobs` or `--reserve-cpus` to override the CPU policy.
+It can lower child-process priority and publish conservative worker-count environment variables for common build tools. This may leave CPU headroom for system work, but it does not prove a network fix, shape traffic, cap bandwidth, change registries, or repair a driver.
 
----
-
-## Beginner UI
-
-The desktop UI is intentionally small and cross-platform:
-
-- Built with `tkinter`, included with most Python desktop installs.
-- One runtime dependency: `websockets`, used only for M-Lab NDT7 speed tests.
-- Three primary buttons: **Audit evidence first**, **Verify speed and stability**, and **Full Optimization**.
-- Advanced actions (M-Lab speed test, Wi-Fi link inspection, DNS repair, idle measurement, pressure-point benchmark, router-side diagnosis, diagnostics, npm-only, reset network, restore, backups) stay visible but secondary.
-- An 8-stage progress panel tracks every step of the pipeline.
-- The log panel streams real command output in a dark terminal-style view.
-
-This keeps the project easy to package later with tools such as PyInstaller or Briefcase.
-
----
-
-## Pressure-Point Benchmark
-
-Use `benchmark` when idle diagnostics look acceptable but downloads still show loss, jitter, or stutter:
-
-```bash
-python net_stability.py benchmark --redact
-```
-
-The benchmark is read-only apart from its JSON report. It collects an idle baseline, runs bounded HTTPS download traffic, keeps probing the gateway and a public target, checks DNS and HTTPS health, estimates throughput, and on Windows captures adapter statistics before and after the loaded phase.
-
-The pressure-point classifier separates the likely failure layer:
-
-- Gateway loss rises under load: local Wi-Fi, adapter, USB, AP, or router CPU path is suspect.
-- Gateway stays clean but public loss or jitter rises: router/WAN queueing, ISP path, VPN/proxy, or remote target behavior is suspect.
-- Loaded p95 latency rises sharply without gateway loss: evaluate SQM/AQM such as FQ-CoDel or CAKE at the actual bottleneck.
-
-StableNet does not silently mutate router settings. Router queue control remains advisory unless a reviewed router integration is added later.
-
----
-
-## Router-Side Diagnosis
-
-Use `router-diagnose` when OS/client optimization is already applied but throughput or package installs still collapse:
-
-```bash
-python net_stability.py router-diagnose --min-download-mbps 18 --redact
-```
-
-The suite is read-only apart from the JSON report and intentional download test traffic. It combines:
-
-- Idle gateway, public ICMP, DNS, and HTTPS probes.
-- Bounded HTTPS download pressure while the same probes continue.
-- Cross-platform Wi-Fi link evidence from Windows, Linux, or macOS.
-- Adapter counters on Windows when available.
-
-The router classifier only recommends actions when the evidence supports them:
-
-- Overlapping 2.4 GHz AP channel or marginal signal: verify router/AP channel plan, width, band choice, and placement.
-- Gateway degrades during load: inspect AP/router CPU, wireless airtime, client caps, guest-network policy, and local-link contention.
-- Gateway stays clean while public latency/jitter rises: evaluate SQM/AQM such as FQ-CoDel or CAKE at the WAN bottleneck.
-- DNS fails while HTTPS is not equally broken: inspect router DNS forwarding only after repeated evidence, without deleting VPN or split-DNS policy.
-- Throughput misses the target with a clean first hop: inspect router rate limits, WAN link state, modem/router logs, and compare with a wired or second-device run.
-
-Every recommendation includes expected metrics and a verification command. StableNet does not apply router settings automatically because router firmware, ISP modem modes, and household-wide policies need router-admin review.
-
----
-
-## Speed Verification and Link Quality
-
-Use `verify` when you want a clear pass/fail gate after changing hardware placement, adapter choice, router settings, or Net Stability optimization:
-
-```bash
-python net_stability.py verify --min-download-mbps 15 --redact
-```
-
-The default gate treats download below 15 Mbps as degraded. That matches the practical target for the weak-link case this project was built around: roughly 10 Mbps is bad evidence, while 15 Mbps or better is acceptable enough to continue investigating higher layers.
-
-For raw speed measurement only:
-
-```bash
-python net_stability.py speedtest --redact
-```
-
-For local radio/link evidence only:
-
-```bash
-python net_stability.py link-quality --redact
-```
-
-The speed test uses M-Lab Locate API v2 and NDT7 WebSocket/TLS measurements. Locate access tokens are required for the test connection, but saved reports strip query strings from service URLs.
-
----
-
-## Restore Points
+## Restore points and reset
 
 Backups are stored outside the repository:
 
-| OS | Backup location |
+| OS | Location |
 | --- | --- |
-| Windows | `%LOCALAPPDATA%\NetStability\backups` |
+| Windows | `%LOCALAPPDATA%\\NetStability\\backups` |
 | macOS | `~/Library/Application Support/NetStability/backups` |
 | Linux | `$XDG_STATE_HOME/netstability/backups` or `~/.local/state/netstability/backups` |
 
-To undo the latest change:
-
 ```bash
+python net_stability.py list-backups
 python net_stability.py restore latest
 ```
 
-To inspect available backups:
+`reset-network` is a separate, disruptive troubleshooting command. It may reset OS network-stack state and should only be used after review with the expected reboot/reconnect impact understood. macOS reset is limited to transient route/DNS/mDNS cache flushing and does not delete untracked Apple configuration files.
 
-```bash
-python net_stability.py list-backups
-```
-
----
-
-## Platform Notes
+## Platform notes
 
 ### Windows
 
-System tuning requires an Administrator terminal. User-level npm tuning does not.
-
-The tool applies these Windows-specific optimizations:
-- TCP receive-window auto-tuning set to `normal` (repairs restricted/disabled states)
-- Wi-Fi power policy set to Maximum Performance
-- Active power-plan USB selective suspend disabled when a physical USB Wi-Fi adapter is detected
-- Exact USB Wi-Fi device power-management flag disabled when Windows exposes `MSPower_DeviceEnable`
-- NDIS SelectiveSuspend and DeviceSleepOnDisconnect disabled on Wi-Fi adapters
-- MTU set to 1500 on Wi-Fi interfaces
-- Delivery Optimization P2P sharing disabled via registry
-- QoS reservable bandwidth set to 0%
-- TCP retransmission registry: `TcpMaxDataRetransmissions=5`, `TcpMaxConnectRetransmissions=3`
-
-Windows DNS policy repair is available separately via `repair-dns`:
-- Detects NRPT-effective query failures, DNS Client event 1014/1023 spikes, and invalid resolver entries like `0.0.0.0`
-- Flushes the DNS cache before repair
-- Rewrites only invalid interface DNS server assignments, preserving VPN and enterprise NRPT rules
-- Recommends reboot or `reset-network` if NRPT corruption persists
-
-The tool may briefly restart or reapply the Wi-Fi adapter so settings take effect.
+Read-only diagnostics use documented `netsh`, PowerShell, adapter, DNS-policy, and link-report surfaces. The conservative repair path can restore abnormal receive-window auto-tuning. DNS repair removes an invalid sentinel only when an existing valid resolver can be preserved exactly; invalid-only configurations remain advisory. Resolver changes are snapshot-backed and restore the exact original list. It does not set a fixed MTU, overwrite DNS for speed, disable QoS, set retransmission folklore defaults, or blanket-disable USB power management.
 
 ### Linux
 
-Run npm tuning as your normal user:
-
-```bash
-python net_stability.py apply --npm-only
-```
-
-If NetworkManager denies permission for system tuning, run the system-only operation separately:
-
-```bash
-sudo python net_stability.py apply --system-only
-```
-
-The tool refuses to modify npm configuration under `sudo` to avoid changing root's npm state by accident.
-
-Linux-specific optimizations:
-- NetworkManager Wi-Fi powersave disabled on active profiles
-- sysctl TCP/IP tuning: buffer sizes, SACK, window scaling, timestamps, TCP fastopen
-- BBR congestion control enabled with fq_codel qdisc
-- NIC ring buffers set to rx=4096 / tx=4096 (via ethtool)
-- irqbalance daemon enabled and started
-- DNS set to 1.1.1.1 / 1.0.0.1
-
-Linux DNS repair is available via `repair-dns`:
-- Reports current DNS servers
-- Flushes resolver caches with `resolvectl` or `systemd-resolve` when available
-- Sets DNS to 1.1.1.1 / 1.0.0.1 when the resolver state is missing, invalid, or not already using the stable profile
+Diagnostics use available `ip`, `nmcli`, `iw`, `ethtool`, `resolvectl`, and route surfaces. Ethernet reports include speed/duplex/carrier and exposed counters; Wi-Fi reports include NetworkManager and `iw` evidence. Normal system apply preserves NetworkManager, resolver configuration, kernel TCP policy, ring sizes, IRQ state, and persistent sysctl files. DNS troubleshooting flushes caches without replacing configured servers.
 
 ### macOS
 
-macOS-specific optimizations:
-- DNS set to 1.1.1.1 / 1.0.0.1
-- TCP buffer sizes: send=131072, recv=131072
-- Persistent sysctl.conf written for buffer settings
+Diagnostics use `networksetup`, `system_profiler`, `ifconfig`, route, and cache tools available on the host. Ethernet media and Wi-Fi radio evidence are reported when exposed. Normal system apply does not write fixed TCP buffers, overwrite `/etc/sysctl.conf`, replace DNS servers, or delete plist configuration. DNS troubleshooting flushes transient caches only.
 
-macOS DNS repair is available via `repair-dns`:
-- Reports current DNS servers
-- Flushes DNS and mDNS responder caches
-- Sets DNS to 1.1.1.1 / 1.0.0.1 when the resolver state is missing, invalid, or not already using the stable profile
+## Packaging and release staging
 
-The tool does not change undocumented system Wi-Fi knobs.
-
----
-
-## Network Stack Reset
-
-The `reset-network` command resets TCP/IP, Winsock, and DNS settings to OS defaults:
+Install locally in editable mode if desired:
 
 ```bash
-python net_stability.py reset-network
-```
-
-This is a separate, destructive operation (not part of the normal `apply` path) and requires a system reboot afterward.
-
----
-
-## Install As A Local Command
-
-For a local editable install:
-
-```bash
-uv pip install -e .
+python -m pip install -e .
 net-stability-gui
 ```
 
-If you prefer not to install it, run the files directly with `python`.
-
-## Release Build and Distribution
-
-Run locally to build cross-platform installers on the current machine:
+Build staging artifacts on the current native host:
 
 ```bash
 python -m pip install ".[build]"
 python scripts/build_release.py
 ```
 
-Built outputs appear in `release-artifacts/<platform>-<arch>/`:
+The script stages platform/architecture-specific archives and executable bundles under `release-artifacts/`. The macOS target is Apple Silicon (`arm64`): its DMG contains a real `Net Stability` `.app` bundle plus a separate CLI executable. No Intel macOS artifact is currently staged. Native GitHub Actions runners are required for trustworthy outputs. Signing, notarization, and Windows code signing require external certificates/secrets and are not claimed by local staging. Release publication is intentionally a separate reviewed operation.
 
-- `net-stability-<platform>-<arch>.tar.gz`
-- `net-stability-gui-<platform>-<arch>`
-- `net-stability-<platform>-<arch>`
-- `checksums.txt`
-
-To publish release assets through GitHub, tag and push the release version:
+## Development checks
 
 ```bash
-git tag v1.4.0
-git push origin v1.4.0
-```
-
-The GitHub Actions workflow in `.github/workflows/release.yml` builds Windows, Linux, and macOS artifacts from tags (or via workflow dispatch), creates a combined `checksums.txt`, and uploads `.exe`, extensionless Unix executables, `.tar.gz`, and macOS `.dmg` outputs to the release.
-
----
-
-## Development Checks
-
-Basic verification:
-
-```bash
-python -m py_compile net_stability.py net_stability_ndt7.py net_stability_gui.py
+python -m unittest discover -s tests -v
+python -m py_compile net_stability.py net_stability_gui.py net_stability_gui_commands.py net_stability_link_diagnostics.py
 python net_stability.py --version
 python net_stability_gui.py --smoke
-python net_stability.py verify --skip-speedtest --samples 1
 ```
 
-The smoke check verifies the GUI entry point without opening a desktop window.
+## Safety boundaries
 
----
-
-## Safety Model
-
-Net Stability is intentionally conservative:
-
-- Every change is backed up **before** it is applied.
-- Restore commands target exact snapshots with full pre-change state.
-- User npm state and elevated system state are handled in separate operations when needed.
-- Windows DNS policy repair is conservative and does not delete NRPT or VPN rules automatically.
-- Linux and macOS DNS repair is scoped to resolver cache cleanup and the documented stable DNS server profile.
-- M-Lab NDT7 speed tests and Wi-Fi link inspection are read-only measurement surfaces; they never authorize unsafe TCP, driver, band, or offload folklore.
-- The tool favors documented OS knobs and explicit diagnostics.
-- Reports can be redacted before sharing.
-- Router queue management is advisory only; a PC-side utility cannot directly fix queues inside an ISP modem or router.
-- Some previously-denylisted tweaks (MTU, DNS, BBR, QoS) are now applied with **evidence-backed safe values** from the research paper. The `audit` command clearly lists which folklore tweaks are still denied and which are overridden with paper-backed justification.
-- The `reset-network` command is intentionally kept separate from `apply` because it is a destructive operation.
-- Non-evidence-backed folklore tweaks (global IPv6 disable, TCP ACK/Nagle recipes, RSS/VMQ on Wi-Fi, forced band/frequency, blanket USB suspend disable without USB Wi-Fi evidence, firewall/antivirus disable, automatic driver installation) remain permanently denylisted.
-
----
+Net Stability is not a universal optimizer and does not promise that every slow download is caused by the host. It reports uncertainty when command surfaces are unavailable, keeps mutations narrow and reviewable, preserves configured resolver and router policy, and treats physical, VPN/proxy, driver, AP, WAN, and ISP causes as separate hypotheses. No iOS application or iPhone/iPad support is provided by this desktop architecture.
 
 ## License
 

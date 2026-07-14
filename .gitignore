@@ -15,12 +15,14 @@ assets/icons/
 
 # Test, type-checker, and tooling caches
 .codegraph/
+.codeviewer-mcp.sqlite*
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
 .pyright/
 .coverage
 htmlcov/
+.aislop/history.jsonl
 .aislop/session.jsonl
 
 # Local application state and generated reports
