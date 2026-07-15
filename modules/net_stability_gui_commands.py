@@ -13,6 +13,17 @@ class CommandSpec:
     args: tuple[str, ...]
     description: str
     primary: bool = False
+    mutates: bool = False
+    confirmation: str | None = None
+    cancellable: bool = True
+
+    def __post_init__(self) -> None:
+        if self.mutates and not self.confirmation:
+            raise ValueError("mutating commands require confirmation text")
+        if self.mutates and self.cancellable:
+            raise ValueError("mutating commands cannot be cancellable")
+        if self.confirmation and not self.mutates:
+            raise ValueError("confirmation text is reserved for mutating commands")
 
 
 COMMANDS: Final[tuple[CommandSpec, ...]] = (
@@ -31,6 +42,18 @@ COMMANDS: Final[tuple[CommandSpec, ...]] = (
         "View restore points",
         ("list-backups",),
         "List saved restore points. Restoring one remains an explicit CLI action.",
+    ),
+    CommandSpec(
+        "Apply recommended changes",
+        ("apply", "--system-only", "--no-restart", "--yes"),
+        "Create a restore point and apply only evidence-gated system repairs available on this platform. npm settings are not changed.",
+        mutates=True,
+        confirmation=(
+            "Create a restore point and apply the reviewed system changes?\n\n"
+            "Only evidence-gated repairs will be attempted. npm settings stay unchanged. "
+            "After this starts, it cannot be stopped safely."
+        ),
+        cancellable=False,
     ),
     CommandSpec(
         "Run speed check",

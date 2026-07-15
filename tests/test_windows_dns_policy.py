@@ -420,17 +420,18 @@ class WindowsDnsPolicyTests(unittest.TestCase):
         )
 
     def test_gui_dns_action_is_review_only(self) -> None:
-        # Given: the GUI command specification is the user-facing DNS action.
+        # Given: the dedicated DNS command is separate from confirmed system apply.
         dns_command = next(
             command
             for command in net_stability_gui_commands.COMMANDS
-            if "DNS" in command.label
+            if command.args[0] == "repair-dns"
         )
 
-        # Then: the GUI cannot silently approve or execute DNS mutation.
+        # Then: the DNS-specific button remains a non-mutating preview.
         self.assertEqual(dns_command.label, "Review DNS repair")
         self.assertIn("--dry-run", dns_command.args)
         self.assertNotIn("--yes", dns_command.args)
+        self.assertFalse(dns_command.mutates)
         self.assertIn("Nothing is changed", dns_command.description)
 
     def test_failure_when_react_bricks_connect_timeout_is_retryable(self) -> None:
@@ -466,6 +467,7 @@ class WindowsDnsPolicyTests(unittest.TestCase):
 
         # Then: the DNS policy repair button is advertised.
         self.assertEqual(result.returncode, 0, output)
+        self.assertIn("Apply recommended changes", output)
         self.assertIn("Run speed check", output)
         self.assertIn("Review DNS repair", output)
 

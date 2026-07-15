@@ -12,7 +12,8 @@ It supports Windows, Linux, and macOS, including macOS on Apple Silicon when the
 ## Operating model
 
 - **Run diagnostics** is the primary GUI action and is read-only apart from report files and requested test traffic.
-- **Review recommended changes** shows the exact evidence-gated actions available for the current platform. The GUI does not expose a blanket apply button.
+- **Review recommended changes** shows the exact evidence-gated system actions available for the current platform without changing settings.
+- **Apply recommended changes** is a separate, confirmed system-only action. It creates a restore point first, never acts as a blanket optimizer, and cannot be stopped safely after execution begins.
 - Restore manifests are captured before an explicit mutation and record the original state needed for rollback where the OS exposes it.
 - Router, AP, ISP, VPN, and physical-placement recommendations remain advisory; the tool does not change router settings.
 - Reports support identifier and token redaction before sharing.
@@ -44,11 +45,12 @@ The compact GUI provides one primary action and a small Tools section:
 
 - **Run diagnostics** — read-only evidence collection.
 - **Review recommended changes** — dry-run, no settings changed.
+- **Apply recommended changes** — confirmed, snapshot-backed system repairs only; npm settings stay unchanged.
 - **View restore points** — inspect snapshots and use the CLI for an explicit restore.
 - **Verify speed and stability** — loaded latency and optional M-Lab NDT7 goodput.
 - **Inspect Ethernet and Wi-Fi link** — platform link inventory.
 - **Diagnose router side** — bounded loaded-path classification.
-- **Review DNS repair** — read-only GUI preview of the platform repair plan. Any repair must be run explicitly from the CLI.
+- **Review DNS repair** — read-only preview of the platform DNS repair plan. Confirmed system apply may repair evidence-gated Windows DNS policy; Linux and macOS cache repair remains an explicit CLI action.
 
 Use `python net_stability_gui.py --smoke` to verify the GUI entry point without opening a window.
 
@@ -70,7 +72,7 @@ python net_stability.py list-backups
 python net_stability.py restore latest
 ```
 
-A normal `apply` remains available for CLI compatibility, but review its dry-run first. Use `--npm-only` for the explicit user-level npm profile. Windows system repair requires an Administrator terminal; Linux authorization may require a separate system-only invocation. npm changes are refused under `sudo` so root's configuration is not changed accidentally.
+The GUI's confirmed apply action uses the same system-only CLI path shown by its dry run. Use `--npm-only` from the CLI for the separate user-level npm profile. Windows system repair requires an Administrator process; Linux authorization may require a separate system-only invocation. npm changes are refused under `sudo` so root's configuration is not changed accidentally.
 
 ## Verification and loaded-path diagnosis
 

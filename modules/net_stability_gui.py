@@ -11,7 +11,7 @@ import sys
 import threading
 import tkinter as tk
 from pathlib import Path
-from tkinter import ttk
+from tkinter import messagebox, ttk
 from typing import Final, List, Optional
 
 _gui_commands = import_module("modules.net_stability_gui_commands")
@@ -44,6 +44,14 @@ def command_for(spec: CommandSpec) -> tuple[str, ...]:
     return (sys.executable, str(SCRIPT_PATH), *spec.args)
 
 
+def button_style_for(spec: CommandSpec) -> str:
+    if spec.mutates:
+        return "Danger.TButton"
+    if spec.primary:
+        return "Primary.TButton"
+    return "TButton"
+
+
 class NetStabilityGui:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -52,6 +60,7 @@ class NetStabilityGui:
         self.status_var = tk.StringVar(value="Ready")
         self.buttons: List[ttk.Button] = []
         self.process: Optional[subprocess.Popen[str]] = None
+        self.active_spec: Optional[CommandSpec] = None
         self.running = False
         self.cancel_requested = False
 
@@ -94,7 +103,23 @@ class NetStabilityGui:
             "Primary.TButton", font=("Segoe UI", 14, "bold"), padding=(24, 16)
         )
         style.configure(
-            "Danger.TButton", font=("Segoe UI", 12, "bold"), padding=(18, 14)
+            "Danger.TButton",
+            font=("Segoe UI", 10, "bold"),
+            padding=(14, 8),
+            foreground="#7f1d1d",
+            background="#e5e3df",
+            bordercolor="#b9aaa7",
+            lightcolor="#e5e3df",
+            darkcolor="#e5e3df",
+        )
+        style.map(
+            "Danger.TButton",
+            foreground=[("disabled", "#9ca3af"), ("!disabled", "#7f1d1d")],
+            background=[
+                ("disabled", "#f3f4f6"),
+                ("pressed", "#ead1d1"),
+                ("active", "#f1e3e3"),
+            ],
         )
         style.configure("TButton", font=("Segoe UI", 10), padding=(14, 8))
         style.configure(
@@ -137,7 +162,7 @@ class NetStabilityGui:
                 button = ttk.Button(
                     primary_frame,
                     text=spec.label,
-                    style="Primary.TButton",
+                    style=button_style_for(spec),
                     command=lambda item=spec: self._start(item),
                     takefocus=True,
                 )
@@ -188,6 +213,7 @@ class NetStabilityGui:
             button = ttk.Button(
                 advanced,
                 text=spec.label,
+                style=button_style_for(spec),
                 command=lambda item=spec: self._start(item),
                 takefocus=True,
             )
@@ -245,10 +271,19 @@ class NetStabilityGui:
         if self.running:
             self._write_log("A task is already running.\n")
             return
+        if spec.confirmation and not messagebox.askyesno(
+            spec.label,
+            spec.confirmation,
+            parent=self.root,
+        ):
+            self.status_var.set(f"{spec.label} cancelled")
+            return
+        self.active_spec = spec
         self.running = True
         self.cancel_requested = False
         self._set_controls_state(tk.DISABLED)
-        self.cancel_button.configure(state=tk.NORMAL)
+        cancel_state = tk.NORMAL if spec.cancellable else tk.DISABLED
+        self.cancel_button.configure(state=cancel_state)
         self.activity.start(12)
         self.status_var.set(spec.description)
         self._reset_stages()
@@ -293,8 +328,14 @@ class NetStabilityGui:
             self.events.put(f"DONE:{return_code}:{spec.label}")
 
     def _cancel(self) -> None:
+        active_spec = self.active_spec
         process = self.process
-        if not self.running or process is None or process.poll() is not None:
+        if (
+            not self.running
+            or (active_spec is not None and not active_spec.cancellable)
+            or process is None
+            or process.poll() is not None
+        ):
             return
         self.cancel_requested = True
         self.status_var.set("Stopping task…")
@@ -343,6 +384,7 @@ class NetStabilityGui:
                 _, return_code, label = event.split(":", 2)
                 self.running = False
                 self.process = None
+                self.active_spec = None
                 self.activity.stop()
                 self.activity.configure(value=0)
                 self.cancel_button.configure(state=tk.DISABLED)

@@ -692,6 +692,162 @@ class CliGuardrailTests(unittest.TestCase):
             with self.subTest(export=legacy_export.__name__):
                 self.assertIs(legacy_export, extracted_export)
 
+    def test_gui_apply_command_is_confirmed_system_only_and_non_cancellable(
+        self,
+    ) -> None:
+        # Given: the GUI offers separate review and apply actions.
+        commands = net_stability_gui.COMMANDS
+        tools = [command for command in commands if not command.primary]
+        review_index = next(
+            index
+            for index, command in enumerate(tools)
+            if command.label == "Review recommended changes"
+        )
+        apply_index = next(
+            index
+            for index, command in enumerate(tools)
+            if command.label == "Apply recommended changes"
+        )
+        review_row, review_column = divmod(review_index, 2)
+        apply_row, apply_column = divmod(apply_index, 2)
+        apply_command = tools[apply_index]
+
+        # Then: apply sits below review at the same compact tool size.
+        self.assertEqual(apply_column, review_column)
+        self.assertEqual(apply_row, review_row + 1)
+        self.assertEqual(
+            apply_command.args,
+            ("apply", "--system-only", "--no-restart", "--yes"),
+        )
+        self.assertTrue(apply_command.mutates)
+        self.assertTrue(apply_command.confirmation)
+        self.assertFalse(apply_command.cancellable)
+        self.assertFalse(apply_command.primary)
+        self.assertNotIn("--dry-run", apply_command.args)
+        self.assertNotIn("--npm-only", apply_command.args)
+        self.assertEqual(
+            net_stability_gui.button_style_for(apply_command),
+            "Danger.TButton",
+        )
+        self.assertEqual(
+            [command.label for command in commands if command.primary],
+            ["Run diagnostics"],
+        )
+
+    def test_gui_declined_apply_confirmation_starts_nothing(self) -> None:
+        # Given: the user declines the confirmed mutation.
+        apply_command = next(
+            command for command in net_stability_gui.COMMANDS if command.mutates
+        )
+        gui = net_stability_gui.NetStabilityGui.__new__(
+            net_stability_gui.NetStabilityGui
+        )
+        gui.root = mock.Mock()
+        gui.running = False
+        gui.active_spec = None
+        gui.status_var = mock.Mock()
+        gui._set_controls_state = mock.Mock()
+        gui.activity = mock.Mock()
+
+        # When: the apply action is selected and confirmation is declined.
+        with (
+            mock.patch.object(
+                net_stability_gui.messagebox, "askyesno", return_value=False
+            ) as ask_yes_no,
+            mock.patch.object(net_stability_gui.threading, "Thread") as thread,
+        ):
+            gui._start(apply_command)
+
+        # Then: no background execution or running state begins.
+        ask_yes_no.assert_called_once_with(
+            apply_command.label,
+            apply_command.confirmation,
+            parent=gui.root,
+        )
+        thread.assert_not_called()
+        self.assertFalse(gui.running)
+        self.assertIsNone(gui.active_spec)
+        gui._set_controls_state.assert_not_called()
+        gui.activity.start.assert_not_called()
+        gui.status_var.set.assert_called_once_with(
+            "Apply recommended changes cancelled"
+        )
+
+    def test_gui_confirmed_apply_starts_with_stop_disabled(self) -> None:
+        # Given: the user confirms the snapshot-backed mutation.
+        apply_command = next(
+            command for command in net_stability_gui.COMMANDS if command.mutates
+        )
+        gui = net_stability_gui.NetStabilityGui.__new__(
+            net_stability_gui.NetStabilityGui
+        )
+        gui.root = mock.Mock()
+        gui.running = False
+        gui.active_spec = None
+        gui.cancel_requested = False
+        gui.status_var = mock.Mock()
+        gui.cancel_button = mock.Mock()
+        gui.activity = mock.Mock()
+        gui.log = mock.Mock()
+        gui._set_controls_state = mock.Mock()
+        gui._reset_stages = mock.Mock()
+
+        # When: confirmation is accepted.
+        with (
+            mock.patch.object(
+                net_stability_gui.messagebox, "askyesno", return_value=True
+            ),
+            mock.patch.object(net_stability_gui.threading, "Thread") as thread,
+        ):
+            gui._start(apply_command)
+
+        # Then: the exact command is scheduled and cannot be terminated from the GUI.
+        self.assertTrue(gui.running)
+        self.assertIs(gui.active_spec, apply_command)
+        gui.cancel_button.configure.assert_called_once_with(
+            state=net_stability_gui.tk.DISABLED
+        )
+        thread.assert_called_once_with(
+            target=gui._run_command,
+            args=(apply_command,),
+            daemon=True,
+        )
+        thread.return_value.start.assert_called_once_with()
+
+    def test_gui_cancel_refuses_mutation_but_stops_diagnostics(self) -> None:
+        # Given: one running apply process and one running diagnostic process.
+        apply_command = next(
+            command for command in net_stability_gui.COMMANDS if command.mutates
+        )
+        diagnostic_command = next(
+            command for command in net_stability_gui.COMMANDS if command.primary
+        )
+        gui = net_stability_gui.NetStabilityGui.__new__(
+            net_stability_gui.NetStabilityGui
+        )
+        gui.running = True
+        gui.process = mock.Mock(**{"poll.return_value": None})
+        gui.cancel_requested = False
+        gui.status_var = mock.Mock()
+        gui._write_log = mock.Mock()
+        gui.active_spec = apply_command
+
+        # When: cancellation is attempted during apply.
+        gui._cancel()
+
+        # Then: the mutating process is preserved.
+        gui.process.terminate.assert_not_called()
+        self.assertFalse(gui.cancel_requested)
+
+        # When: the same cancellation is requested for diagnostics.
+        gui.active_spec = diagnostic_command
+        gui._cancel()
+
+        # Then: the existing cancellable behavior remains available.
+        gui.process.terminate.assert_called_once_with()
+        self.assertTrue(gui.cancel_requested)
+        gui.status_var.set.assert_called_once_with("Stopping task…")
+
     def test_gui_done_event_restores_controls_and_preserves_result(self) -> None:
         # Given: a completed task event reaches the GUI queue.
         gui = net_stability_gui.NetStabilityGui.__new__(
@@ -701,6 +857,7 @@ class CliGuardrailTests(unittest.TestCase):
         gui.events.put("DONE:0:Run diagnostics")
         gui.running = True
         gui.process = mock.Mock()
+        gui.active_spec = net_stability_gui.COMMANDS[0]
         gui.cancel_requested = False
         gui.activity = mock.Mock()
         gui.cancel_button = mock.Mock()
@@ -718,6 +875,7 @@ class CliGuardrailTests(unittest.TestCase):
         # Then: activity stops, controls return, and success remains visible.
         self.assertFalse(gui.running)
         self.assertIsNone(gui.process)
+        self.assertIsNone(gui.active_spec)
         gui.activity.stop.assert_called_once_with()
         gui.status_var.set.assert_called_once_with("Run diagnostics complete")
         gui._set_controls_state.assert_called_once_with(net_stability_gui.tk.NORMAL)
